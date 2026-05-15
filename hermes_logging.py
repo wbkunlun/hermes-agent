@@ -259,11 +259,14 @@ def setup_logging(
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    # Initialize audit logging if configured
-    if audit_config:
+    # Initialize audit logging. Audit is on by default so managed/container
+    # deployments get a durable operation trail without requiring shell hooks.
+    # Operators can opt out with `audit.enabled: false` in config.yaml.
+    effective_audit_config = audit_config if audit_config is not None else _read_audit_config()
+    if effective_audit_config:
         try:
             from audit import setup_audit_logging
-            setup_audit_logging(audit_config, log_dir)
+            setup_audit_logging(effective_audit_config, log_dir)
         except Exception as e:
             logging.getLogger(__name__).warning("Failed to initialize audit logging: %s", e)
 
@@ -399,3 +402,49 @@ def _read_logging_config():
     except Exception:
         pass
     return (None, None, None)
+
+
+def _read_audit_config() -> Dict[str, Any]:
+    """Best-effort read of ``audit`` from config.yaml.
+
+    Audit logging defaults to enabled. A missing config file or missing
+    ``audit`` block yields a compact default that writes JSONL under
+    ``{HERMES_HOME}/logs/audit/`` via ``setup_audit_logging(..., log_dir)``.
+    Set ``audit.enabled: false`` to disable it.
+    """
+    default: Dict[str, Any] = {
+        "enabled": True,
+        "log": {
+            "rotation": {
+                "max_size_mb": 100,
+                "max_age_hours": 24,
+                "max_backups": 720,
+                "compress": True,
+                "timezone_name": "Asia/Shanghai",
+            }
+        },
+        "tamper_protection": {"enabled": True},
+    }
+    try:
+        import yaml
+        config_path = get_config_path()
+        if not config_path.exists():
+            return default
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        audit_cfg = cfg.get("audit")
+        if audit_cfg is None:
+            return default
+        if not isinstance(audit_cfg, dict):
+            return default
+        merged = dict(default)
+        for key, value in audit_cfg.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                nested = dict(merged[key])
+                nested.update(value)
+                merged[key] = nested
+            else:
+                merged[key] = value
+        return merged
+    except Exception:
+        return default

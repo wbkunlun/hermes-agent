@@ -273,9 +273,18 @@ def setup_audit_logging(
     if not enabled:
         return None
 
-    # Load policy
+    # Load policy. If no explicit rules are configured, use the default
+    # Kubernetes-style policy so `audit.enabled: true` immediately records
+    # useful events instead of silently evaluating every operation to None.
     policy_data = audit_config.get("policy", {})
-    policy = AuditPolicy.from_dict({"policy": policy_data, "log": audit_config.get("log", {}), "tamper_protection": audit_config.get("tamper_protection", {})})
+    if policy_data:
+        policy = AuditPolicy.from_dict({
+            "policy": policy_data,
+            "log": audit_config.get("log", {}),
+            "tamper_protection": audit_config.get("tamper_protection", {}),
+        })
+    else:
+        policy = AuditPolicy.default_policy()
 
     # Determine log path
     log_path = audit_config.get("log", {}).get(

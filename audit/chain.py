@@ -43,8 +43,15 @@ class AuditHashChain:
         if not self._log_path.exists():
             return ""
 
-        # Find the most recent audit log file
-        log_files = sorted(self._log_path.glob("audit-*.jsonl"), reverse=True)
+        # Find the most recent audit log file. The active backend writes
+        # audit.jsonl and rotates to audit.jsonl.<timestamp>[.gz], while older
+        # builds used audit-YYYY-MM-DD.jsonl.
+        log_files = sorted(
+            list(self._log_path.glob("audit.jsonl"))
+            + list(self._log_path.glob("audit-*.jsonl")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if not log_files:
             return ""
 
@@ -112,7 +119,11 @@ class AuditHashChain:
             return True, []  # Empty log is valid
 
         # Collect all log files in order
-        log_files = sorted(log_path.glob("audit-*.jsonl"))
+        log_files = sorted(
+            list(log_path.glob("audit.jsonl"))
+            + list(log_path.glob("audit-*.jsonl")),
+            key=lambda p: p.stat().st_mtime,
+        )
 
         prev_hash = ""
         entry_count = 0
