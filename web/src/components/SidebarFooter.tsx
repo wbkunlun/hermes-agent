@@ -1,5 +1,5 @@
-import { Typography } from "@/components/NouiTypography";
-import type { StatusResponse } from "@/lib/api";
+import { Typography } from "@nous-research/ui/ui/components/typography";
+import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 
