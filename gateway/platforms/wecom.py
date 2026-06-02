@@ -92,6 +92,7 @@ CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+ERRCODE_NOT_SUBSCRIBED = 846609  # "aibot websocket not subscribed"
 
 DEDUP_MAX_SIZE = 1000
 
@@ -1223,8 +1224,56 @@ class WeComAdapter(BasePlatformAdapter):
             "created_at": finish_body.get("created_at"),
         }
 
+    async def _send_with_reconnect_retry(
+        self,
+        cmd: str,
+        body: Dict[str, Any],
+        reply_req_id: Optional[str] = None,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        """Send a request with one reconnection retry on ercode 846609.
+
+        When the WeCom WebSocket disconnects mid-session (ercode 846609,
+        "aibot websocket not subscribed"), this automatically reconnects
+        and retries the send once to avoid silent delivery failures.
+        """
+        # Ensure WebSocket is connected before attempting send
+        if self._ws is None or self._ws.closed:
+            logger.warning("[%s] WebSocket not connected, reconnecting before send...", self.name)
+            await self._open_connection()
+            self._mark_connected()
+
+        try:
+            if reply_req_id:
+                response = await self._send_reply_request(reply_req_id, body, cmd=cmd, timeout=timeout)
+            else:
+                response = await self._send_request(cmd, body, timeout)
+        except RuntimeError as exc:
+            if "not connected" in str(exc).lower():
+                logger.warning("[%s] WebSocket disconnected during send, reconnecting and retrying...", self.name)
+                await self._open_connection()
+                self._mark_connected()
+                if reply_req_id:
+                    return await self._send_reply_request(reply_req_id, body, cmd=cmd, timeout=timeout)
+                return await self._send_request(cmd, body, timeout)
+            raise
+
+        errcode = response.get("errcode", 0)
+        if errcode == ERRCODE_NOT_SUBSCRIBED:
+            logger.warning(
+                "[%s] ercode 846609 (not subscribed), reconnecting and retrying...",
+                self.name,
+            )
+            await self._open_connection()
+            self._mark_connected()
+            if reply_req_id:
+                return await self._send_reply_request(reply_req_id, body, cmd=cmd, timeout=timeout)
+            return await self._send_request(cmd, body, timeout)
+        return response
+
     async def _send_media_message(self, chat_id: str, media_type: str, media_id: str) -> Dict[str, Any]:
-        response = await self._send_request(
+        """Send a media message with reconnection retry on ercode 846609."""
+        response = await self._send_with_reconnect_retry(
             APP_CMD_SEND,
             {
                 "chatid": chat_id,
@@ -1236,12 +1285,14 @@ class WeComAdapter(BasePlatformAdapter):
         return response
 
     async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
-        response = await self._send_reply_request(
-            reply_req_id,
+        """Send a reply markdown with reconnection retry on ercode 846609."""
+        response = await self._send_with_reconnect_retry(
+            APP_CMD_RESPONSE,
             {
                 "msgtype": "markdown",
                 "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
             },
+            reply_req_id=reply_req_id,
         )
         self._raise_for_wecom_error(response, "send reply markdown")
         return response
@@ -1252,12 +1303,14 @@ class WeComAdapter(BasePlatformAdapter):
         media_type: str,
         media_id: str,
     ) -> Dict[str, Any]:
-        response = await self._send_reply_request(
-            reply_req_id,
+        """Send a reply media message with reconnection retry on ercode 846609."""
+        response = await self._send_with_reconnect_retry(
+            APP_CMD_RESPONSE,
             {
                 "msgtype": media_type,
                 media_type: {"media_id": media_id},
             },
+            reply_req_id=reply_req_id,
         )
         self._raise_for_wecom_error(response, "send reply media message")
         return response
@@ -1380,7 +1433,7 @@ class WeComAdapter(BasePlatformAdapter):
             if reply_req_id:
                 response = await self._send_reply_markdown(reply_req_id, content)
             else:
-                response = await self._send_request(
+                response = await self._send_with_reconnect_retry(
                     APP_CMD_SEND,
                     {
                         "chatid": chat_id,
