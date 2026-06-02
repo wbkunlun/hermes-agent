@@ -162,7 +162,15 @@ class WeComAdapter(BasePlatformAdapter):
         ).strip() or DEFAULT_WS_URL
 
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "open")).strip().lower()
-        self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
+        # dm_policy already honors WECOM_DM_POLICY, so the allowlist must honor
+        # WECOM_ALLOWED_USERS too. Without the env fallback an env-only setup
+        # (dm_policy=allowlist via env, no config extra) runs with an empty
+        # allowlist and drops every authorized DM at intake.
+        self._allow_from = _coerce_list(
+            extra.get("allow_from")
+            or extra.get("allowFrom")
+            or os.getenv("WECOM_ALLOWED_USERS", "")
+        )
 
         self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
@@ -185,6 +193,10 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+        # Serializes concurrent _reconnect_send() calls so that multiple send
+        # tasks (e.g. replying in two different chats) don't race on
+        # _listen_task / _ws / _session during reconnection.
+        self._reconnect_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -263,13 +275,23 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
+        ws_close_err: Optional[Exception] = None
         if self._ws and not self._ws.closed:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception as exc:
+                ws_close_err = exc
         self._ws = None
 
         if self._session and not self._session.closed:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception as exc:
+                ws_close_err = ws_close_err or exc
         self._session = None
+
+        if ws_close_err:
+            raise ws_close_err  # type: ignore[misc]
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
@@ -336,7 +358,20 @@ class WeComAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if not self._running:
                     return
-                logger.warning("[%s] WebSocket error: %s", self.name, exc)
+
+                # "Concurrent call to receive()" — aiohttp guard triggered because
+                # two send tasks raced through _reconnect_send() before the
+                # asyncio.Lock was added.  Treated as a transient disconnect;
+                # the reconnect below will create a fresh connection.
+                msg = str(exc)
+                if "Concurrent call to receive()" in msg:
+                    logger.info(
+                        "[%s] Concurrent receive detected (transient), reconnecting...",
+                        self.name,
+                    )
+                else:
+                    logger.warning("[%s] WebSocket error: %s", self.name, exc)
+
                 self._fail_pending_responses(RuntimeError("WeCom connection interrupted"))
 
                 delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
@@ -848,6 +883,11 @@ class WeComAdapter(BasePlatformAdapter):
     # Policy helpers
     # ------------------------------------------------------------------
 
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """WeCom gates DM/group access at intake via dm_policy/group_policy."""
+        return True
+
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
@@ -1219,29 +1259,41 @@ class WeComAdapter(BasePlatformAdapter):
         the connection we just established.  We cancel the background tasks
         before reconnecting and restart them afterward so we have exclusive
         control over the connection lifecycle during the retry.
+
+        Protected by ``_reconnect_lock`` so that concurrent send tasks (e.g.
+        replying in two different chats when both trigger reconnection) do
+        not race on ``_listen_task`` / ``_ws`` / ``_session``.  The first
+        caller reconnects; subsequent callers that waited for the lock and
+        find a healthy connection skip the reconnection work.
         """
-        # Pause background tasks to prevent race with _listen_loop
-        if self._listen_task and not self._listen_task.done():
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
-            self._listen_task = None
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
+        async with self._reconnect_lock:
+            # Another task may have already reconnected while we waited
+            # for the lock — if so, nothing more to do.
+            if self._ws is not None and not self._ws.closed:
+                return
 
-        self._fail_pending_responses(RuntimeError("WeCom reconnecting"))
-        await self._open_connection()
+            # Pause background tasks to prevent race with _listen_loop
+            if self._listen_task and not self._listen_task.done():
+                self._listen_task.cancel()
+                try:
+                    await self._listen_task
+                except asyncio.CancelledError:
+                    pass
+                self._listen_task = None
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                self._heartbeat_task = None
 
-        # Restart background tasks
-        self._listen_task = asyncio.create_task(self._listen_loop())
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._fail_pending_responses(RuntimeError("WeCom reconnecting"))
+            await self._open_connection()
+
+            # Restart background tasks
+            self._listen_task = asyncio.create_task(self._listen_loop())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def _send_with_reconnect_retry(
         self,
