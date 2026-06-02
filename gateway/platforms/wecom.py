@@ -149,6 +149,21 @@ class WeComAdapter(BasePlatformAdapter):
     # When a chunk is near the 4000-char limit, a continuation is almost certain.
     _SPLIT_THRESHOLD = 3900
 
+    # Active instance singleton (same pattern as YuanbaoAdapter).
+    # Allows tools like send_message to reuse the gateway's persistent WebSocket
+    # instead of creating a temporary connection that could conflict.
+    _active_instance: ClassVar[Optional["WeComAdapter"]] = None
+
+    @classmethod
+    def get_active(cls) -> Optional["WeComAdapter"]:
+        """Return the currently active gateway adapter, or None."""
+        return cls._active_instance
+
+    @classmethod
+    def set_active(cls, adapter: Optional["WeComAdapter"]) -> None:
+        """Set or clear the active gateway adapter."""
+        cls._active_instance = adapter
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM)
 
@@ -228,6 +243,7 @@ class WeComAdapter(BasePlatformAdapter):
             )
             await self._open_connection()
             self._mark_connected()
+            WeComAdapter.set_active(self)
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
@@ -264,6 +280,8 @@ class WeComAdapter(BasePlatformAdapter):
             self._heartbeat_task = None
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
+        if WeComAdapter._active_instance is self:
+            WeComAdapter.set_active(None)
         await self._cleanup_ws()
 
         if self._http_client:

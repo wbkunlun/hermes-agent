@@ -1534,7 +1534,13 @@ async def _send_dingtalk(extra, chat_id, message):
 
 
 async def _send_wecom(extra, chat_id, message):
-    """Send via WeCom using the adapter's WebSocket send pipeline."""
+    """Send via WeCom using the adapter's WebSocket send pipeline.
+
+    Priority:
+    1. Reuse the gateway's persistent WebSocket (avoids creating a new
+       connection that could conflict with the main gateway session).
+    2. Fall back to a temporary adapter + new WebSocket connection.
+    """
     try:
         from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
         if not check_wecom_requirements():
@@ -1543,6 +1549,16 @@ async def _send_wecom(extra, chat_id, message):
         return {"error": "WeCom adapter not available."}
 
     try:
+        # Priority 1: reuse the gateway's persistent WebSocket connection.
+        adapter = WeComAdapter.get_active()
+        if adapter is not None and adapter.is_connected:
+            logger.debug("[send_wecom] Reusing gateway WeCom adapter")
+            result = await adapter.send(chat_id, message)
+            if not result.success:
+                return _error(f"WeCom send failed: {result.error}")
+            return {"success": True, "platform": "wecom", "chat_id": chat_id, "message_id": result.message_id}
+
+        # Priority 2: no gateway adapter available — create a temporary one.
         from gateway.config import PlatformConfig
         pconfig = PlatformConfig(extra=extra)
         adapter = WeComAdapter(pconfig)
