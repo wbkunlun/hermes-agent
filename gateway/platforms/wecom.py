@@ -1224,6 +1224,38 @@ class WeComAdapter(BasePlatformAdapter):
             "created_at": finish_body.get("created_at"),
         }
 
+    async def _reconnect_send(self) -> None:
+        """Reconnect WebSocket, pausing background tasks to avoid races.
+
+        The ``_listen_loop`` background task also tries to reconnect after a
+        WebSocket drop.  If it races with our manual reconnect, it can close
+        the connection we just established.  We cancel the background tasks
+        before reconnecting and restart them afterward so we have exclusive
+        control over the connection lifecycle during the retry.
+        """
+        # Pause background tasks to prevent race with _listen_loop
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except asyncio.CancelledError:
+                pass
+            self._listen_task = None
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
+        self._fail_pending_responses(RuntimeError("WeCom reconnecting"))
+        await self._open_connection()
+
+        # Restart background tasks
+        self._listen_task = asyncio.create_task(self._listen_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
     async def _send_with_reconnect_retry(
         self,
         cmd: str,
@@ -1237,10 +1269,10 @@ class WeComAdapter(BasePlatformAdapter):
         "aibot websocket not subscribed"), this automatically reconnects
         and retries the send once to avoid silent delivery failures.
         """
-        # Ensure WebSocket is connected before attempting send
+        # === Pre-send liveness check ===
         if self._ws is None or self._ws.closed:
             logger.warning("[%s] WebSocket not connected, reconnecting before send...", self.name)
-            await self._open_connection()
+            await self._reconnect_send()
             self._mark_connected()
 
         try:
@@ -1249,14 +1281,19 @@ class WeComAdapter(BasePlatformAdapter):
             else:
                 response = await self._send_request(cmd, body, timeout)
         except RuntimeError as exc:
-            if "not connected" in str(exc).lower():
-                logger.warning("[%s] WebSocket disconnected during send, reconnecting and retrying...", self.name)
-                await self._open_connection()
-                self._mark_connected()
-                if reply_req_id:
-                    return await self._send_reply_request(reply_req_id, body, cmd=cmd, timeout=timeout)
-                return await self._send_request(cmd, body, timeout)
-            raise
+            # _listen_loop fails pending responses with "WeCom connection interrupted"
+            # and _send_request/_send_json use "WeCom websocket is not connected".
+            # Catch any RuntimeError from the send path — they all indicate a
+            # broken connection that should be retried after reconnecting.
+            logger.warning(
+                "[%s] RuntimeError during send (%s), reconnecting and retrying once...",
+                self.name, exc,
+            )
+            await self._reconnect_send()
+            self._mark_connected()
+            if reply_req_id:
+                return await self._send_reply_request(reply_req_id, body, cmd=cmd, timeout=timeout)
+            return await self._send_request(cmd, body, timeout)
 
         errcode = response.get("errcode", 0)
         if errcode == ERRCODE_NOT_SUBSCRIBED:
@@ -1264,7 +1301,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "[%s] ercode 846609 (not subscribed), reconnecting and retrying...",
                 self.name,
             )
-            await self._open_connection()
+            await self._reconnect_send()
             self._mark_connected()
             if reply_req_id:
                 return await self._send_reply_request(reply_req_id, body, cmd=cmd, timeout=timeout)
