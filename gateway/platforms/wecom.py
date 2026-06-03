@@ -1780,3 +1780,13 @@ def qr_scan_for_bot_info(
     print()  # newline after dots
     print(f"  QR scan timed out ({timeout_seconds // 60} minutes). Please try again.")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Module-level thin delegates (preserve import compatibility for external callers)
+# ---------------------------------------------------------------------------
+
+
+def get_active_adapter() -> Optional["WeComAdapter"]:
+    """Delegate to ``WeComAdapter.get_active()``."""
+    return WeComAdapter.get_active()

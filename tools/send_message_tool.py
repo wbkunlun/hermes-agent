@@ -1523,9 +1523,9 @@ async def _send_wecom(extra, chat_id, message):
     """Send via WeCom using the adapter's WebSocket send pipeline.
 
     Priority:
-    1. Reuse the gateway's persistent WebSocket (avoids creating a new
-       connection that could conflict with the main gateway session).
-    2. Fall back to a temporary adapter + new WebSocket connection.
+    1. Reuse the in-process gateway runner's WeCom adapter (``runner.adapters``).
+    2. Reuse the class singleton (``get_active_adapter`` / ``get_active``).
+    3. Fall back to a temporary adapter + new WebSocket connection.
     """
     try:
         from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
@@ -1534,17 +1534,51 @@ async def _send_wecom(extra, chat_id, message):
     except ImportError:
         return {"error": "WeCom adapter not available."}
 
-    try:
-        # Priority 1: reuse the gateway's persistent WebSocket connection.
-        adapter = WeComAdapter.get_active()
-        if adapter is not None and adapter.is_connected:
-            logger.debug("[send_wecom] Reusing gateway WeCom adapter")
-            result = await adapter.send(chat_id, message)
-            if not result.success:
-                return _error(f"WeCom send failed: {result.error}")
-            return {"success": True, "platform": "wecom", "chat_id": chat_id, "message_id": result.message_id}
+    async def _send_with_adapter(adapter, *, source: str):
+        if adapter is None or not getattr(adapter, "is_connected", False):
+            return None
+        logger.debug("[send_wecom] Reusing %s WeCom adapter", source)
+        result = await adapter.send(chat_id, message)
+        if not result.success:
+            return _error(f"WeCom send failed: {result.error}")
+        return {
+            "success": True,
+            "platform": "wecom",
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+        }
 
-        # Priority 2: no gateway adapter available — create a temporary one.
+    try:
+        # Priority 1: in-process gateway runner (no dependency on get_active).
+        runner = None
+        try:
+            from gateway.run import _gateway_runner_ref
+            from gateway.config import Platform
+
+            runner = _gateway_runner_ref()
+        except Exception:
+            runner = None
+        if runner is not None:
+            try:
+                adapter = runner.adapters.get(Platform.WECOM)
+            except Exception:
+                adapter = None
+            sent = await _send_with_adapter(adapter, source="gateway runner")
+            if sent is not None:
+                return sent
+
+        # Priority 2: class singleton (v2026.6.2.1+; getattr for mixed installs).
+        try:
+            from gateway.platforms.wecom import get_active_adapter
+        except ImportError:
+            get_active_adapter = getattr(WeComAdapter, "get_active", None)
+        if get_active_adapter is not None:
+            adapter = get_active_adapter()
+            sent = await _send_with_adapter(adapter, source="active singleton")
+            if sent is not None:
+                return sent
+
+        # Priority 3: no gateway adapter available — create a temporary one.
         from gateway.config import PlatformConfig
         pconfig = PlatformConfig(extra=extra)
         adapter = WeComAdapter(pconfig)
