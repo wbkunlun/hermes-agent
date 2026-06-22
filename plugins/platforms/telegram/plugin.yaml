@@ -1,0 +1,19 @@
+name: telegram-platform
+label: Telegram
+kind: platform
+version: 1.0.0
+description: >
+  Telegram platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/telegram.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: TELEGRAM_BOT_TOKEN
+    description: "Telegram bot token from @BotFather"
+    prompt: "Telegram bot token from @BotFather"
+    password: true
+  - name: TELEGRAM_ALLOWED_USERS
+    description: "Comma-separated allowlist"
+    prompt: "Comma-separated allowlist"
+    password: false

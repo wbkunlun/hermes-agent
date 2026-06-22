@@ -1,0 +1,184 @@
+name: Upstream Sync Check
+
+# Daily cron: probe upstream NousResearch/hermes-agent for new tags and
+# report a dry-run merge result against the fork's branch.
+#
+# Behaviour:
+#   * Every day at 06:00 UTC, run scripts/sync-upstream.sh --dry-run
+#     against the newest v2026.* upstream tag.
+#   * If a newer upstream tag exists than what's already on
+#     feat/upstream-v<N>.<N>.<N>-merge, open a PR (or comment on the
+#     existing one) so the operator can review and merge.
+#   * Manual trigger (`workflow_dispatch`) with an explicit tag is
+#     supported for ad-hoc checks.
+#
+# Replaces the manual "remember to sync" ritual with a CI beacon that
+# fires when upstream ships v0.18 (or whenever the next release lands).
+#
+# Per-adapter production fixes in gateway/platforms/*.py are protected
+# by sync-upstream.sh's pre-merge fork-content snapshot + post-merge
+# identity check, so a dry-run failure here is a real signal.
+
+on:
+  schedule:
+    # Daily at 06:00 UTC. Cheap (~30s), no matrix, single job.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Specific upstream tag to probe (default: newest v2026.*)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+# Skip on forks of the fork — only the canonical wbkunlun/hermes-agent
+# repo should be auto-opening PRs against itself.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.repository == 'wbkunlun/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # sync-upstream.sh walks merge history
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install bash + jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq >/dev/null
+
+      - name: Add upstream remote (idempotent)
+        run: |
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          fi
+          git remote -v
+
+      - name: Fetch upstream tags
+        run: git fetch upstream --tags
+
+      - name: Resolve target tag
+        id: target
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=$(git tag -l 'v2026*' --sort=-v:refname | head -1)
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "::error::no upstream v2026.* tag found"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Probing tag: $TAG"
+
+      - name: Detect existing merge branch
+        id: existing
+        run: |
+          SEMVER=$(echo "${{ steps.target.outputs.tag }}" | sed 's/^v//')
+          SEMVER_MAJOR=$(echo "$SEMVER" | cut -d. -f1)
+          SEMVER_MINOR=$(echo "$SEMVER" | cut -d. -f2)
+          SEMVER_PATCH=$(echo "$SEMVER" | cut -d. -f3)
+          BRANCH="feat/upstream-v${SEMVER_MAJOR}.${SEMVER_MINOR}.${SEMVER_PATCH}-merge"
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Merge branch: $BRANCH (exists=${{ steps.existing.outputs.exists }})"
+
+      - name: Run sync dry-run
+        id: dryrun
+        run: |
+          set +e
+          OUTPUT=$(bash scripts/sync-upstream.sh --dry-run "${{ steps.target.outputs.tag }}" 2>&1)
+          EXIT=$?
+          echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          if [[ $EXIT -ne 0 ]]; then
+            echo "::warning::dry-run exited with $EXIT — review step summary"
+          fi
+
+      - name: Compute drift signal
+        id: drift
+        run: |
+          UPSTREAM_TIP=$(git rev-parse "${{ steps.target.outputs.tag }}^{commit}")
+          # Compare against main (the most recent shipped fork release).
+          FORK_TIP=$(git rev-parse origin/main 2>/dev/null || echo "")
+          UPSTREAM_COMMITS=$(git log --oneline "$FORK_TIP..$UPSTREAM_TIP" 2>/dev/null | wc -l | tr -d ' ')
+          echo "upstream_commits=$UPSTREAM_COMMITS" >> "$GITHUB_OUTPUT"
+
+      - name: Open sync PR if upstream has moved
+        if: steps.existing.outputs.exists == 'false' && steps.drift.outputs.upstream_commits != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ steps.target.outputs.tag }}
+          BRANCH: ${{ steps.existing.outputs.branch }}
+          COMMITS: ${{ steps.drift.outputs.upstream_commits }}
+        run: |
+          BODY=$(cat <<EOF
+          ## Upstream ${TARGET} available
+
+          \`scripts/sync-upstream.sh\` reports upstream has moved \`${COMMITS}\` commits ahead of \`main\` since the last fork sync.
+
+          ### Next steps
+
+          \`\`\`bash
+          # Locally:
+          git fetch upstream --tags
+          bash scripts/sync-upstream.sh ${TARGET} --push
+          # Or just dry-run first:
+          bash scripts/sync-upstream.sh ${TARGET} --dry-run
+          \`\`\`
+
+          The sync script:
+
+          * Creates branch \`${BRANCH}\` if missing.
+          * Runs \`git merge ${TARGET} --no-edit -X theirs\`.
+          * Bumps \`pyproject.toml\` to v\${TARGET#v}.
+          * Runs \`tests/tools/test_send_message_wecom.py\`, \`tests/acp/test_session_provenance.py\`, and the provider-catalog smoke test.
+          * Fails the merge if any test fails — do NOT push past a red test.
+
+          cc: @brycehuang
+          EOF
+          )
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "sync: upstream ${TARGET}" \
+            --body "$BODY" \
+            --label "upstream-sync" \
+            --draft || echo "::notice::PR create skipped — branch may exist already"
+
+      - name: Post schedule-trigger summary
+        if: github.event_name == 'schedule'
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+          ---
+          **Schedule probe complete.**
+
+          * Target tag: \`${{ steps.target.outputs.tag }}\`
+          * Merge branch: \`${{ steps.existing.outputs.branch }}\` (exists=${{ steps.existing.outputs.exists }})
+          * Upstream commits ahead of main: ${{ steps.drift.outputs.upstream_commits }}
+          * Dry-run exit code: ${{ steps.dryrun.outputs.exit_code }}
+
+          $(if [[ "${{ steps.drift.outputs.upstream_commits }}" != "0" && "${{ steps.existing.outputs.exists }}" == "false" ]]; then echo "**Action needed**: a sync PR has been opened above."; else echo "No action needed."; fi)
+          EOF

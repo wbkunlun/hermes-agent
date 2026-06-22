@@ -1,0 +1,23 @@
+name: email-platform
+label: Email
+kind: platform
+version: 1.0.0
+description: >
+  Email platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/email.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: EMAIL_SMTP_HOST
+    description: "SMTP host"
+    prompt: "SMTP host"
+    password: false
+  - name: EMAIL_SMTP_USER
+    description: "SMTP user"
+    prompt: "SMTP user"
+    password: false
+  - name: EMAIL_SMTP_PASS
+    description: "SMTP password"
+    prompt: "SMTP password"
+    password: true

@@ -1,0 +1,12 @@
+name: whatsapp-platform
+label: WhatsApp
+kind: platform
+version: 1.0.0
+description: >
+  WhatsApp platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/whatsapp.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  []
