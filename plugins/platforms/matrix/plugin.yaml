@@ -1,0 +1,19 @@
+name: matrix-platform
+label: Matrix
+kind: platform
+version: 1.0.0
+description: >
+  Matrix platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/matrix.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: MATRIX_HOMESERVER
+    description: "Matrix homeserver URL"
+    prompt: "Matrix homeserver URL"
+    password: false
+  - name: MATRIX_ACCESS_TOKEN
+    description: "Matrix access token"
+    prompt: "Matrix access token"
+    password: true

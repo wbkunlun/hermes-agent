@@ -1,0 +1,23 @@
+name: sms-platform
+label: SMS
+kind: platform
+version: 1.0.0
+description: >
+  SMS platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/sms.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: TWILIO_ACCOUNT_SID
+    description: "Twilio account SID"
+    prompt: "Twilio account SID"
+    password: false
+  - name: TWILIO_AUTH_TOKEN
+    description: "Twilio auth token"
+    prompt: "Twilio auth token"
+    password: true
+  - name: TWILIO_FROM_NUMBER
+    description: "Twilio sender number"
+    prompt: "Twilio sender number"
+    password: false

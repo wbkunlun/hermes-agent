@@ -1,0 +1,15 @@
+name: dingtalk-platform
+label: DingTalk
+kind: platform
+version: 1.0.0
+description: >
+  DingTalk platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/dingtalk.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: DINGTALK_BOT_TOKEN
+    description: "DingTalk AI Bot token"
+    prompt: "DingTalk AI Bot token"
+    password: true

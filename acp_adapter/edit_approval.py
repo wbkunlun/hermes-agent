@@ -238,10 +238,22 @@ def make_acp_edit_approval_requester(
     timeout: float = 60.0,
     auto_approve_getter: Callable[[], tuple[str, str | None]] | None = None,
 ) -> EditApprovalRequester:
-    """Return a sync requester that bridges edit proposals to ACP permissions."""
+    """Return a sync requester that bridges edit proposals to ACP permissions.
+
+    Routing priority (kept conservative — production fixes preserved):
+
+    1. ``auto_approve_getter`` policy check first — same as upstream.
+    2. If ``request_permission_fn`` is provided, use the ACP client UI.
+    3. Otherwise — and only when running inside a gateway approval
+       context (e.g. ACP invoked from a wecom/Telegram bot session) —
+       delegate to ``tools.approval.request_elicitation_consent`` so the
+       approval surfaces through the existing gateway notification path
+       (Telegram buttons, wecom buttons, etc.). This was added in v0.17.0
+       to share the MCP elicitation handler with ACP edit approval.
+    4. Otherwise — fail closed (deny).
+    """
 
     def _requester(proposal: EditProposal) -> bool:
-        from acp.schema import PermissionOption
         from agent.async_utils import safe_schedule_threadsafe
 
         if auto_approve_getter is not None:
@@ -253,34 +265,79 @@ def make_acp_edit_approval_requester(
             except Exception:
                 logger.debug("ACP edit auto-approval policy check failed", exc_info=True)
 
-        options = [
-            PermissionOption(option_id="allow_once", kind="allow_once", name="Allow edit"),
-            PermissionOption(option_id="deny", kind="reject_once", name="Deny"),
-        ]
-        tool_call = build_acp_edit_tool_call(proposal)
-        coro = request_permission_fn(
-            session_id=session_id,
-            tool_call=tool_call,
-            options=options,
-        )
-        future = safe_schedule_threadsafe(
-            coro,
-            loop,
-            logger=logger,
-            log_message="Edit approval request: failed to schedule on loop",
-        )
-        if future is None:
-            return False
+        if request_permission_fn is not None:
+            # ACP client has its own UI — defer to it. The acp package import
+            # is local to this branch so the gateway-elicitation fallback
+            # below works even in environments without ``acp`` installed.
+            from acp.schema import PermissionOption
+
+            options = [
+                PermissionOption(option_id="allow_once", kind="allow_once", name="Allow edit"),
+                PermissionOption(option_id="deny", kind="reject_once", name="Deny"),
+            ]
+            tool_call = build_acp_edit_tool_call(proposal)
+            coro = request_permission_fn(
+                session_id=session_id,
+                tool_call=tool_call,
+                options=options,
+            )
+            future = safe_schedule_threadsafe(
+                coro,
+                loop,
+                logger=logger,
+                log_message="Edit approval request: failed to schedule on loop",
+            )
+            if future is None:
+                return False
+            try:
+                response = future.result(timeout=timeout)
+            except (FutureTimeout, Exception) as exc:
+                future.cancel()
+                logger.warning("Edit approval request timed out or failed: %s", exc)
+                return False
+            outcome = getattr(response, "outcome", None)
+            return (
+                getattr(outcome, "outcome", None) == "selected"
+                and getattr(outcome, "option_id", None) == "allow_once"
+            )
+
+        # No ACP request_permission_fn bound — try the gateway-aware
+        # MCP elicitation handler when the ACP run is happening inside a
+        # gateway session. This keeps approval unified across MCP servers
+        # and ACP clients (e.g. when an ACP run is driven by a wecom bot).
         try:
-            response = future.result(timeout=timeout)
-        except (FutureTimeout, Exception) as exc:
-            future.cancel()
-            logger.warning("Edit approval request timed out or failed: %s", exc)
+            from tools.approval import (
+                _is_gateway_approval_context,
+                request_elicitation_consent,
+            )
+        except Exception as exc:  # pragma: no cover -- import is environment-specific
+            logger.warning("ACP edit: approval surface unavailable: %s", exc)
             return False
-        outcome = getattr(response, "outcome", None)
-        return (
-            getattr(outcome, "outcome", None) == "selected"
-            and getattr(outcome, "option_id", None) == "allow_once"
+
+        if not _is_gateway_approval_context():
+            logger.debug(
+                "ACP edit approval requested outside a gateway context "
+                "and no ACP request_permission_fn bound — denying",
+            )
+            return False
+
+        message = f"Approve edit: {proposal.path}"
+        description = (
+            f"Tool: {proposal.tool_name}\n"
+            f"Path: {proposal.path}\n"
+            f"Old: {proposal.old_text or '(new file)'}\n"
+            f"New: {proposal.new_text}"
         )
+        try:
+            decision = request_elicitation_consent(
+                message,
+                description,
+                timeout_seconds=int(timeout),
+                surface="acp-edit-approval",
+            )
+        except Exception as exc:
+            logger.warning("ACP edit: elicitation consent failed: %s", exc)
+            return False
+        return decision == "accept"
 
     return _requester
