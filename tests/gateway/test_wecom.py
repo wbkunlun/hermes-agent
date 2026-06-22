@@ -171,6 +171,12 @@ class TestWeComReplyMode:
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        # Mock a healthy WebSocket so the production-grade
+        # _send_with_reconnect_retry wrapper (added in v0.16.0 for the
+        # ercode-846609 auto-retry path) skips its pre-send liveness
+        # reconnect. Without this mock the wrapper would attempt a
+        # real websocket connect inside the test and time out.
+        adapter._ws = AsyncMock(closed=False)
         adapter._reply_req_ids["msg-1"] = "req-1"
         adapter._send_reply_request = AsyncMock(
             return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
@@ -192,6 +198,10 @@ class TestWeComReplyMode:
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        # See comment in test_send_uses_passive_reply_markdown_… above —
+        # the production _send_with_reconnect_retry wrapper triggers a
+        # real reconnect on _ws=None, which times out the test.
+        adapter._ws = AsyncMock(closed=False)
         adapter._reply_req_ids["msg-1"] = "req-1"
         adapter._prepare_outbound_media = AsyncMock(
             return_value={
@@ -507,14 +517,22 @@ class TestMediaUpload:
 class TestSend:
     @pytest.mark.asyncio
     async def test_send_uses_proactive_payload(self):
-        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+        from gateway.platforms.wecom import APP_CMD_SEND, REQUEST_TIMEOUT_SECONDS, WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        # Mock a healthy WebSocket so _send_with_reconnect_retry (the
+        # production 846609-retry wrapper added in v0.16.0) skips its
+        # pre-send liveness reconnect and goes straight to the mocked
+        # _send_request.
+        adapter._ws = AsyncMock(closed=False)
         adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-1"}, "errcode": 0})
 
         result = await adapter.send("chat-123", "Hello WeCom")
 
         assert result.success is True
+        # _send_with_reconnect_retry forwards REQUEST_TIMEOUT_SECONDS to
+        # _send_request as a positional argument; include it so the
+        # mock signature matches the production call shape.
         adapter._send_request.assert_awaited_once_with(
             APP_CMD_SEND,
             {
@@ -522,6 +540,7 @@ class TestSend:
                 "msgtype": "markdown",
                 "markdown": {"content": "Hello WeCom"},
             },
+            REQUEST_TIMEOUT_SECONDS,
         )
 
     @pytest.mark.asyncio
@@ -529,6 +548,7 @@ class TestSend:
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)
         adapter._send_request = AsyncMock(return_value={"errcode": 40001, "errmsg": "bad request"})
 
         result = await adapter.send("chat-123", "Hello WeCom")
@@ -829,6 +849,7 @@ class TestWeComZombieSessionFix:
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)
         adapter._last_chat_req_ids["group-1"] = "inbound-req-42"
         adapter._send_reply_request = AsyncMock(
             return_value={"headers": {"req_id": "inbound-req-42"}, "errcode": 0}
@@ -854,6 +875,7 @@ class TestWeComZombieSessionFix:
         from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)
         adapter._send_request = AsyncMock(
             return_value={"headers": {"req_id": "new"}, "errcode": 0}
         )
