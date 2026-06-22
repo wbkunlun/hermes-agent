@@ -1,0 +1,19 @@
+name: feishu-platform
+label: Feishu
+kind: platform
+version: 1.0.0
+description: >
+  Feishu platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/feishu.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: FEISHU_APP_ID
+    description: "Feishu app ID"
+    prompt: "Feishu app ID"
+    password: false
+  - name: FEISHU_APP_SECRET
+    description: "Feishu app secret"
+    prompt: "Feishu app secret"
+    password: true

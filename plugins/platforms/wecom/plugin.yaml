@@ -1,0 +1,88 @@
+name: wecom-platform
+label: WeCom (Enterprise WeChat) + Callback
+kind: platform
+version: 1.0.0
+description: >
+  WeCom (Enterprise WeChat) platform plugin — bundled into the upstream
+  ``plugins/platforms/wecom`` slot.
+
+  Ships two transports, both registered as distinct platforms:
+
+  - ``wecom`` — WeCom AI Bot WebSocket gateway (aibot_subscribe /
+    aibot_msg_callback / aibot_send_msg / aibot_upload_media_*).
+  - ``wecom_callback`` — Self-built app HTTP callback flow (BizMsgCrypt
+    AES-CBC XML envelopes, decrypted via ``plugins.platforms.wecom.crypto``).
+
+  Includes production-tested fixes for runtime crashes observed in the
+  fork's deployment:
+
+  * asyncio.Lock on _reconnect_send — serialises concurrent reconnect
+    attempts from parallel send tasks so they don't race on
+    _listen_task / _ws / _session.
+  * _send_with_reconnect_retry retries on RuntimeError AND on errcode
+    846609 (aibot websocket not subscribed) — fixes silent delivery
+    failures when the gateway's persistent WebSocket drops mid-session.
+  * _flush_text_batch cancel-delivery race guard — prevents the
+    CPython Task._must_cancel edge-case where a merged text event
+    is silently dropped when a superseding timer fires just before
+    handle_message sees CancelledError.
+  * dm_policy WECOM_ALLOWED_USERS env-var fallback — env-only
+    allowlist setups no longer drop every authorised DM at intake.
+  * Concurrent-receive transient-detection in _listen_loop —
+    pre-Lock race regression that aiohttp raised as "Concurrent call
+    to receive()" is treated as a transient disconnect and reconnects.
+
+author: wbkunlun (fork), NousResearch (upstream)
+multiplex:
+  # Wecom AI-bot WebSocket transport does NOT bind a port, so each profile
+  # in multiplex mode gets its own bot ID/secret via
+  # ``agent.secret_scope.build_profile_secret_scope`` (upstream phase 2
+  # "fail-closed profile credential isolation"). Profile keys are stamped
+  # into session IDs so sessions from different wecom bots never collide.
+  #
+  # Setup for two isolated wecom bots in multiplex mode:
+  #
+  #   # ~/.hermes/.env  (default profile)
+  #   WECOM_BOT_ID=bot_a_id
+  #   WECOM_SECRET=bot_a_secret
+  #   WECOM_ALLOWED_USERS=user_a
+  #   gateway.multiplex_profiles=true
+  #
+  #   # ~/.hermes/profiles/sales/.env  (sales profile)
+  #   WECOM_BOT_ID=bot_b_id
+  #   WECOM_SECRET=bot_b_secret
+  #   WECOM_ALLOWED_USERS=user_b
+  #
+  # The default profile's gateway serves inbound for every profile on the
+  # host, and credentials are scoped per-profile.
+  #
+  # NOTE: wecom_callback (self-built HTTP) IS in the port-binding set
+  # (port 8645) — running more than one profile with wecom_callback
+  # requires different ``port`` overrides per profile.
+  port_binding: false
+  transport: websocket
+requires_env:
+  - name: WECOM_BOT_ID
+    description: "WeCom AI Bot ID (or set bot_id in platforms.wecom.extra)"
+    prompt: "WeCom Bot ID"
+    password: false
+  - name: WECOM_SECRET
+    description: "WeCom AI Bot secret paired with the bot ID"
+    prompt: "WeCom Bot Secret"
+    password: true
+optional_env:
+  - name: WECOM_WEBSOCKET_URL
+    description: "WeCom AI-Bot WebSocket URL (default: wss://openws.work.weixin.qq.com)"
+    prompt: "WeCom WebSocket URL"
+  - name: WECOM_DM_POLICY
+    description: "DM policy: open | allowlist | disabled | pairing (default: open)"
+    prompt: "WeCom DM policy"
+  - name: WECOM_ALLOWED_USERS
+    description: "Comma-separated allowlist of user IDs when dm_policy=allowlist"
+    prompt: "WeCom allowed users"
+  - name: WECOM_GROUP_POLICY
+    description: "Group policy: open | allowlist | disabled (default: open)"
+    prompt: "WeCom group policy"
+  - name: WECOM_HOME_CHANNEL
+    description: "Default WeCom chat for cronjob deliver=wecom"
+    prompt: "WeCom home channel"

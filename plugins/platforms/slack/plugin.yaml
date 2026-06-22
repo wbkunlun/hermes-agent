@@ -1,0 +1,19 @@
+name: slack-platform
+label: Slack
+kind: platform
+version: 1.0.0
+description: >
+  Slack platform adapter — bundled-plugin thin wrapper.
+
+  Full implementation lives in ``gateway/platforms/slack.py`` so all
+  fork-specific production fixes are preserved verbatim.
+author: wbkunlun (fork), NousResearch (upstream)
+requires_env:
+  - name: SLACK_BOT_TOKEN
+    description: "Slack bot OAuth token (xoxb-...)"
+    prompt: "Slack bot OAuth token (xoxb-...)"
+    password: true
+  - name: SLACK_ALLOWED_USERS
+    description: "Comma-separated allowlist"
+    prompt: "Comma-separated allowlist"
+    password: false
