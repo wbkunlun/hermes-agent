@@ -373,6 +373,82 @@ class TestMediaHelpers:
         assert result["rejected"] is True
         assert "20MB" in (result["reject_reason"] or "")
 
+    def test_decode_base64_pads_unpadded_wecom_payloads(self):
+        """Regression test for wehermes issue 2026-06-24.
+
+        WeCom strips trailing ``=`` from base64 strings in some
+        callbacks, so ``image.base64`` arrives as 43 chars
+        (``binascii.Error: ... number of data characters 3 cannot be 1
+        more than a multiple of 4``). ``_decode_base64`` must pad to a
+        multiple of 4 before decoding.
+        """
+        import base64
+        from gateway.platforms.wecom import WeComAdapter
+
+        # Round-trip: 32 random bytes → base64 → strip padding → re-decode
+        raw = os.urandom(32)
+        encoded = base64.b64encode(raw).decode()
+        unpadded = encoded.rstrip("=")
+        assert len(unpadded) % 4 != 0, "test precondition: stripped payload must be unpadded"
+
+        decoded = WeComAdapter._decode_base64(unpadded)
+        assert decoded == raw
+
+        # The literal 43-char example from the issue.
+        literal = "S4vLcShLQvWd1Y1G27IjGRrZtmKo2EEPql2ttk1thRA"
+        assert len(literal) == 43
+        decoded_literal = WeComAdapter._decode_base64(literal)
+        assert len(decoded_literal) == 32
+
+        # data: URI prefix still handled (only the post-comma segment is decoded)
+        with_prefix = WeComAdapter._decode_base64("data:image/png;base64," + encoded)
+        assert with_prefix == raw
+
+    def test_url_safety_disabled_by_default(self):
+        """Default behaviour must keep SSRF protection enabled.
+
+        Opt-out is a per-deployment decision (Tencent Cloud COS,
+        corporate proxy, VPN-routed egress). See
+        ``docs/issues/hermes-agent-wecom-regressions-2026-06-24.md``.
+        """
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        assert adapter._url_safety_disabled() is False
+
+    def test_url_safety_disabled_via_extra(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"disable_url_safety": True})
+        )
+        assert adapter._url_safety_disabled() is True
+
+    def test_url_safety_disabled_via_env_var(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setenv("WECOM_DISABLE_URL_SAFETY", "true")
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        assert adapter._url_safety_disabled() is True
+
+    def test_url_safety_env_var_truthy_parsing(self, monkeypatch):
+        """``WECOM_DISABLE_URL_SAFETY`` accepts 1/true/yes/on (case-insensitive)."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        for truthy in ("1", "true", "TRUE", "Yes", "on", "  yes  "):
+            monkeypatch.setenv("WECOM_DISABLE_URL_SAFETY", truthy)
+            adapter = WeComAdapter(PlatformConfig(enabled=True))
+            assert adapter._url_safety_disabled() is True, f"failed for {truthy!r}"
+
+        for falsy in ("", "0", "false", "no", "off", "anything-else"):
+            monkeypatch.setenv("WECOM_DISABLE_URL_SAFETY", falsy)
+            adapter = WeComAdapter(PlatformConfig(enabled=True))
+            assert adapter._url_safety_disabled() is False, f"failed for {falsy!r}"
+
     def test_decrypt_file_bytes_round_trip(self):
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from gateway.platforms.wecom import WeComAdapter
