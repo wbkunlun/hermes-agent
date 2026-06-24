@@ -845,6 +845,14 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _decode_base64(data: str) -> bytes:
         payload = data.split(",", 1)[-1].strip()
+        # WeCom strips trailing '=' from base64 strings in some
+        # callbacks (43-char payloads are common). base64.b64decode()
+        # requires length to be a multiple of 4 — pad before decoding
+        # so callers don't get ``binascii.Error: number of data
+        # characters 3 cannot be 1 more than a multiple of 4`` and
+        # silently lose inbound image media.
+        # Same fix already present in ``_decrypt_file_bytes``.
+        payload = payload + "=" * ((4 - len(payload) % 4) % 4)
         return base64.b64decode(payload)
 
     @staticmethod
@@ -968,6 +976,35 @@ class WeComAdapter(BasePlatformAdapter):
         if not normalized or normalized.startswith("quote:"):
             return None
         return self._reply_req_ids.get(normalized)
+
+    def _url_safety_disabled(self) -> bool:
+        """True when the operator has opted out of ``tools.url_safety`` for
+        WeCom media downloads.
+
+        Triggered by either:
+
+        * ``config.yaml``::
+
+              platforms:
+                wecom:
+                  extra:
+                    disable_url_safety: true
+
+        * Environment variable ``WECOM_DISABLE_URL_SAFETY=true`` (or any
+          truthy value per ``_coerce_list`` style parsing).
+
+        Default: ``False`` — the SSRF check stays on so public-internet
+        deployments keep the upstream protection. See
+        ``docs/issues/hermes-agent-wecom-regressions-2026-06-24.md`` for
+        the Tencent Cloud COS / corporate-proxy motivation.
+        """
+        extra = self.config.extra or {}
+        if extra.get("disable_url_safety"):
+            return True
+        env_value = os.getenv("WECOM_DISABLE_URL_SAFETY", "")
+        if env_value.strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Outbound messaging
@@ -1116,9 +1153,19 @@ class WeComAdapter(BasePlatformAdapter):
         url: str,
         max_bytes: int,
     ) -> Tuple[bytes, Dict[str, str]]:
-        from tools.url_safety import is_safe_url
-        if not is_safe_url(url):
-            raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
+        # WeCom media URLs are part of the Tencent-signed webhook payload,
+        # not chosen by the model — there's no SSRF risk from the LLM side.
+        # Tencent Cloud VPCs resolve ``*.cos.<region>.myqcloud.com`` to
+        # ``169.254.0.0/16`` (link-local) for the in-VPC free-egress
+        # optimisation, which ``tools.url_safety.is_safe_url`` permanently
+        # blocks regardless of ``security.allow_private_urls``. Operators
+        # in Tencent / Huawei / corporate-proxy / VPN egress environments
+        # opt back in via the per-platform ``disable_url_safety`` extra
+        # or the ``WECOM_DISABLE_URL_SAFETY`` env var.
+        if not self._url_safety_disabled():
+            from tools.url_safety import is_safe_url
+            if not is_safe_url(url):
+                raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
 
         if not HTTPX_AVAILABLE:
             raise RuntimeError("httpx is required for WeCom media download")
