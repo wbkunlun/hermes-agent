@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -162,6 +163,15 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+# Compression circuit breaker: after N consecutive failures the LLM
+# summary call is skipped entirely for COOLDOWN seconds, falling back
+# to static truncation.  Prevents a slow/unresponsive auxiliary model
+# from blocking the agent thread on every compression cycle.
+_COMPRESSION_CB_THRESHOLD = 2
+_COMPRESSION_CB_COOLDOWN = 300
+_compression_cb_lock = threading.Lock()
+_compression_cb_failures: dict = {}  # session_id -> consecutive_failures
+_compression_cb_cooldown_until: dict = {}  # session_id -> monotonic time
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -2280,7 +2290,26 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        # Check compression circuit breaker before LLM call
+        _session_id = str(id(self))
+        with _compression_cb_lock:
+            _cb_cooldown = _compression_cb_cooldown_until.get(_session_id, 0)
+            _cb_fails = _compression_cb_failures.get(_session_id, 0)
+            _circuit_open = (
+                _cb_fails >= _COMPRESSION_CB_THRESHOLD
+                and time.monotonic() < _cb_cooldown
+            )
+        if _circuit_open:
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression circuit breaker open (%d consecutive failures), "
+                    "skipping LLM summary for %d more seconds",
+                    _cb_fails,
+                    max(0, int(_cb_cooldown - time.monotonic())),
+                )
+            summary = None
+        else:
+            summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -2307,6 +2336,21 @@ This compaction should PRIORITISE preserving all information related to the focu
                     n_skipped,
                 )
             return messages
+
+        # Record success/failure for circuit breaker
+        with _compression_cb_lock:
+            if summary:
+                _compression_cb_failures[_session_id] = 0
+            else:
+                _prev = _compression_cb_failures.get(_session_id, 0)
+                _compression_cb_failures[_session_id] = _prev + 1
+                if _prev + 1 >= _COMPRESSION_CB_THRESHOLD:
+                    _compression_cb_cooldown_until[_session_id] = time.monotonic() + _COMPRESSION_CB_COOLDOWN
+                    logger.warning(
+                        "Compression circuit breaker tripped (%d consecutive failures), "
+                        "cooldown for %d seconds",
+                        _prev + 1, _COMPRESSION_CB_COOLDOWN,
+                    )
 
         # Phase 4: Assemble compressed message list
         compressed = []

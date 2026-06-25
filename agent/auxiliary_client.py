@@ -4925,7 +4925,7 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     raw = task_config.get("timeout")
     if raw is not None:
         try:
-            return float(raw)
+            return max(float(raw), 5.0)
         except (ValueError, TypeError):
             pass
     return default

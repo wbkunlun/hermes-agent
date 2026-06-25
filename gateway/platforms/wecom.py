@@ -67,6 +67,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    resolve_proxy_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -238,8 +239,13 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
             from gateway.platforms._http_client_limits import platform_httpx_limits
+            _proxy_url = resolve_proxy_url()
+            if _proxy_url:
+                _httpx_kwargs = {"proxies": [httpx.Proxy(url=_proxy_url)]}
+            else:
+                _httpx_kwargs = {}
             self._http_client = httpx.AsyncClient(
-                timeout=30.0, follow_redirects=True, limits=platform_httpx_limits(),
+                timeout=30.0, follow_redirects=True, limits=platform_httpx_limits(), **_httpx_kwargs,
             )
             await self._open_connection()
             self._mark_connected()
@@ -1170,8 +1176,12 @@ class WeComAdapter(BasePlatformAdapter):
         if not HTTPX_AVAILABLE:
             raise RuntimeError("httpx is required for WeCom media download")
 
-        client = self._http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        created_client = client is not self._http_client
+        # Use a fresh proxy-free client so COS / image downloads
+        # go direct and are not blocked by SSRF protection.
+        # trust_env=False ensures NO proxy is used regardless of env vars.
+        _download_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, trust_env=False)
+        client = _download_client
+        created_client = True
         try:
             async with client.stream(
                 "GET",
