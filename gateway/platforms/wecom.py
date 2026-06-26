@@ -241,7 +241,7 @@ class WeComAdapter(BasePlatformAdapter):
             from gateway.platforms._http_client_limits import platform_httpx_limits
             _proxy_url = resolve_proxy_url()
             if _proxy_url:
-                _httpx_kwargs = {"proxies": [httpx.Proxy(url=_proxy_url)]}
+                _httpx_kwargs = {"proxy": httpx.Proxy(url=_proxy_url)}
             else:
                 _httpx_kwargs = {}
             self._http_client = httpx.AsyncClient(
