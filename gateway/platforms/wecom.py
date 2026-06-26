@@ -67,7 +67,6 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
-    resolve_proxy_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -239,13 +238,8 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
             from gateway.platforms._http_client_limits import platform_httpx_limits
-            _proxy_url = resolve_proxy_url()
-            if _proxy_url:
-                _httpx_kwargs = {"proxy": httpx.Proxy(url=_proxy_url)}
-            else:
-                _httpx_kwargs = {}
             self._http_client = httpx.AsyncClient(
-                timeout=30.0, follow_redirects=True, limits=platform_httpx_limits(), **_httpx_kwargs,
+                timeout=30.0, follow_redirects=True, limits=platform_httpx_limits(),
             )
             await self._open_connection()
             self._mark_connected()
