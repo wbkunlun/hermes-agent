@@ -546,11 +546,16 @@ class TestMediaUpload:
             def stream(self, method, url, headers=None):
                 return FakeResponse()
 
-        adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._http_client = FakeClient()
+            async def aclose(self):
+                return None
 
-        with pytest.raises(ValueError, match="exceeds WeCom limit"):
-            await adapter._download_remote_bytes("https://example.com/file.bin", max_bytes=4)
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+
+        # _download_remote_bytes builds its own proxy-free httpx.AsyncClient
+        # (it does not reuse self._http_client), so patch the constructor.
+        with patch("gateway.platforms.wecom.httpx.AsyncClient", return_value=FakeClient()):
+            with pytest.raises(ValueError, match="exceeds WeCom limit"):
+                await adapter._download_remote_bytes("https://example.com/file.bin", max_bytes=4)
 
     @pytest.mark.asyncio
     async def test_cache_media_decrypts_url_payload_before_writing(self):
@@ -593,22 +598,20 @@ class TestMediaUpload:
 class TestSend:
     @pytest.mark.asyncio
     async def test_send_uses_proactive_payload(self):
-        from gateway.platforms.wecom import APP_CMD_SEND, REQUEST_TIMEOUT_SECONDS, WeComAdapter
+        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        # Mock a healthy WebSocket so _send_with_reconnect_retry (the
-        # production 846609-retry wrapper added in v0.16.0) skips its
-        # pre-send liveness reconnect and goes straight to the mocked
-        # _send_request.
+        # Mock a healthy WebSocket so the send() fast path goes straight to
+        # the mocked _send_request (instead of enqueueing for the worker).
         adapter._ws = AsyncMock(closed=False)
         adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-1"}, "errcode": 0})
 
         result = await adapter.send("chat-123", "Hello WeCom")
 
         assert result.success is True
-        # _send_with_reconnect_retry forwards REQUEST_TIMEOUT_SECONDS to
-        # _send_request as a positional argument; include it so the
-        # mock signature matches the production call shape.
+        # Fast path calls _send_request directly with the default timeout
+        # (no positional timeout arg) — it no longer routes through
+        # _send_with_reconnect_retry.
         adapter._send_request.assert_awaited_once_with(
             APP_CMD_SEND,
             {
@@ -616,7 +619,6 @@ class TestSend:
                 "msgtype": "markdown",
                 "markdown": {"content": "Hello WeCom"},
             },
-            REQUEST_TIMEOUT_SECONDS,
         )
 
     @pytest.mark.asyncio
@@ -864,7 +866,7 @@ class TestWeComZombieSessionFix:
         }
 
         await adapter._on_message(payload)
-        assert adapter._last_chat_req_ids["group-1"] == "req-abc"
+        assert adapter._last_chat_req_ids["group-1"] == ["req-abc"]
 
     @pytest.mark.asyncio
     async def test_on_message_does_not_cache_blocked_sender_req_id(self):
@@ -906,7 +908,7 @@ class TestWeComZombieSessionFix:
         assert len(adapter._last_chat_req_ids) <= DEDUP_MAX_SIZE
         # The most recently remembered chat must still be present.
         latest = f"chat-{DEDUP_MAX_SIZE + 49}"
-        assert adapter._last_chat_req_ids[latest] == f"req-{DEDUP_MAX_SIZE + 49}"
+        assert adapter._last_chat_req_ids[latest] == [f"req-{DEDUP_MAX_SIZE + 49}"]
 
     def test_remember_chat_req_id_ignores_empty_values(self):
         from gateway.platforms.wecom import WeComAdapter
@@ -926,7 +928,7 @@ class TestWeComZombieSessionFix:
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._ws = AsyncMock(closed=False)
-        adapter._last_chat_req_ids["group-1"] = "inbound-req-42"
+        adapter._last_chat_req_ids["group-1"] = ["inbound-req-42"]
         adapter._send_reply_request = AsyncMock(
             return_value={"headers": {"req_id": "inbound-req-42"}, "errcode": 0}
         )
@@ -1051,3 +1053,245 @@ class TestTextBatchFlushRace:
         assert adapter._pending_text_batches.get(key) is None, (
             "active task must pop the event after processing"
         )
+
+
+class TestReliabilityBundle:
+    """Send-reliability bundle: send-queue/worker, heartbeat-ack reconnect,
+    subscription-death handling, req-id sliding window, inbound PING/PONG.
+
+    These behaviors were ported from the wehermes overlay into the fork so
+    transient WebSocket drops don't silently lose agent replies.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_payload_replies_pong_to_ping(self):
+        from gateway.platforms.wecom import APP_CMD_PONG, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_json = AsyncMock()
+
+        await adapter._dispatch_payload({
+            "cmd": "ping",
+            "headers": {"req_id": "r1"},
+            "body": {},
+        })
+
+        adapter._send_json.assert_awaited_once()
+        sent = adapter._send_json.await_args.args[0]
+        assert sent["cmd"] == APP_CMD_PONG
+        assert sent["headers"]["req_id"] == "r1"
+        assert sent["body"] == {}
+
+    def test_remember_chat_req_id_keeps_sliding_window_of_3(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._remember_chat_req_id("c1", "r1")
+        adapter._remember_chat_req_id("c1", "r2")
+        adapter._remember_chat_req_id("c1", "r3")
+        adapter._remember_chat_req_id("c1", "r4")
+
+        assert adapter._last_chat_req_ids["c1"] == ["r2", "r3", "r4"]
+
+    @pytest.mark.asyncio
+    async def test_send_uses_last_req_id_in_sliding_window(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)
+        adapter._last_chat_req_ids["g1"] = ["old", "new"]
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "new"}, "errcode": 0}
+        )
+
+        result = await adapter.send("g1", "ping")
+
+        assert result.success is True
+        # Must use the most recent req_id in the window ([-1]), not the whole list.
+        assert adapter._send_reply_request.await_args.args[0] == "new"
+
+    @pytest.mark.asyncio
+    async def test_send_enqueues_when_ws_down_returns_queued_id(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = None  # WS unavailable
+
+        result = await adapter.send("c1", "hello")
+
+        assert result.success is True
+        assert result.message_id.startswith("queued:")
+        assert adapter._send_queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_send_returns_failure_on_queue_full(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = None
+        # Pre-fill the queue to its maxsize (64).
+        for _ in range(64):
+            adapter._send_queue.put_nowait({"chat_id": "x", "content": "x", "reply_to": None})
+
+        result = await adapter.send("c1", "hello")
+
+        assert result.success is False
+        assert "queue full" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_send_enqueues_on_ws_not_connected_runtime_error(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)  # looks healthy...
+        adapter._send_request = AsyncMock(
+            side_effect=RuntimeError("WeCom websocket is not connected")
+        )
+
+        result = await adapter.send("c1", "hello")
+
+        assert result.success is True
+        assert result.message_id.startswith("queued:")
+        assert adapter._send_queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_send_returns_failure_on_non_ws_runtime_error(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)
+        adapter._send_request = AsyncMock(side_effect=RuntimeError("something else"))
+
+        result = await adapter.send("c1", "hello")
+
+        assert result.success is False
+        assert adapter._send_queue.qsize() == 0  # NOT enqueued — real failure
+
+    @pytest.mark.asyncio
+    async def test_send_worker_drains_queue_and_sends(self):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ensure_ws_alive = AsyncMock(return_value=True)
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})
+
+        adapter._send_queue.put_nowait({"chat_id": "c1", "content": "hello", "reply_to": None})
+        adapter._send_queue.put_nowait(None)  # sentinel stops the loop after draining
+
+        await adapter._send_worker_loop()
+
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {"chatid": "c1", "msgtype": "markdown", "markdown": {"content": "hello"}},
+        )
+        assert adapter._send_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_send_worker_drops_when_ws_stays_down(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ensure_ws_alive = AsyncMock(return_value=False)
+        adapter._send_request = AsyncMock()
+        # Zero the retry backoff so the test doesn't sleep for seconds.
+        monkeypatch.setattr(wecom_module, "SEND_RETRY_BACKOFF", [0.0, 0.0, 0.0], raising=False)
+
+        adapter._send_queue.put_nowait({"chat_id": "c1", "content": "hello", "reply_to": None})
+        adapter._send_queue.put_nowait(None)  # sentinel
+
+        await adapter._send_worker_loop()
+
+        adapter._send_request.assert_not_awaited()  # never sent — WS stayed down
+        assert adapter._send_queue.empty()  # message dropped after retries
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_ack_timeout_forces_reconnect_after_3_strikes(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock(closed=False)
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+        # 3 consecutive ack timeouts, then a success so the loop settles.
+        calls = {"n": 0}
+
+        async def _fake_send_request(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise asyncio.TimeoutError()
+            return {"errcode": 0}
+
+        adapter._send_request = _fake_send_request
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        await asyncio.sleep(0.15)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        adapter._cleanup_ws.assert_awaited_once()  # exactly one reconnect after 3 misses
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_single_miss_does_not_reconnect(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock(closed=False)
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+        # 2 misses (below the 3-strike threshold), then a success.
+        calls = {"n": 0}
+
+        async def _fake_send_request(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise asyncio.TimeoutError()
+            return {"errcode": 0}
+
+        adapter._send_request = _fake_send_request
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        await asyncio.sleep(0.15)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        adapter._cleanup_ws.assert_not_awaited()  # transient misses must NOT tear down the WS
+
+    @pytest.mark.asyncio
+    async def test_subscription_death_hook_cleans_up_on_846609(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock(closed=False)
+
+        # Drive _send_request's correlated future to a 846609 response.
+        async def _fake_send_json(payload):
+            req_id = payload["headers"]["req_id"]
+            fut = adapter._pending_responses.get(req_id)
+            if fut and not fut.done():
+                fut.set_result({"errcode": 846609, "errmsg": "aibot websocket not subscribed"})
+
+        adapter._send_json = _fake_send_json
+        adapter._fail_pending_responses = MagicMock()
+        adapter._cleanup_ws = AsyncMock()
+
+        response = await adapter._send_request("aibot_send_msg", {})
+
+        assert response.get("errcode") == 846609
+        adapter._fail_pending_responses.assert_called_once()
+        adapter._cleanup_ws.assert_awaited_once()

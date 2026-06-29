@@ -80,6 +80,7 @@ APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
 APP_CMD_SEND = "aibot_send_msg"
 APP_CMD_RESPONSE = "aibot_respond_msg"
 APP_CMD_PING = "ping"
+APP_CMD_PONG = "pong"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
 APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
 APP_CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
@@ -91,8 +92,17 @@ MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+HEARTBEAT_TIMEOUT_SECONDS = 10.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 ERRCODE_NOT_SUBSCRIBED = 846609  # "aibot websocket not subscribed"
+# errcodes indicating the WeCom subscription has died and the socket must be
+# torn down so _listen_loop reconnects. Kept as a set so future codes can be
+# added; mirrors ERRCODE_NOT_SUBSCRIBED which is retained for direct compares.
+SUBSCRIPTION_DEAD_ERROR_CODES = {ERRCODE_NOT_SUBSCRIBED}
+
+# Background send-worker retry tuning (see _send_worker_loop).
+SEND_RETRY_MAX = 3
+SEND_RETRY_BACKOFF = [1.0, 2.0, 4.0]
 
 DEDUP_MAX_SIZE = 1000
 
@@ -207,11 +217,18 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
-        self._last_chat_req_ids: Dict[str, str] = {}
+        self._last_chat_req_ids: Dict[str, List[str]] = {}
         # Serializes concurrent _reconnect_send() calls so that multiple send
         # tasks (e.g. replying in two different chats) don't race on
         # _listen_task / _ws / _session during reconnection.
         self._reconnect_lock = asyncio.Lock()
+
+        # Outbound send queue: buffers messages when the WS is unavailable so
+        # agent responses are not lost during transient network blips. Only
+        # send() enqueues; reply-path and internal sends bypass it (they are
+        # time-sensitive, bound to a WeCom callback req_id).
+        self._send_queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue(maxsize=64)
+        self._send_worker_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -246,6 +263,7 @@ class WeComAdapter(BasePlatformAdapter):
             WeComAdapter.set_active(self)
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._send_worker_task = asyncio.create_task(self._send_worker_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             return True
         except Exception as exc:
@@ -278,6 +296,20 @@ class WeComAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._heartbeat_task = None
+
+        # Drain and stop the send worker; drop any unsent buffered messages.
+        if self._send_worker_task:
+            self._send_worker_task.cancel()
+            try:
+                await self._send_worker_task
+            except asyncio.CancelledError:
+                pass
+            self._send_worker_task = None
+        while not self._send_queue.empty():
+            try:
+                self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
         if WeComAdapter._active_instance is self:
@@ -419,24 +451,152 @@ class WeComAdapter(BasePlatformAdapter):
                 raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:
-        """Send lightweight application-level pings."""
+        """Send pings and await acknowledgement to detect subscription death early.
+
+        Uses a multi-miss threshold before disconnecting: a single transient
+        heartbeat loss (brief proxy hiccup, GC pause) will NOT tear down the
+        WebSocket. Only after ``_HB_MAX_CONSECUTIVE_MISSES`` consecutive ack
+        timeouts do we force a reconnect via ``_cleanup_ws`` — the listen loop
+        then re-establishes the connection.
+        """
+        consecutive_misses = 0
+        _HB_MAX_CONSECUTIVE_MISSES = 3
         try:
             while self._running:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 if not self._ws or self._ws.closed:
+                    consecutive_misses = 0
                     continue
                 try:
-                    await self._send_json(
-                        {
-                            "cmd": APP_CMD_PING,
-                            "headers": {"req_id": self._new_req_id("ping")},
-                            "body": {},
-                        }
+                    await self._send_request(
+                        APP_CMD_PING,
+                        {},
+                        timeout=HEARTBEAT_TIMEOUT_SECONDS,
                     )
+                    consecutive_misses = 0
+                except asyncio.TimeoutError:
+                    consecutive_misses += 1
+                    if consecutive_misses >= _HB_MAX_CONSECUTIVE_MISSES:
+                        logger.warning(
+                            "[%s] Heartbeat not acknowledged %d times in a row, forcing reconnect",
+                            self.name, _HB_MAX_CONSECUTIVE_MISSES,
+                        )
+                        consecutive_misses = 0
+                        try:
+                            await self._cleanup_ws()
+                        except Exception as exc:
+                            logger.warning(
+                                "[%s] Error closing WS after heartbeat miss: %s", self.name, exc
+                            )
+                    else:
+                        logger.warning(
+                            "[%s] Heartbeat not acknowledged in %.0fs (miss %d/%d)",
+                            self.name, HEARTBEAT_TIMEOUT_SECONDS,
+                            consecutive_misses, _HB_MAX_CONSECUTIVE_MISSES,
+                        )
                 except Exception as exc:
-                    logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
+                    logger.debug("[%s] Heartbeat failed: %s", self.name, exc)
         except asyncio.CancelledError:
             pass
+
+    async def _ensure_ws_alive(self) -> bool:
+        """Return True if the WebSocket is usable, reconnecting once if down.
+
+        Non-blocking and lock-free by design: a single proactive reconnect
+        attempt. ``_listen_loop`` independently reconnects on its own errors,
+        so a benign race may briefly double-reconnect (same as the overlay
+        this was ported from). Returns False immediately if the reconnect
+        fails so the caller (the send worker) can back off / drop.
+        """
+        if self._ws and not self._ws.closed:
+            return True
+        logger.info("[%s] WebSocket is down, attempting proactive reconnect", self.name)
+        try:
+            await self._open_connection()
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Proactive reconnect failed: %s", self.name, exc)
+            return False
+
+    async def _send_worker_loop(self) -> None:
+        """Background worker that drains the send queue, retrying on WS failure.
+
+        Only processes messages enqueued by :meth:`send`; reply-path and
+        internal sends bypass the queue (they are time-sensitive). Calls
+        ``_send_request`` / ``_send_reply_markdown`` directly — the worker IS
+        the retry layer, so wrapping in ``_send_with_reconnect_retry`` would
+        double-retry.
+        """
+        while self._running:
+            try:
+                item = await asyncio.wait_for(self._send_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if item is None:
+                # Shutdown sentinel.
+                self._send_queue.task_done()
+                break
+
+            chat_id = item["chat_id"]
+            content = item["content"]
+            reply_to = item.get("reply_to")
+
+            for attempt in range(SEND_RETRY_MAX):
+                try:
+                    if not await self._ensure_ws_alive():
+                        if attempt < SEND_RETRY_MAX - 1:
+                            await asyncio.sleep(SEND_RETRY_BACKOFF[attempt])
+                            continue
+                        logger.warning(
+                            "[%s] Send worker: WS unavailable after %d attempts, dropping message to %s",
+                            self.name, SEND_RETRY_MAX, chat_id,
+                        )
+                        break
+
+                    reply_req_id = self._reply_req_id_for_message(reply_to)
+                    if not reply_req_id and chat_id in self._last_chat_req_ids:
+                        ids = self._last_chat_req_ids[chat_id]
+                        if ids:
+                            reply_req_id = ids[-1]
+
+                    if reply_req_id:
+                        response = await self._send_reply_markdown(reply_req_id, content)
+                    else:
+                        response = await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                            },
+                        )
+
+                    errcode = response.get("errcode", 0)
+                    if errcode not in (0, None):
+                        raise RuntimeError(
+                            f"WeCom errcode {errcode}: {response.get('errmsg', 'unknown')}"
+                        )
+
+                    self._send_queue.task_done()
+                    break
+                except asyncio.TimeoutError:
+                    if attempt < SEND_RETRY_MAX - 1:
+                        await asyncio.sleep(SEND_RETRY_BACKOFF[attempt])
+                    else:
+                        logger.warning(
+                            "[%s] Send worker: timeout after %d attempts, dropping message to %s",
+                            self.name, SEND_RETRY_MAX, chat_id,
+                        )
+                        self._send_queue.task_done()
+                except Exception as exc:
+                    if attempt < SEND_RETRY_MAX - 1:
+                        await asyncio.sleep(SEND_RETRY_BACKOFF[attempt])
+                    else:
+                        logger.warning(
+                            "[%s] Send worker: failed after %d attempts (%s), dropping message to %s",
+                            self.name, SEND_RETRY_MAX, exc, chat_id,
+                        )
+                        self._send_queue.task_done()
 
     async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
         """Route inbound websocket payloads."""
@@ -452,7 +612,18 @@ class WeComAdapter(BasePlatformAdapter):
         if cmd in CALLBACK_COMMANDS:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_PING:
+            # WeCom sends server-initiated pings; reply with a pong bound to
+            # the same req_id so the gateway keeps our subscription live.
+            if req_id:
+                try:
+                    await self._send_json(
+                        {"cmd": APP_CMD_PONG, "headers": {"req_id": req_id}, "body": {}}
+                    )
+                except Exception as exc:
+                    logger.debug("[%s] Failed to send PONG (req_id=%s): %s", self.name, req_id, exc)
+            return
+        if cmd == APP_CMD_EVENT_CALLBACK:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -463,6 +634,30 @@ class WeComAdapter(BasePlatformAdapter):
             if not future.done():
                 future.set_exception(exc)
             self._pending_responses.pop(req_id, None)
+
+    async def _handle_subscription_death(self, response: Dict[str, Any]) -> None:
+        """Tear down the socket on a dead-subscription errcode so _listen_loop reconnects.
+
+        WeCom returns 846609 ("aibot websocket not subscribed") when the
+        server-side subscription has lapsed; the only recovery is a fresh
+        subscribe handshake. Failing pending responses first prevents callers
+        from waiting out their full timeout on a dead socket. Never raises —
+        a close error is logged and swallowed so it can't escape into the
+        ``_send_request`` caller (the fork's ``_cleanup_ws`` raises on close
+        errors, unlike the overlay this was ported from).
+        """
+        errmsg = response.get("errmsg", "unknown error")
+        logger.warning(
+            "[%s] WeCom subscription dead (errcode 846609: %s), forcing reconnect",
+            self.name, errmsg,
+        )
+        self._fail_pending_responses(RuntimeError(f"WeCom subscription dead: {errmsg}"))
+        try:
+            await self._cleanup_ws()
+        except Exception as exc:
+            logger.warning(
+                "[%s] Error closing WS after subscription death: %s", self.name, exc
+            )
 
     async def _send_json(self, payload: Dict[str, Any]) -> None:
         """Send a raw JSON frame over the active websocket."""
@@ -481,6 +676,8 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             await self._send_json({"cmd": cmd, "headers": {"req_id": req_id}, "body": body})
             response = await asyncio.wait_for(future, timeout=timeout)
+            if response.get("errcode") in SUBSCRIPTION_DEAD_ERROR_CODES:
+                await self._handle_subscription_death(response)
             return response
         finally:
             self._pending_responses.pop(req_id, None)
@@ -507,6 +704,8 @@ class WeComAdapter(BasePlatformAdapter):
                 {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body}
             )
             response = await asyncio.wait_for(future, timeout=timeout)
+            if response.get("errcode") in SUBSCRIPTION_DEAD_ERROR_CODES:
+                await self._handle_subscription_death(response)
             return response
         finally:
             self._pending_responses.pop(normalized_req_id, None)
@@ -955,19 +1154,24 @@ class WeComAdapter(BasePlatformAdapter):
             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
 
     def _remember_chat_req_id(self, chat_id: str, req_id: str) -> None:
-        """Cache the most recent inbound req_id per chat.
+        """Cache a sliding window of recent inbound req_ids per chat.
 
         Used as a fallback reply target when we need to send into a group
         without an explicit ``reply_to`` — WeCom AI Bots are blocked from
         APP_CMD_SEND in groups and must use APP_CMD_RESPONSE bound to some
-        prior req_id. Bounded like _reply_req_ids so long-running gateways
-        don't leak memory across many chats.
+        prior req_id. Keeping a small window (not just the latest) prevents
+        a burst of inbound messages during AI inference from overwriting
+        the req_id that an in-flight APP_CMD_RESPONSE still needs. Bounded
+        like _reply_req_ids so long-running gateways don't leak memory.
         """
         normalized_chat_id = str(chat_id or "").strip()
         normalized_req_id = str(req_id or "").strip()
         if not normalized_chat_id or not normalized_req_id:
             return
-        self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
+        ids = self._last_chat_req_ids.setdefault(normalized_chat_id, [])
+        ids.append(normalized_req_id)
+        if len(ids) > 3:
+            ids[:] = ids[-3:]
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
 
@@ -1502,7 +1706,9 @@ class WeComAdapter(BasePlatformAdapter):
 
         reply_req_id = self._reply_req_id_for_message(reply_to)
         if not reply_req_id and chat_id in self._last_chat_req_ids:
-            reply_req_id = self._last_chat_req_ids[chat_id]
+            ids = self._last_chat_req_ids[chat_id]
+            if ids:
+                reply_req_id = ids[-1]
 
         try:
             upload_result = await self._upload_media_bytes(
@@ -1563,44 +1769,75 @@ class WeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send markdown to a WeCom chat via proactive ``aibot_send_msg``."""
+        """Send markdown to a WeCom chat.
+
+        Tries a direct send first (fast path). If the WebSocket is down or the
+        send fails with a connection-level error, the message is enqueued for
+        retry by the background send worker rather than silently dropped.
+        """
         del metadata
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
-        try:
-            reply_req_id = self._reply_req_id_for_message(reply_to)
+        # Fast path: direct send when the WS looks healthy.
+        if self._ws and not self._ws.closed:
+            try:
+                reply_req_id = self._reply_req_id_for_message(reply_to)
+                if not reply_req_id and chat_id in self._last_chat_req_ids:
+                    ids = self._last_chat_req_ids[chat_id]
+                    if ids:
+                        reply_req_id = ids[-1]
 
-            if not reply_req_id and chat_id in self._last_chat_req_ids:
-                reply_req_id = self._last_chat_req_ids[chat_id]
+                if reply_req_id:
+                    response = await self._send_reply_markdown(reply_req_id, content)
+                else:
+                    response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "markdown",
+                            "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                        },
+                    )
 
-            if reply_req_id:
-                response = await self._send_reply_markdown(reply_req_id, content)
-            else:
-                response = await self._send_with_reconnect_retry(
-                    APP_CMD_SEND,
-                    {
-                        "chatid": chat_id,
-                        "msgtype": "markdown",
-                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
-                    },
+                error = self._response_error(response)
+                if error:
+                    return SendResult(success=False, error=error)
+                return SendResult(
+                    success=True,
+                    message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+                    raw_response=response,
                 )
-        except asyncio.TimeoutError:
-            return SendResult(success=False, error="Timeout sending message to WeCom")
-        except Exception as exc:
-            logger.error("[%s] Send failed: %s", self.name, exc)
-            return SendResult(success=False, error=str(exc))
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Direct send timed out, queuing message to %s", self.name, chat_id)
+            except RuntimeError as exc:
+                # "WebSocket is not connected" or similar connection errors →
+                # fall through to the queue; the worker retries after reconnect.
+                if "websocket is not connected" in str(exc).lower():
+                    logger.warning("[%s] WS unavailable for send, queuing message to %s", self.name, chat_id)
+                else:
+                    logger.error("[%s] Send failed: %s", self.name, exc)
+                    return SendResult(success=False, error=str(exc))
+            except Exception as exc:
+                logger.error("[%s] Send failed: %s", self.name, exc)
+                return SendResult(success=False, error=str(exc))
+        else:
+            logger.info("[%s] WS not connected, queuing message to %s", self.name, chat_id)
 
-        error = self._response_error(response)
-        if error:
-            return SendResult(success=False, error=error)
-
-        return SendResult(
-            success=True,
-            message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
-            raw_response=response,
-        )
+        # Slow path: enqueue for background retry.
+        try:
+            self._send_queue.put_nowait(
+                {"chat_id": chat_id, "content": content, "reply_to": reply_to}
+            )
+            return SendResult(
+                success=True,
+                message_id=f"queued:{uuid.uuid4().hex[:12]}",
+                raw_response={"queued": True},
+            )
+        except asyncio.QueueFull:
+            logger.error("[%s] Send queue full (64), dropping message to %s", self.name, chat_id)
+            return SendResult(success=False, error="Send queue full, message dropped")
 
     async def send_image(
         self,
