@@ -1,0 +1,61 @@
+name: wework-platform
+label: WeWork
+kind: platform
+version: 1.0.0
+description: >
+  WeWork (企业微信) webhook platform adapter for Hermes Agent.
+author: WeHermes
+requires_env:
+  - name: WEWORK_ENABLED
+    description: "为 true 时启用 WeWork（与 weclaw 一致；entrypoint 会写入 platforms.wework）"
+    prompt: "WeWork enabled (true/false)"
+    password: false
+  - name: WEWORK_KEYID
+    description: "发消息 API 鉴权 keyid（必填；入站 Webhook 不需要）"
+    prompt: "WeWork keyid"
+    password: true
+optional_env:
+  - name: WEWORK_API_URL
+    description: "发消息 API 地址（默认：内网 pros-chatbot/yuanfang/sendEMsg）"
+    prompt: "WeWork apiUrl"
+    password: false
+  - name: WEWORK_SERVICE_NAME
+    description: "服务号名称（默认：oa-dev）"
+    prompt: "WeWork serviceName"
+    password: false
+  - name: WEWORK_WEBHOOK_HOST
+    description: "Webhook 监听地址（默认：0.0.0.0）"
+    prompt: "WeWork webhook host"
+    password: false
+  - name: WEWORK_WEBHOOK_PORT
+    description: "Webhook 监听端口（默认：13776）"
+    prompt: "WeWork webhook port"
+    password: false
+  - name: WEWORK_WEBHOOK_PATH
+    description: "Webhook 路径（默认：/）"
+    prompt: "WeWork webhook path"
+    password: false
+  - name: WEWORK_TEXT_CHUNK_LIMIT
+    description: "单条消息最大字符数（默认：3500）"
+    prompt: "WeWork text chunk limit"
+    password: false
+  - name: WEWORK_DM_POLICY
+    description: "私聊策略：open | pairing | allowlist（默认：pairing）"
+    prompt: "WeWork dmPolicy"
+    password: false
+  - name: WEWORK_ALLOW_FROM
+    description: "私聊 allowlist（逗号分隔；空=放开；支持 *）"
+    prompt: "WeWork allowFrom"
+    password: false
+  - name: WEWORK_GROUP_POLICY
+    description: "群聊策略：open | allowlist | disabled（默认：allowlist）"
+    prompt: "WeWork groupPolicy"
+    password: false
+  - name: WEWORK_GROUP_ALLOW_FROM
+    description: "群聊 allowlist（逗号分隔；支持 *；可用群名或 wechatId）"
+    prompt: "WeWork groupAllowFrom"
+    password: false
+  - name: WEWORK_REQUIRE_MENTION
+    description: "群聊是否必须@机器人（true/false，默认：true）"
+    prompt: "WeWork requireMention"
+    password: false
