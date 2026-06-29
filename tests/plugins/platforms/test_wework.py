@@ -48,3 +48,61 @@ def test_looks_like_wechat_id_classifies_by_R_segment():
     )
     assert _looks_like_wechat_id("") is False
     assert _looks_like_wechat_id(None) is False
+
+
+def test_parse_inbound_dm_targets_user_field_not_wechat_id():
+    """A private-chat reply must go to the sender's ``user`` field (API
+    ``userName``), never the wechatId. The wechatId is a conversation marker
+    (``S:..;S:..``), not a valid userName — sending to it makes the WeWork API
+    reject the reply ("fail"), so the user gets nothing. Group replies still
+    use the wechatId (API ``to``)."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.wework.adapter import WeWorkAdapter
+
+    adapter = WeWorkAdapter(PlatformConfig(enabled=True, extra={"keyid": "k"}))
+    payload = {
+        "cmd": "/new",
+        "user": "brycehuang",
+        "userFullName": "Bryce Huang",
+        "wechatId": "S:1688857642682584_8444250708322274;S:1688851343262740_1688857642682584",
+        "fromGroup": "",
+        "sendTime": "t1",
+        "storeKey": "s1",
+    }
+
+    inbound = adapter._parse_inbound(payload)
+
+    assert inbound is not None
+    assert inbound.is_group is False
+    assert inbound.chat_id == "brycehuang", (
+        "DM reply target must be the user field (userName=brycehuang), not the "
+        f"wechatId (got {inbound.chat_id!r})"
+    )
+
+
+def test_parse_inbound_group_targets_wechat_id():
+    """Group replies use the wechatId (API ``to``)."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.wework.adapter import WeWorkAdapter
+
+    adapter = WeWorkAdapter(
+        PlatformConfig(
+            enabled=True, extra={"keyid": "k", "groupPolicy": "open", "requireMention": False}
+        )
+    )
+    payload = {
+        "cmd": "hi",
+        "user": "brycehuang",
+        "userFullName": "Bryce Huang",
+        "wechatId": "S:1688858099504500_8444250708322274;R:3284275877",
+        "fromGroup": "",
+        "sendTime": "t2",
+        "storeKey": "s2",
+        "isAt": True,
+    }
+
+    inbound = adapter._parse_inbound(payload)
+
+    assert inbound is not None
+    assert inbound.is_group is True
+    assert inbound.chat_id == "S:1688858099504500_8444250708322274;R:3284275877"

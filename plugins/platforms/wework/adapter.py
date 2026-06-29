@@ -355,11 +355,12 @@ class WeWorkAdapter(BasePlatformAdapter):
             chat_id = wechat_id  # send target (API `to`)
             chat_name = from_group or wechat_id  # allowlist/routing display
         else:
-            # The send() API's userName field expects a WeChat internal ID
-            # (e.g. S:alice-id), not the account name. Use wechat_id as
-            # chat_id for routing; keep sender_user in chat_name for display.
-            chat_id = wechat_id or sender_user  # send target (API `userName`)
-            chat_name = sender_user or sender_full_name
+            # Private chat: the reply target is the sender's user id (API
+            # ``userName``), NOT the wechatId. The wechatId is a conversation
+            # marker (``S:..;S:..``), not a valid userName — sending to it
+            # makes the WeWork API reject the reply, so the user gets nothing.
+            chat_id = sender_user  # send target (API `userName`)
+            chat_name = sender_full_name or sender_user
 
         logger.info(
             "[%s] inbound: is_group=%s chat_id=%s chat_name=%s sender=%s text=%s",
