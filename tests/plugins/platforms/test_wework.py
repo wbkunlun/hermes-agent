@@ -28,3 +28,23 @@ def test_wework_registers_via_plugin_loader():
     assert platform_registry.is_registered("wework"), (
         "wework not registered — plugins/platforms/wework/ missing or unloadable"
     )
+
+
+def test_looks_like_wechat_id_classifies_by_R_segment():
+    """Group wechatId contains an ``R:<roomid>`` segment; private chat is
+    ``S:<a>_<b>;S:<b>_<a>`` (two S: segments, no R:). Detection MUST key on
+    R: — the old ``"S:" in v and ";" in v`` heuristic misclassifies every
+    private chat as a group (private wechatIds are also multi-segment),
+    sending replies to an invalid group target so the user gets nothing."""
+    from plugins.platforms.wework.adapter import _looks_like_wechat_id
+
+    # Real production formats (see wehermes wework-group-prefix memory).
+    private = "S:1688857642682584_8444250708322274;S:1688851343262740_1688857642682584"
+    group = "S:1688858099504500_8444250708322274;R:3284275877"
+
+    assert _looks_like_wechat_id(group) is True
+    assert _looks_like_wechat_id(private) is False, (
+        "private chat (no R: segment) must NOT be classified as a group"
+    )
+    assert _looks_like_wechat_id("") is False
+    assert _looks_like_wechat_id(None) is False

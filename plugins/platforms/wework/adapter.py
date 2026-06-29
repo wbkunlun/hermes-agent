@@ -131,11 +131,21 @@ def _chunk_text(text: str, limit: int) -> List[str]:
 
 
 def _looks_like_wechat_id(value: str) -> bool:
+    """True when *value* is a group (room) wechatId.
+
+    WeCom encodes the conversation type into wechatId:
+      - group:   ``S:<bot>_<x>;R:<roomid>``  — contains an ``R:`` segment
+      - private: ``S:<a>_<b>;S:<b>_<a>``     — only ``S:`` segments, no ``R:``
+
+    Detection MUST key on ``R:``. The old ``"S:" in v and ";" in v`` heuristic
+    misclassifies every private chat as a group (private wechatIds are also
+    multi-segment ``S:..;S:..``), routing replies to an invalid group target
+    so the user receives nothing.
+    """
     v = str(value or "").strip()
     if not v:
         return False
-    # Group wechatId is typically `S:...;S:...` (private chat has S: but no ";")
-    return "S:" in v and ";" in v
+    return "R:" in v
 
 
 @dataclass
