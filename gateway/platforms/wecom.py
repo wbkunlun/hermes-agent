@@ -67,6 +67,8 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    proxy_kwargs_for_aiohttp,
+    resolve_proxy_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -346,11 +348,24 @@ class WeComAdapter(BasePlatformAdapter):
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
         await self._cleanup_ws()
-        self._session = aiohttp.ClientSession(trust_env=True)
+        # aiohttp's trust_env does an EXACT scheme match (wss:// needs
+        # WSS_PROXY, not HTTP_PROXY), so a deployment that only sets
+        # HTTP_PROXY would get NO proxy for the WebSocket and time out behind
+        # an HTTP egress proxy. Resolve the proxy explicitly (reads
+        # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY + macOS system proxy, honors
+        # NO_PROXY for the WS host) and pass it to ws_connect. With no proxy
+        # configured this falls back to trust_env=True (the previous behavior).
+        ws_host = urlparse(self._ws_url).hostname
+        proxy_url = resolve_proxy_url(target_hosts=[ws_host] if ws_host else None)
+        sess_kw, req_kw = proxy_kwargs_for_aiohttp(proxy_url)
+        if not sess_kw:
+            sess_kw = {"trust_env": not bool(proxy_url)}
+        self._session = aiohttp.ClientSession(**sess_kw)
         self._ws = await self._session.ws_connect(
             self._ws_url,
             heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
             timeout=CONNECT_TIMEOUT_SECONDS,
+            **req_kw,
         )
 
         req_id = self._new_req_id("subscribe")

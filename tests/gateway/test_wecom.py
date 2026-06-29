@@ -844,6 +844,66 @@ class TestWeComZombieSessionFix:
         assert subscribe["body"]["device_id"] == adapter._device_id
 
     @pytest.mark.asyncio
+    async def test_open_connection_routes_websocket_through_http_proxy(self, monkeypatch):
+        """Regression (wehermes Tencent Cloud deploy): aiohttp's trust_env does
+        an EXACT scheme match — ``wss://`` needs ``WSS_PROXY``, not
+        ``HTTP_PROXY`` — so a deployment that only sets ``HTTP_PROXY`` gets no
+        proxy for the WeCom WebSocket and the connect times out. When
+        ``HTTP_PROXY`` is set we must pass ``proxy=`` to ``ws_connect``
+        explicitly (via ``resolve_proxy_url``)."""
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+        for var in (
+            "HTTPS_PROXY", "WSS_PROXY", "ALL_PROXY",
+            "https_proxy", "wss_proxy", "all_proxy",
+            "NO_PROXY", "no_proxy",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "b", "secret": "s"})
+        )
+
+        captured: dict = {}
+
+        class _FakeWS:
+            closed = False
+
+            async def send_json(self, payload):
+                return None
+
+            async def close(self):
+                return None
+
+        class _FakeSession:
+            def __init__(self, **kwargs):
+                captured["session_kw"] = kwargs
+
+            async def ws_connect(self, *args, **kwargs):
+                captured["ws_kw"] = kwargs
+                return _FakeWS()
+
+            async def close(self):
+                return None
+
+        adapter._cleanup_ws = AsyncMock()
+        adapter._wait_for_handshake = AsyncMock(return_value={"errcode": 0})
+
+        with patch("gateway.platforms.wecom.aiohttp.ClientSession", _FakeSession):
+            await adapter._open_connection()
+
+        # The proxy must reach the WebSocket — as ``proxy=`` (HTTP proxy when
+        # aiohttp_socks is absent) or via a connector (SOCKS / aiohttp_socks).
+        ws_proxy = captured["ws_kw"].get("proxy")
+        has_connector = "connector" in captured.get("session_kw", {})
+        assert ws_proxy == "http://proxy.example:8080" or has_connector, (
+            "WebSocket not routed through HTTP_PROXY (would time out behind an "
+            f"HTTP egress proxy): ws_kwargs={captured.get('ws_kw')}, "
+            f"session_kwargs={captured.get('session_kw')}"
+        )
+
+    @pytest.mark.asyncio
     async def test_on_message_caches_last_req_id_per_chat(self):
         from gateway.platforms.wecom import WeComAdapter
 
