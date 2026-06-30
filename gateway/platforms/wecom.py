@@ -806,6 +806,18 @@ class WeComAdapter(BasePlatformAdapter):
             user_name=sender_id or None,
         )
 
+        # Inject sender identity so the model knows who it's talking to.
+        # WeCom AI Bot callbacks only carry `userid` (no display name), and
+        # run.py's [user_name] prefix only fires for shared multi-user
+        # sessions — which DMs never are, and groups aren't either while
+        # group_sessions_per_user stays at its default (True). channel_context
+        # is prepended to the message by run.py before it reaches the LLM, so
+        # this hint is the model's only identity signal in private chats (and
+        # the one that reliably reaches it in groups too). NB: if
+        # group_sessions_per_user is later set to False, groups will *also*
+        # get a [userid] prefix from run.py — redundant but harmless.
+        identity_hint = f"当前对话用户（userid）：{sender_id}" if sender_id else None
+
         event = MessageEvent(
             text=text,
             message_type=message_type,
@@ -816,6 +828,7 @@ class WeComAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None,
             reply_to_text=reply_text if has_reply_context else None,
+            channel_context=identity_hint,
             timestamp=datetime.now(tz=timezone.utc),
         )
 

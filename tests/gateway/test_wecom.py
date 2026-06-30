@@ -773,6 +773,78 @@ class TestInboundMessages:
         await adapter._on_message(payload)
         adapter.handle_message.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_on_message_injects_sender_identity_for_dm(self):
+        """The model must know who it's talking to, even in a private chat.
+
+        WeCom AI Bot callbacks only carry ``userid`` (no display name), and
+        run.py's ``[user_name]`` prefix only fires for shared multi-user
+        sessions — which DMs never are (``is_shared_multi_user_session``
+        returns False for ``chat_type == "dm"``). Without an identity hint
+        the LLM has no idea who the current user is. The adapter must inject
+        the userid into ``channel_context``, which run.py prepends to the
+        message before it reaches the model.
+        """
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0  # disable batching for tests
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "chatid": "dm-1",
+                "chattype": "single",
+                "from": {"userid": "zhangsan"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.channel_context and "zhangsan" in event.channel_context
+
+    @pytest.mark.asyncio
+    async def test_on_message_injects_sender_identity_for_group(self):
+        """Group chats must also carry sender identity.
+
+        With ``group_sessions_per_user`` at its default (True), group
+        sessions are per-user isolated, so run.py does not add the
+        ``[user_name]`` prefix either. The ``channel_context`` hint is the
+        model's only signal for who sent the message.
+        """
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "lisi"},
+                "msgtype": "text",
+                "text": {"content": "hi all"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.channel_context and "lisi" in event.channel_context
+
 
 class TestWeComZombieSessionFix:
     """Tests for PR #11572 — device_id, markdown reply, group req_id fallback."""
