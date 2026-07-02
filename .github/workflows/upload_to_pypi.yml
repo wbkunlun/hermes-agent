@@ -23,7 +23,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # PyPI trusted publishing is registered against the canonical
+  # NousResearch/hermes-agent repository. Forks (e.g. wbkunlun/hermes-agent)
+  # do not have a matching trusted-publisher claim on PyPI, so the
+  # ``pypa/gh-action-pypi-publish`` step fails with
+  # ``invalid-publisher: valid token, but no corresponding publisher``.
+  #
+  # Skip the workflow on forks. The fork can still publish to its own
+  # private index if needed by overriding this guard via a local fork
+  # commit.
   build:
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Build distribution 📦
     runs-on: ubuntu-latest
     steps:
