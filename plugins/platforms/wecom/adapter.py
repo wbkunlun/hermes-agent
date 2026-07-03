@@ -282,11 +282,24 @@ class WeComAdapter(BasePlatformAdapter):
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
         await self._cleanup_ws()
-        self._session = aiohttp.ClientSession(trust_env=True)
+        # aiohttp's trust_env does an EXACT scheme match (wss:// needs
+        # WSS_PROXY, not HTTP_PROXY), so a deployment that only sets
+        # HTTP_PROXY gets NO proxy for the WebSocket and times out behind
+        # an HTTP egress proxy (e.g. Tencent Cloud). Resolve the proxy
+        # explicitly and pass it to ws_connect; with no proxy configured,
+        # fall back to trust_env=True (the previous behavior).
+        from gateway.platforms.base import proxy_kwargs_for_aiohttp, resolve_proxy_url
+        ws_host = urlparse(self._ws_url).hostname
+        proxy_url = resolve_proxy_url(target_hosts=[ws_host] if ws_host else None)
+        sess_kw, req_kw = proxy_kwargs_for_aiohttp(proxy_url)
+        if not sess_kw:
+            sess_kw = {"trust_env": not bool(proxy_url)}
+        self._session = aiohttp.ClientSession(**sess_kw)
         self._ws = await self._session.ws_connect(
             self._ws_url,
             heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
             timeout=CONNECT_TIMEOUT_SECONDS,
+            **req_kw,
         )
 
         req_id = self._new_req_id("subscribe")
@@ -800,6 +813,10 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _decode_base64(data: str) -> bytes:
         payload = data.split(",", 1)[-1].strip()
+        # WeCom strips trailing base64 padding in some callback fields
+        # (e.g. image.base64 is often 43 chars). b64decode requires the
+        # length to be a multiple of 4, so re-pad before decoding.
+        payload = payload + "=" * ((4 - len(payload) % 4) % 4)
         return base64.b64decode(payload)
 
     @staticmethod
@@ -1095,7 +1112,17 @@ class WeComAdapter(BasePlatformAdapter):
         max_bytes: int,
     ) -> Tuple[bytes, Dict[str, str]]:
         from tools.url_safety import is_safe_url
-        if not is_safe_url(url):
+        # Per-deployment SSRF opt-out: in Tencent Cloud VPCs, WeCom media
+        # hosts (*.cos.<region>.myqcloud.com) resolve to the 169.254.0.0/16
+        # link-local range for in-VPC free egress, which url_safety blocks
+        # unconditionally. These URLs come from the WeCom-signed webhook
+        # payload (not LLM-chosen), so operators may disable the check via
+        # platforms.wecom.extra.disable_url_safety or WECOM_DISABLE_URL_SAFETY.
+        _disable_url_safety = str(
+            self.config.extra.get("disable_url_safety")
+            or os.getenv("WECOM_DISABLE_URL_SAFETY", "")
+        ).strip().lower() in {"true", "1", "yes", "on"}
+        if not _disable_url_safety and not is_safe_url(url):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
 
         if not HTTPX_AVAILABLE:
