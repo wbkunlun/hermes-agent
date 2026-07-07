@@ -228,7 +228,7 @@ class WeWorkAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = _DedupCache()
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not check_wework_requirements():
             self._set_fatal_error(
                 "wework_missing_dependency",
