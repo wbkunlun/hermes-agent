@@ -798,7 +798,7 @@ class TestWeComZombieSessionFix:
         }
 
         await adapter._on_message(payload)
-        assert adapter._last_chat_req_ids["group-1"] == "req-abc"
+        assert adapter._last_chat_req_ids["group-1"] == ["req-abc"]
 
     @pytest.mark.asyncio
     async def test_on_message_does_not_cache_blocked_sender_req_id(self):
@@ -840,7 +840,7 @@ class TestWeComZombieSessionFix:
         assert len(adapter._last_chat_req_ids) <= DEDUP_MAX_SIZE
         # The most recently remembered chat must still be present.
         latest = f"chat-{DEDUP_MAX_SIZE + 49}"
-        assert adapter._last_chat_req_ids[latest] == f"req-{DEDUP_MAX_SIZE + 49}"
+        assert adapter._last_chat_req_ids[latest] == [f"req-{DEDUP_MAX_SIZE + 49}"]
 
     def test_remember_chat_req_id_ignores_empty_values(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
@@ -859,7 +859,7 @@ class TestWeComZombieSessionFix:
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._last_chat_req_ids["group-1"] = "inbound-req-42"
+        adapter._last_chat_req_ids["group-1"] = ["inbound-req-42"]
         adapter._send_reply_request = AsyncMock(
             return_value={"headers": {"req_id": "inbound-req-42"}, "errcode": 0}
         )

@@ -81,6 +81,7 @@ APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
 APP_CMD_SEND = "aibot_send_msg"
 APP_CMD_RESPONSE = "aibot_respond_msg"
 APP_CMD_PING = "ping"
+APP_CMD_PONG = "pong"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
 APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
 APP_CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
@@ -92,7 +93,9 @@ MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+HEARTBEAT_TIMEOUT_SECONDS = 10.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+SUBSCRIPTION_DEAD_ERROR_CODES = {846609}
 
 DEDUP_MAX_SIZE = 1000
 
@@ -191,8 +194,11 @@ class WeComAdapter(BasePlatformAdapter):
         self._text_batch_split_delay_seconds = env_float("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
-        self._device_id = uuid.uuid4().hex
-        self._last_chat_req_ids: Dict[str, str] = {}
+        self._device_id = (
+            os.getenv("WECOM_DEVICE_ID")
+            or uuid.uuid4().hex
+        )
+        self._last_chat_req_ids: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -387,22 +393,26 @@ class WeComAdapter(BasePlatformAdapter):
                 raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:
-        """Send lightweight application-level pings."""
+        """Send pings and await acknowledgement to detect subscription death early."""
         try:
             while self._running:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 if not self._ws or self._ws.closed:
                     continue
                 try:
-                    await self._send_json(
-                        {
-                            "cmd": APP_CMD_PING,
-                            "headers": {"req_id": self._new_req_id("ping")},
-                            "body": {},
-                        }
+                    await self._send_request(
+                        APP_CMD_PING,
+                        {},
+                        timeout=HEARTBEAT_TIMEOUT_SECONDS,
                     )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] Heartbeat not acknowledged in %.0fs, forcing reconnect",
+                        self.name, HEARTBEAT_TIMEOUT_SECONDS,
+                    )
+                    await self._cleanup_ws()
                 except Exception as exc:
-                    logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
+                    logger.debug("[%s] Heartbeat failed: %s", self.name, exc)
         except asyncio.CancelledError:
             pass
 
@@ -420,7 +430,15 @@ class WeComAdapter(BasePlatformAdapter):
         if cmd in CALLBACK_COMMANDS:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_PING:
+            if req_id:
+                await self._send_json({
+                    "cmd": APP_CMD_PONG,
+                    "headers": {"req_id": req_id},
+                    "body": {},
+                })
+            return
+        if cmd == APP_CMD_EVENT_CALLBACK:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -431,6 +449,16 @@ class WeComAdapter(BasePlatformAdapter):
             if not future.done():
                 future.set_exception(exc)
             self._pending_responses.pop(req_id, None)
+
+    async def _handle_subscription_death(self, response: Dict[str, Any]) -> None:
+        """Close the websocket on errcode 846609 so _listen_loop reconnects."""
+        errmsg = response.get("errmsg", "unknown error")
+        logger.warning(
+            "[%s] WeCom subscription dead (errcode 846609: %s), forcing reconnect",
+            self.name, errmsg,
+        )
+        self._fail_pending_responses(RuntimeError(f"WeCom subscription dead: {errmsg}"))
+        await self._cleanup_ws()
 
     async def _send_json(self, payload: Dict[str, Any]) -> None:
         """Send a raw JSON frame over the active websocket."""
@@ -449,6 +477,8 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             await self._send_json({"cmd": cmd, "headers": {"req_id": req_id}, "body": body})
             response = await asyncio.wait_for(future, timeout=timeout)
+            if response.get("errcode") in SUBSCRIPTION_DEAD_ERROR_CODES:
+                await self._handle_subscription_death(response)
             return response
         finally:
             self._pending_responses.pop(req_id, None)
@@ -475,6 +505,8 @@ class WeComAdapter(BasePlatformAdapter):
                 {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body}
             )
             response = await asyncio.wait_for(future, timeout=timeout)
+            if response.get("errcode") in SUBSCRIPTION_DEAD_ERROR_CODES:
+                await self._handle_subscription_death(response)
             return response
         finally:
             self._pending_responses.pop(normalized_req_id, None)
@@ -945,19 +977,23 @@ class WeComAdapter(BasePlatformAdapter):
             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
 
     def _remember_chat_req_id(self, chat_id: str, req_id: str) -> None:
-        """Cache the most recent inbound req_id per chat.
+        """Cache a sliding window of recent inbound req_ids per chat.
 
         Used as a fallback reply target when we need to send into a group
         without an explicit ``reply_to`` — WeCom AI Bots are blocked from
         APP_CMD_SEND in groups and must use APP_CMD_RESPONSE bound to some
-        prior req_id. Bounded like _reply_req_ids so long-running gateways
-        don't leak memory across many chats.
+        prior req_id. Keeping a small window prevents a burst of messages
+        during AI inference from overwriting the req_id that the in-flight
+        response needs.
         """
         normalized_chat_id = str(chat_id or "").strip()
         normalized_req_id = str(req_id or "").strip()
         if not normalized_chat_id or not normalized_req_id:
             return
-        self._last_chat_req_ids[normalized_chat_id] = normalized_req_id
+        ids = self._last_chat_req_ids.setdefault(normalized_chat_id, [])
+        ids.append(normalized_req_id)
+        if len(ids) > 3:
+            ids[:] = ids[-3:]
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
 
@@ -1358,7 +1394,9 @@ class WeComAdapter(BasePlatformAdapter):
 
         reply_req_id = self._reply_req_id_for_message(reply_to)
         if not reply_req_id and chat_id in self._last_chat_req_ids:
-            reply_req_id = self._last_chat_req_ids[chat_id]
+            ids = self._last_chat_req_ids[chat_id]
+            if ids:
+                reply_req_id = ids[-1]
 
         try:
             upload_result = await self._upload_media_bytes(
@@ -1429,7 +1467,9 @@ class WeComAdapter(BasePlatformAdapter):
             reply_req_id = self._reply_req_id_for_message(reply_to)
 
             if not reply_req_id and chat_id in self._last_chat_req_ids:
-                reply_req_id = self._last_chat_req_ids[chat_id]
+                ids = self._last_chat_req_ids[chat_id]
+                if ids:
+                    reply_req_id = ids[-1]
 
             if reply_req_id:
                 response = await self._send_reply_markdown(reply_req_id, content)
@@ -1718,6 +1758,15 @@ async def _standalone_send(
     succeed when cron runs separately from the gateway. Opens an ephemeral
     WeComAdapter, connects, sends, and disconnects. Replaces the legacy
     _send_wecom helper.
+
+    .. note::
+       WeCom's server only allows one active WebSocket session per
+       ``bot_id``.  This ephemeral connection will **displace** any
+       existing gateway session on the same bot.  The gateway is
+       designed to detect the resulting ``errcode 846609`` and recover
+       via ``_handle_subscription_death`` within seconds, but
+       operators should be aware that a cron job firing mid-conversation
+       may cause a brief interruption.
     """
     if not check_wecom_requirements():
         return {"error": "WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET."}
