@@ -146,7 +146,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "whatsapp_cloud":  _TIER_LOW,
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
-    "wecom":           _TIER_LOW,
+    "wecom":           _TIER_MEDIUM,  # v2026.7.10-fork2: now supports streaming
     "wecom_callback":  _TIER_LOW,
     "dingtalk":        _TIER_LOW,
 
