@@ -153,7 +153,14 @@ class WeComAdapter(BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
-    SUPPORTS_MESSAGE_EDITING = False
+    SUPPORTS_MESSAGE_EDITING = True
+
+    # WeCom stream protocol requires an explicit finalize frame (stream.finish=true)
+    # to mark a streaming message as permanent. Set REQUIRES_EDIT_FINALIZE = True so
+    # the stream consumer always sends the finalize=True edit even when content has
+    # not changed since the last streaming frame.
+    REQUIRES_EDIT_FINALIZE: bool = True
+
     # Threshold for detecting WeCom client-side message splits.
     # When a chunk is near the 4000-char limit, a continuation is almost certain.
     _SPLIT_THRESHOLD = 3900
@@ -208,6 +215,11 @@ class WeComAdapter(BasePlatformAdapter):
         # Set while a subscribed websocket is live; cleared on death/cleanup so
         # retrying senders block until _listen_loop brings the socket back.
         self._ws_live: asyncio.Event = asyncio.Event()
+
+        # Stream state for progressive msgtype: "stream" output.
+        # Maps stream_id → {"reply_req_id": str, "created_at": float}
+        # Used by edit_message() to find the reply_req_id bound at stream creation.
+        self._stream_states: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1560,9 +1572,17 @@ class WeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send markdown to a WeCom chat via proactive ``aibot_send_msg``."""
-        del metadata
+        """Send a message to a WeCom chat.
 
+        When ``metadata`` contains ``expect_edits=True`` (set by the stream
+        consumer for the first frame of an ongoing stream), sends a
+        ``msgtype: "stream"`` first frame via ``aibot_respond_msg`` and returns
+        the stream id as ``message_id`` for subsequent ``edit_message()`` calls.
+
+        Otherwise sends as ``msgtype: "markdown"`` via ``aibot_send_msg``
+        (proactive) or ``aibot_respond_msg`` (reply), matching the existing
+        non-streaming behaviour.
+        """
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
@@ -1573,6 +1593,42 @@ class WeComAdapter(BasePlatformAdapter):
                 ids = self._last_chat_req_ids[chat_id]
                 if ids:
                     reply_req_id = ids[-1]
+
+            # Detect streaming first-frame request from the stream consumer.
+            # The consumer sets expect_edits=True in metadata when it will call
+            # edit_message() afterwards.  Without a reply_req_id we cannot use
+            # aibot_respond_msg, so fall through to the markdown path.
+            is_streaming = (
+                isinstance(metadata, dict)
+                and metadata.get("expect_edits") is True
+                and reply_req_id is not None
+            )
+
+            if is_streaming:
+                stream_id = uuid.uuid4().hex[:12]
+                self._stream_states[stream_id] = {
+                    "reply_req_id": reply_req_id,
+                    "created_at": time.monotonic(),
+                }
+                truncated = content[: self.MAX_MESSAGE_LENGTH]
+                response = await self._send_reply_request(
+                    reply_req_id,
+                    {
+                        "msgtype": "stream",
+                        "stream": {
+                            "id": stream_id,
+                            "finish": False,
+                            "content": truncated,
+                        },
+                    },
+                )
+                error = self._response_error(response)
+                if error:
+                    self._stream_states.pop(stream_id, None)
+                    return SendResult(success=False, error=error)
+                return SendResult(
+                    success=True, message_id=stream_id, raw_response=response
+                )
 
             if reply_req_id:
                 response = await self._send_reply_markdown(reply_req_id, content)
@@ -1598,6 +1654,81 @@ class WeComAdapter(BasePlatformAdapter):
         return SendResult(
             success=True,
             message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+            raw_response=response,
+        )
+
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Update or finalise a streaming message via ``aibot_respond_msg``.
+
+        ``message_id`` is the stream id returned by ``send()`` when the
+        stream was created.  Looks up the stored ``reply_req_id`` and sends
+        a ``msgtype: "stream"`` update frame with the same stream id.
+
+        When ``finalize=True``, sets ``stream.finish: true`` to mark the
+        message as permanent.  Stream state is cleaned up after finalisation.
+
+        If the stream id is not found (e.g. after a restart or timeout),
+        returns ``success=False`` so the stream consumer enters fallback
+        mode and delivers the final content as a regular message.
+        """
+        del chat_id, metadata
+
+        stream_state = self._stream_states.get(message_id)
+        if not stream_state:
+            logger.warning(
+                "[%s] Stream %s not found (may have expired or been finalised)",
+                self.name,
+                message_id,
+            )
+            return SendResult(
+                success=False,
+                error=f"Stream {message_id} not found",
+            )
+
+        reply_req_id = stream_state["reply_req_id"]
+        if not reply_req_id:
+            return SendResult(success=False, error="No reply_req_id for stream")
+
+        try:
+            truncated = content[: self.MAX_MESSAGE_LENGTH]
+            response = await self._send_reply_request(
+                reply_req_id,
+                {
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": message_id,
+                        "finish": finalize,
+                        "content": truncated,
+                    },
+                },
+            )
+        except asyncio.TimeoutError:
+            return SendResult(success=False, error="Timeout editing stream message")
+        except Exception as exc:
+            logger.error(
+                "[%s] Edit stream %s failed: %s", self.name, message_id, exc
+            )
+            return SendResult(success=False, error=str(exc))
+
+        error = self._response_error(response)
+        if error:
+            return SendResult(success=False, error=error)
+
+        if finalize:
+            self._stream_states.pop(message_id, None)
+
+        return SendResult(
+            success=True,
+            message_id=message_id,
             raw_response=response,
         )
 

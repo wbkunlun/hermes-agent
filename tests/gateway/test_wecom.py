@@ -37,10 +37,11 @@ class TestWeComRequirements:
 
 
 class TestWeComAdapterInit:
-    def test_declares_non_editable_message_capability(self):
+    def test_declares_message_edit_capability(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
 
-        assert WeComAdapter.SUPPORTS_MESSAGE_EDITING is False
+        assert WeComAdapter.SUPPORTS_MESSAGE_EDITING is True
+        assert WeComAdapter.REQUIRES_EDIT_FINALIZE is True
 
     def test_reads_config_from_extra(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
@@ -1090,3 +1091,347 @@ class TestSendRequestRetry:
         adapter._ws_live.set()
         asyncio.run(adapter._handle_subscription_death({"errcode": 846609}))
         assert not adapter._ws_live.is_set()
+
+
+class TestWeComStreaming:
+    """Tests for progressive streaming via msgtype: ``stream``."""
+
+    @pytest.fixture
+    def adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        return WeComAdapter(PlatformConfig(enabled=True))
+
+    # ── send() — streaming first frame ──
+
+    @pytest.mark.asyncio
+    async def test_send_creates_stream_first_frame(self, adapter):
+        """send() with expect_edits and valid reply_to must send
+        msgtype: stream, finish: false, and return the stream id."""
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send(
+            "chat-123",
+            "hello streaming",
+            reply_to="msg-1",
+            metadata={"expect_edits": True},
+        )
+
+        assert result.success is True
+        assert result.message_id is not None
+        stream_id = result.message_id
+        assert len(stream_id) == 12  # uuid4.hex[:12]
+
+        adapter._send_reply_request.assert_awaited_once()
+        args = adapter._send_reply_request.await_args.args
+        assert args[0] == "req-1"
+        body = args[1]
+        assert body["msgtype"] == "stream"
+        assert body["stream"]["id"] == stream_id
+        assert body["stream"]["finish"] is False
+        assert body["stream"]["content"] == "hello streaming"
+
+        # Stream state must be stored for edit_message()
+        assert stream_id in adapter._stream_states
+        assert adapter._stream_states[stream_id]["reply_req_id"] == "req-1"
+
+    @pytest.mark.asyncio
+    async def test_send_stream_falls_back_without_expect_edits(self, adapter):
+        """send() without expect_edits must fall through to markdown."""
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send(
+            "chat-123",
+            "hello markdown",
+            reply_to="msg-1",
+            metadata={"notify": True},
+        )
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        args = adapter._send_reply_request.await_args.args
+        assert args[1]["msgtype"] == "markdown"
+        # Stream state must NOT be polluted by non-streaming sends
+        assert adapter._stream_states == {}
+
+    @pytest.mark.asyncio
+    async def test_send_stream_skipped_without_metadata(self, adapter):
+        """send() with metadata=None must use markdown path."""
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send("chat-123", "hello", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        args = adapter._send_reply_request.await_args.args
+        assert args[1]["msgtype"] == "markdown"
+        assert adapter._stream_states == {}
+
+    @pytest.mark.asyncio
+    async def test_send_stream_falls_back_without_reply_context(self, adapter):
+        """send() with expect_edits but no reply_req_id must fall back
+        to proactive markdown send — you cannot stream via aibot_respond_msg
+        without a reply context."""
+        adapter._send_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send(
+            "chat-123",
+            "hello",
+            reply_to=None,
+            metadata={"expect_edits": True},
+        )
+
+        assert result.success is True
+        adapter._send_request.assert_awaited_once()
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND
+
+        cmd = adapter._send_request.await_args.args[0]
+        assert cmd == APP_CMD_SEND
+        assert adapter._stream_states == {}
+
+    @pytest.mark.asyncio
+    async def test_send_stream_error_cleans_up_state(self, adapter):
+        """When the stream first frame returns an error, _stream_states must
+        be cleaned up and SendResult(success=False) returned."""
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"errcode": 40001, "errmsg": "bad request"}
+        )
+
+        result = await adapter.send(
+            "chat-123",
+            "hello",
+            reply_to="msg-1",
+            metadata={"expect_edits": True},
+        )
+
+        assert result.success is False
+        assert "40001" in (result.error or "")
+        # Stream state must be cleaned up on failure
+        assert adapter._stream_states == {}
+
+    @pytest.mark.asyncio
+    async def test_send_stream_uses_max_message_length_truncation(self, adapter):
+        """Stream first frame must truncate content to MAX_MESSAGE_LENGTH."""
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+        from plugins.platforms.wecom.adapter import MAX_MESSAGE_LENGTH
+
+        long = "x" * (MAX_MESSAGE_LENGTH + 100)
+
+        result = await adapter.send(
+            "chat-123",
+            long,
+            reply_to="msg-1",
+            metadata={"expect_edits": True},
+        )
+
+        assert result.success is True
+        args = adapter._send_reply_request.await_args.args
+        assert len(args[1]["stream"]["content"]) == MAX_MESSAGE_LENGTH
+
+    # ── send() — proactive non-streaming ──
+
+    @pytest.mark.asyncio
+    async def test_send_proactive_markdown_unchanged(self, adapter):
+        """Proactive send (no reply_to, no metadata) must still use
+        APP_CMD_SEND with markdown, exactly as before."""
+        adapter._send_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND
+
+        result = await adapter.send("chat-123", "hello proactive")
+
+        assert result.success is True
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "hello proactive"},
+            },
+        )
+
+    # ── edit_message() ──
+
+    @pytest.mark.asyncio
+    async def test_edit_message_update(self, adapter):
+        """edit_message with finalize=False must send a stream update
+        and preserve stream state."""
+        stream_id = "abc123def456"
+        adapter._stream_states[stream_id] = {
+            "reply_req_id": "req-1",
+            "created_at": 1000.0,
+        }
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.edit_message(
+            "chat-123", stream_id, "updated content", finalize=False
+        )
+
+        assert result.success is True
+        assert result.message_id == stream_id
+        adapter._send_reply_request.assert_awaited_once()
+        args = adapter._send_reply_request.await_args.args
+        assert args[0] == "req-1"
+        body = args[1]
+        assert body["msgtype"] == "stream"
+        assert body["stream"]["id"] == stream_id
+        assert body["stream"]["finish"] is False
+        assert body["stream"]["content"] == "updated content"
+
+        # State must survive non-finalize edit
+        assert stream_id in adapter._stream_states
+
+    @pytest.mark.asyncio
+    async def test_edit_message_finalize(self, adapter):
+        """edit_message with finalize=True must send finish: true and
+        clean up stream state."""
+        stream_id = "abc123def456"
+        adapter._stream_states[stream_id] = {
+            "reply_req_id": "req-1",
+            "created_at": 1000.0,
+        }
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.edit_message(
+            "chat-123", stream_id, "final content", finalize=True
+        )
+
+        assert result.success is True
+        args = adapter._send_reply_request.await_args.args
+        assert args[1]["stream"]["finish"] is True
+        # State must be cleaned up after finalize
+        assert stream_id not in adapter._stream_states
+
+    @pytest.mark.asyncio
+    async def test_edit_message_unknown_stream(self, adapter):
+        """edit_message with an unknown stream_id must return
+        success=False so the consumer enters fallback mode."""
+        result = await adapter.edit_message(
+            "chat-123", "nonexistent-stream", "content", finalize=False
+        )
+
+        assert result.success is False
+        assert "not found" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_edit_message_bad_state(self, adapter):
+        """edit_message with a stream that has no reply_req_id must
+        return success=False."""
+        stream_id = "bad-stream"
+        adapter._stream_states[stream_id] = {}  # missing reply_req_id
+
+        result = await adapter.edit_message(
+            "chat-123", stream_id, "content", finalize=False
+        )
+
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_edit_message_timeout(self, adapter):
+        """edit_message must report TimeoutError as success=False."""
+        stream_id = "stream-1"
+        adapter._stream_states[stream_id] = {
+            "reply_req_id": "req-1",
+            "created_at": 1000.0,
+        }
+        adapter._send_reply_request = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        result = await adapter.edit_message(
+            "chat-123", stream_id, "content", finalize=False
+        )
+
+        assert result.success is False
+        assert "Timeout" in (result.error or "")
+        # State must NOT be cleaned up on timeout (no finalize)
+        assert stream_id in adapter._stream_states
+
+    @pytest.mark.asyncio
+    async def test_edit_message_truncates_to_max_length(self, adapter):
+        """edit_message must truncate content to MAX_MESSAGE_LENGTH."""
+        from plugins.platforms.wecom.adapter import MAX_MESSAGE_LENGTH
+
+        stream_id = "stream-1"
+        adapter._stream_states[stream_id] = {
+            "reply_req_id": "req-1",
+            "created_at": 1000.0,
+        }
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+        long = "x" * (MAX_MESSAGE_LENGTH + 100)
+
+        result = await adapter.edit_message(
+            "chat-123", stream_id, long, finalize=False
+        )
+
+        assert result.success is True
+        args = adapter._send_reply_request.await_args.args
+        assert len(args[1]["stream"]["content"]) == MAX_MESSAGE_LENGTH
+
+    # ── Integration: send + edit_message cycle ──
+
+    @pytest.mark.asyncio
+    async def test_send_then_edit_cycle(self, adapter):
+        """Verify a full send→edit→finalize cycle works correctly."""
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        send_responses = iter(
+            [
+                {"headers": {"req_id": "req-1"}, "errcode": 0},
+                {"headers": {"req_id": "req-1"}, "errcode": 0},
+                {"headers": {"req_id": "req-1"}, "errcode": 0},
+            ]
+        )
+        adapter._send_reply_request = AsyncMock(side_effect=lambda *a, **kw: next(send_responses))
+
+        # Step 1: First frame
+        r1 = await adapter.send(
+            "chat-123", "part 1", reply_to="msg-1", metadata={"expect_edits": True}
+        )
+        assert r1.success is True
+        sid = r1.message_id
+
+        # Step 2: Update
+        r2 = await adapter.edit_message("chat-123", sid, "part 1 part 2", finalize=False)
+        assert r2.success is True
+        assert sid in adapter._stream_states  # still active
+
+        # Step 3: Finalize
+        r3 = await adapter.edit_message("chat-123", sid, "part 1 part 2 part 3", finalize=True)
+        assert r3.success is True
+        assert sid not in adapter._stream_states  # cleaned up
+
+        # All three requests used the same reply_req_id
+        calls = adapter._send_reply_request.await_args_list
+        assert len(calls) == 3
+        for call in calls:
+            assert call.args[0] == "req-1"
+            assert call.args[1]["msgtype"] == "stream"
+        # Stream IDs match
+        assert calls[0].args[1]["stream"]["id"] == sid
+        assert calls[1].args[1]["stream"]["id"] == sid
+        assert calls[2].args[1]["stream"]["id"] == sid
+        # Finish flags
+        assert calls[0].args[1]["stream"]["finish"] is False
+        assert calls[1].args[1]["stream"]["finish"] is False
+        assert calls[2].args[1]["stream"]["finish"] is True
+
