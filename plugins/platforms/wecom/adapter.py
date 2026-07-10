@@ -96,6 +96,12 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 HEARTBEAT_TIMEOUT_SECONDS = 10.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 SUBSCRIPTION_DEAD_ERROR_CODES = {846609}
+# Send retry: ride out the ~2-3s reconnect window (RECONNECT_BACKOFF[0]=2s +
+# WS handshake) instead of failing the in-flight send on 846609 / the
+# pre-send "not connected" guard. Heartbeat pings are excluded (they own
+# their own deadline + forced reconnect).
+SEND_RETRY_BUDGET_SECONDS = 8.0
+SEND_MAX_RETRIES = 2
 
 DEDUP_MAX_SIZE = 1000
 
@@ -199,6 +205,9 @@ class WeComAdapter(BasePlatformAdapter):
             or uuid.uuid4().hex
         )
         self._last_chat_req_ids: Dict[str, List[str]] = {}
+        # Set while a subscribed websocket is live; cleared on death/cleanup so
+        # retrying senders block until _listen_loop brings the socket back.
+        self._ws_live: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -277,6 +286,7 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
+        self._ws_live.clear()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = None
@@ -326,6 +336,8 @@ class WeComAdapter(BasePlatformAdapter):
         if errcode not in {0, None}:
             errmsg = auth_payload.get("errmsg", "authentication failed")
             raise RuntimeError(f"{errmsg} (errcode={errcode})")
+        # Subscribe ack received — the socket is live for sends.
+        self._ws_live.set()
 
     async def _wait_for_handshake(self, req_id: str) -> Dict[str, Any]:
         """Wait for the subscribe acknowledgement."""
@@ -365,6 +377,8 @@ class WeComAdapter(BasePlatformAdapter):
                     return
                 logger.warning("[%s] WebSocket error: %s", self.name, exc)
                 self._fail_pending_responses(RuntimeError("WeCom connection interrupted"))
+                # Socket is gone; retrying senders must wait for reconnect.
+                self._ws_live.clear()
 
                 delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
                 backoff_idx += 1
@@ -452,6 +466,7 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _handle_subscription_death(self, response: Dict[str, Any]) -> None:
         """Close the websocket on errcode 846609 so _listen_loop reconnects."""
+        self._ws_live.clear()
         errmsg = response.get("errmsg", "unknown error")
         logger.warning(
             "[%s] WeCom subscription dead (errcode 846609: %s), forcing reconnect",
@@ -466,8 +481,53 @@ class WeComAdapter(BasePlatformAdapter):
             raise RuntimeError("WeCom websocket is not connected")
         await self._ws.send_json(payload)
 
-    async def _send_request(self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
-        """Send a JSON request and await the correlated response."""
+    async def _send_request(
+        self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS
+    ) -> Dict[str, Any]:
+        """Send a JSON request and await the correlated response.
+
+        Retries through the reconnect window on errcode 846609 or the
+        pre-send "not connected" guard: the socket tears down and
+        ``_listen_loop`` brings it back within seconds, so a send that
+        lands during that window waits on ``_ws_live`` and retries instead
+        of surfacing a failure. Heartbeat pings bypass the retry (they own
+        their own deadline + forced reconnect).
+        """
+        if cmd == APP_CMD_PING:
+            return await self._send_request_once(cmd, body, timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SEND_RETRY_BUDGET_SECONDS
+        last_response: Optional[Dict[str, Any]] = None
+        last_exc: Optional[BaseException] = None
+        for _ in range(SEND_MAX_RETRIES):
+            try:
+                response = await self._send_request_once(cmd, body, timeout)
+            except asyncio.CancelledError:
+                raise
+            except (RuntimeError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+            else:
+                if response.get("errcode") in SUBSCRIPTION_DEAD_ERROR_CODES:
+                    last_response = response  # subscription dead — await reconnect, then retry
+                else:
+                    return response
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(self._ws_live.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+        if last_response is not None:
+            return last_response
+        if last_exc is not None:
+            raise last_exc
+        return {"errcode": -1, "errmsg": "WeCom send retry budget exhausted"}
+
+    async def _send_request_once(
+        self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS
+    ) -> Dict[str, Any]:
+        """Single send attempt — send a JSON request and await its response."""
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
 
@@ -490,7 +550,50 @@ class WeComAdapter(BasePlatformAdapter):
         cmd: str = APP_CMD_RESPONSE,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> Dict[str, Any]:
-        """Send a reply frame correlated to an inbound callback req_id."""
+        """Send a reply frame correlated to an inbound callback req_id.
+
+        Retries through the reconnect window like ``_send_request``; the
+        inbound ``reply_req_id`` key is stable and re-registered per attempt.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SEND_RETRY_BUDGET_SECONDS
+        last_response: Optional[Dict[str, Any]] = None
+        last_exc: Optional[BaseException] = None
+        for _ in range(SEND_MAX_RETRIES):
+            try:
+                response = await self._send_reply_request_once(
+                    reply_req_id, body, cmd=cmd, timeout=timeout
+                )
+            except asyncio.CancelledError:
+                raise
+            except (RuntimeError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+            else:
+                if response.get("errcode") in SUBSCRIPTION_DEAD_ERROR_CODES:
+                    last_response = response
+                else:
+                    return response
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(self._ws_live.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+        if last_response is not None:
+            return last_response
+        if last_exc is not None:
+            raise last_exc
+        return {"errcode": -1, "errmsg": "WeCom send retry budget exhausted"}
+
+    async def _send_reply_request_once(
+        self,
+        reply_req_id: str,
+        body: Dict[str, Any],
+        cmd: str = APP_CMD_RESPONSE,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        """Single reply attempt — send a reply frame and await its response."""
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
 
@@ -1755,19 +1858,49 @@ async def _standalone_send(
     """Out-of-process WeCom delivery via the adapter's WebSocket send pipeline.
 
     Implements the standalone_sender_fn contract so deliver=wecom cron jobs
-    succeed when cron runs separately from the gateway. Opens an ephemeral
-    WeComAdapter, connects, sends, and disconnects. Replaces the legacy
-    _send_wecom helper.
+    succeed when cron runs separately from the gateway. When a live in-process
+    adapter is reachable (``_gateway_runner_ref``), it is reused directly — no
+    competing WebSocket. Otherwise opens an ephemeral WeComAdapter, connects,
+    sends, and disconnects. Replaces the legacy _send_wecom helper.
 
     .. note::
        WeCom's server only allows one active WebSocket session per
-       ``bot_id``.  This ephemeral connection will **displace** any
-       existing gateway session on the same bot.  The gateway is
-       designed to detect the resulting ``errcode 846609`` and recover
-       via ``_handle_subscription_death`` within seconds, but
+       ``bot_id``.  An ephemeral connection (the no-runner fallback) will
+       **displace** any existing gateway session on the same bot.  The
+       gateway is designed to detect the resulting ``errcode 846609`` and
+       recover via ``_handle_subscription_death`` within seconds, but
        operators should be aware that a cron job firing mid-conversation
        may cause a brief interruption.
     """
+    # Reuse the gateway's live in-process adapter when available. Opening an
+    # ephemeral WS here would displace the gateway's sole subscription
+    # (errcode 846609); this mirrors _send_via_adapter's live-first path so a
+    # direct in-process caller never opens a competing connection. Only true
+    # out-of-process callers (no runner) fall through to the ephemeral connect.
+    try:
+        from gateway.run import _gateway_runner_ref
+        _runner = _gateway_runner_ref()
+    except Exception:
+        _runner = None
+    if _runner is not None:
+        _adapters = getattr(_runner, "adapters", None) or {}
+        _live = _adapters.get(Platform.WECOM) if hasattr(_adapters, "get") else None
+        if _live is not None:
+            try:
+                _result = await _live.send(chat_id, message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return {"error": f"WeCom send failed: {e}"}
+            if getattr(_result, "success", False):
+                return {
+                    "success": True,
+                    "platform": "wecom",
+                    "chat_id": chat_id,
+                    "message_id": getattr(_result, "message_id", None),
+                }
+            return {"error": f"WeCom send failed: {getattr(_result, 'error', None)}"}
+
     if not check_wecom_requirements():
         return {"error": "WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET."}
     try:

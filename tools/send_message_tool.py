@@ -158,7 +158,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'wecom:<userid>' (WeCom DM — the userid is the chat_id), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -516,6 +516,15 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    if platform_name == "wecom":
+        # WeCom DM chat_id is the sender userid (inbound handler sets
+        # chat_id = sender_id when no group chatid); group chatids are bare
+        # strings too. There is no phone/name resolution path, so any
+        # non-empty token is an explicit chat_id.
+        ref = target_ref.strip()
+        if ref:
+            return ref, None, True
+        return None, None, False
     if platform_name == "yuanbao":
         match = _YUANBAO_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -974,7 +983,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.FEISHU:
             result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.WECOM:
-            result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
+            # Route through the gateway's live adapter when in-process so we
+            # never open a competing WebSocket that displaces the gateway's
+            # sole subscription (errcode 846609). _standalone_send is the
+            # fallback only for true out-of-process callers. Mirrors the
+            # generic plugin branch below.
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files,
+                force_document=force_document,
+            )
         elif platform == Platform.BLUEBUBBLES:
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
@@ -1781,16 +1803,25 @@ async def _send_yuanbao(chat_id, message, media_files=None):
 
 
 # --- Registry ---
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
-# model tool. The agent should not decide on its own to fire off cross-platform
-# messages or reactions. The send engine in this module (``_send_to_platform``,
+# ``send_message`` is registered as an agent-callable tool, scoped narrowly to
+# the WeCom platform toolsets (hermes-wecom / hermes-wecom-callback in
+# toolsets.py) so the agent can notify a specific WeCom user on request. Other
+# platforms are unchanged. The send engine (``_send_to_platform``,
 # ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
-# helpers) remains the shared transport used by:
+# helpers) remains the shared transport also used by:
 #   - cron delivery (cron/scheduler.py)
 #   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
 #   - the gateway kanban notifier (dashboard-toggled, outside agent control)
-#   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
-# Those callers import the helpers directly; none of them need the registry
-# entry.
+#   - the standalone MCP server (mcp_serve.py)
+# WeCom sends route through the gateway's live in-process adapter via
+# _send_via_adapter, so they never open a competing WebSocket (errcode 846609).
+registry.register(
+    name="send_message",
+    toolset="send_message",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="📨",
+)

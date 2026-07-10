@@ -983,3 +983,110 @@ class TestTextBatchFlushRace:
         assert adapter._pending_text_batches.get(key) is None, (
             "active task must pop the event after processing"
         )
+
+
+class TestSendRequestRetry:
+    """Fix #1: _send_request retries through the reconnect window.
+
+    A send that hits errcode 846609 (or the pre-send 'not connected' guard
+    during the death window) must wait for the socket to come back and retry,
+    instead of surfacing a failure to the user during the ~2-3s reconnect."""
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+        return WeComAdapter(PlatformConfig(enabled=True))
+
+    def test_retries_on_subscription_death_then_succeeds(self):
+        adapter = self._adapter()
+        death = {"errcode": 846609, "errmsg": "aibot websocket not subscribed"}
+        ok = {"errcode": 0, "msgid": "ok"}
+        calls = []
+
+        async def fake_once(cmd, body, timeout):
+            calls.append(cmd)
+            # the listen loop reconnects before the retry attempt fires
+            adapter._ws_live.set()
+            return death if len(calls) == 1 else ok
+
+        adapter._send_request_once = fake_once
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND
+
+        result = asyncio.run(adapter._send_request(APP_CMD_SEND, {"chatid": "u1"}))
+
+        assert result == ok
+        assert len(calls) == 2, "send must retry once after 846609"
+
+    def test_returns_846609_when_socket_never_returns(self, monkeypatch):
+        """If the socket never comes back within the budget, the 846609 is
+        surfaced (no infinite retry loop)."""
+        adapter = self._adapter()
+        monkeypatch.setattr(
+            "plugins.platforms.wecom.adapter.SEND_RETRY_BUDGET_SECONDS", 0.05
+        )
+        death = {"errcode": 846609, "errmsg": "dead"}
+        calls = []
+
+        async def fake_once(cmd, body, timeout):
+            calls.append(cmd)
+            return death  # _ws_live never set → no reconnect
+
+        adapter._send_request_once = fake_once
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND
+
+        result = asyncio.run(adapter._send_request(APP_CMD_SEND, {"chatid": "u1"}))
+
+        assert result["errcode"] == 846609
+
+    def test_retries_when_ws_not_connected(self):
+        """The pre-send 'not connected' RuntimeError is also retried."""
+        adapter = self._adapter()
+        ok = {"errcode": 0, "msgid": "ok"}
+        calls = []
+
+        async def fake_once(cmd, body, timeout):
+            calls.append(cmd)
+            if len(calls) == 1:
+                # socket recovers (listen loop reconnects) despite this attempt
+                # hitting the pre-send "not connected" guard
+                adapter._ws_live.set()
+                raise RuntimeError("WeCom websocket is not connected")
+            return ok
+
+        adapter._send_request_once = fake_once
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND
+
+        result = asyncio.run(adapter._send_request(APP_CMD_SEND, {"chatid": "u1"}))
+
+        assert result == ok
+        assert len(calls) == 2
+
+    def test_ping_is_not_retried(self):
+        """Heartbeat ping owns its own deadline + forced reconnect; it must
+        bypass the retry wrapper (called exactly once)."""
+        adapter = self._adapter()
+        calls = []
+
+        async def fake_once(cmd, body, timeout):
+            calls.append(cmd)
+            raise RuntimeError("ping should not retry")
+
+        adapter._send_request_once = fake_once
+        from plugins.platforms.wecom.adapter import APP_CMD_PING
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(adapter._send_request(APP_CMD_PING, {}))
+
+        assert len(calls) == 1, "APP_CMD_PING must not be retried"
+
+    def test_cleanup_ws_clears_ws_live(self):
+        adapter = self._adapter()
+        adapter._ws_live.set()
+        assert adapter._ws_live.is_set()
+        asyncio.run(adapter._cleanup_ws())
+        assert not adapter._ws_live.is_set()
+
+    def test_subscription_death_clears_ws_live(self):
+        adapter = self._adapter()
+        adapter._ws_live.set()
+        asyncio.run(adapter._handle_subscription_death({"errcode": 846609}))
+        assert not adapter._ws_live.is_set()

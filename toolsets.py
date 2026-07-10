@@ -186,6 +186,12 @@ TOOLSETS = {
         "tools": ["cronjob"],
         "includes": []
     },
+
+    "send_message": {
+        "description": "Send a message to a connected platform user/channel (narrow: WeCom toolsets)",
+        "tools": ["send_message"],
+        "includes": []
+    },
     
 
     "file": {
@@ -539,13 +545,13 @@ TOOLSETS = {
 
     "hermes-wecom": {
         "description": "WeCom bot toolset - enterprise WeChat messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["send_message"],
         "includes": []
     },
 
     "hermes-wecom-callback": {
         "description": "WeCom callback toolset - enterprise self-built app messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["send_message"],
         "includes": []
     },
 

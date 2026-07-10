@@ -55,6 +55,35 @@ def test_whatsapp_friendly_name_still_uses_directory_resolution() -> None:
     assert _parse_target_ref("whatsapp", "general")[2] is False
 
 
+def test_wecom_bare_userid_is_explicit_target() -> None:
+    # WeCom DM chat_id is the sender userid (inbound handler sets
+    # chat_id = sender_id when no group chatid); bare non-empty tokens are
+    # explicit targets — there is no phone/name resolution path.
+    assert _parse_target_ref("wecom", "brycehuang") == ("brycehuang", None, True)
+
+
+def test_wecom_group_chatid_is_explicit_target() -> None:
+    assert _parse_target_ref("wecom", "R:somegroup") == ("R:somegroup", None, True)
+
+
+def test_wecom_empty_target_is_not_explicit() -> None:
+    assert _parse_target_ref("wecom", "   ") == (None, None, False)
+
+
+def test_send_message_registered_and_narrow_to_wecom() -> None:
+    """Fix #3: send_message is registered as an agent tool and added to the
+    WeCom toolsets (narrow scope), but not to other platforms' toolsets."""
+    import tools.send_message_tool  # noqa: F401  (triggers registry.register at import)
+    from tools.registry import registry
+    from toolsets import resolve_toolset
+
+    assert registry.get_entry("send_message") is not None, "send_message must be registered"
+    assert "send_message" in resolve_toolset("hermes-wecom")
+    assert "send_message" in resolve_toolset("hermes-wecom-callback")
+    # narrow scope: not bolted onto every platform
+    assert "send_message" not in resolve_toolset("hermes-telegram")
+
+
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(
