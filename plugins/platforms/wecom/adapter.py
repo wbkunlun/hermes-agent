@@ -221,6 +221,12 @@ class WeComAdapter(BasePlatformAdapter):
         # Used by edit_message() to find the reply_req_id bound at stream creation.
         self._stream_states: Dict[str, Dict[str, Any]] = {}
 
+        # Thinking placeholder streams — a "思考中…" stream sent before the first
+        # content frame arrives.  Maps chat_id → {"stream_id": str, "reply_req_id": str}.
+        # send() with expect_edits reuses the stream_id so the placeholder is
+        # seamlessly replaced by the actual response.
+        self._thinking_streams: Dict[str, Dict[str, Any]] = {}
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -1605,7 +1611,16 @@ class WeComAdapter(BasePlatformAdapter):
             )
 
             if is_streaming:
-                stream_id = uuid.uuid4().hex[:12]
+                # Reuse a "思考中…" placeholder stream if one was created by
+                # send_typing(), so the placeholder is seamlessly replaced
+                # by the actual response instead of creating a second message.
+                thinking = self._thinking_streams.pop(chat_id, None)
+                if thinking:
+                    stream_id = thinking["stream_id"]
+                    reply_req_id = thinking["reply_req_id"]
+                else:
+                    stream_id = uuid.uuid4().hex[:12]
+
                 self._stream_states[stream_id] = {
                     "reply_req_id": reply_req_id,
                     "created_at": time.monotonic(),
@@ -1822,8 +1837,50 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WeCom does not expose typing indicators in this adapter."""
-        del chat_id, metadata
+        """Show a thinking indicator via a ``msgtype: "stream"`` placeholder.
+
+        Sends a stream frame with ``finish: false`` and "思考中…" as content so
+        the WeCom client renders an animated-in-progress indicator.  When the
+        actual response arrives through ``send()`` with ``expect_edits=True``,
+        the placeholder is seamlessly replaced by reusing the same ``stream.id``.
+
+        Idempotent per chat — a second call within the same turn is a no-op
+        (avoids flooding the rate limit).
+        """
+        del metadata
+        if not chat_id or not self._ws_live.is_set():
+            return
+        if chat_id in self._thinking_streams:
+            return
+
+        reply_req_id = self._reply_req_id_for_message(None)
+        if not reply_req_id and chat_id in self._last_chat_req_ids:
+            ids = self._last_chat_req_ids[chat_id]
+            if ids:
+                reply_req_id = ids[-1]
+        if not reply_req_id:
+            return
+
+        stream_id = uuid.uuid4().hex[:12]
+        try:
+            await self._send_reply_request(
+                reply_req_id,
+                {
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": stream_id,
+                        "finish": False,
+                        "content": "思考中…",
+                    },
+                },
+            )
+        except Exception:
+            return  # non-critical; stream consumer will still deliver content
+
+        self._thinking_streams[chat_id] = {
+            "stream_id": stream_id,
+            "reply_req_id": reply_req_id,
+        }
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
