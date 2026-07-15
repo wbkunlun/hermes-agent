@@ -329,33 +329,46 @@ class WeComAdapter(BasePlatformAdapter):
         if not sess_kw:
             sess_kw = {"trust_env": not bool(proxy_url)}
         self._session = aiohttp.ClientSession(**sess_kw)
-        self._ws = await self._session.ws_connect(
-            self._ws_url,
-            heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
-            timeout=CONNECT_TIMEOUT_SECONDS,
-            **req_kw,
-        )
+        # Defense-in-depth: if anything between ws_connect and the SUBSCRIBE
+        # ack raises (proxy failure, server-side close mid-handshake, errcode
+        # on the ack), reset _ws and _session so the next read goes through
+        # the "not connected" branch and the listen loop reconnects from a
+        # clean state. Without this, a failed handshake leaves _ws pointing
+        # at a closed socket, which used to trigger a CPU-spin in the
+        # listen loop.
+        try:
+            self._ws = await self._session.ws_connect(
+                self._ws_url,
+                heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
+                timeout=CONNECT_TIMEOUT_SECONDS,
+                **req_kw,
+            )
 
-        req_id = self._new_req_id("subscribe")
-        await self._send_json(
-            {
-                "cmd": APP_CMD_SUBSCRIBE,
-                "headers": {"req_id": req_id},
-                "body": {
-                    "bot_id": self._bot_id,
-                    "secret": self._secret,
-                    "device_id": self._device_id,
-                },
-            }
-        )
+            req_id = self._new_req_id("subscribe")
+            await self._send_json(
+                {
+                    "cmd": APP_CMD_SUBSCRIBE,
+                    "headers": {"req_id": req_id},
+                    "body": {
+                        "bot_id": self._bot_id,
+                        "secret": self._secret,
+                        "device_id": self._device_id,
+                    },
+                }
+            )
 
-        auth_payload = await self._wait_for_handshake(req_id)
-        errcode = auth_payload.get("errcode", 0)
-        if errcode not in {0, None}:
-            errmsg = auth_payload.get("errmsg", "authentication failed")
-            raise RuntimeError(f"{errmsg} (errcode={errcode})")
-        # Subscribe ack received — the socket is live for sends.
-        self._ws_live.set()
+            auth_payload = await self._wait_for_handshake(req_id)
+            errcode = auth_payload.get("errcode", 0)
+            if errcode not in {0, None}:
+                errmsg = auth_payload.get("errmsg", "authentication failed")
+                raise RuntimeError(f"{errmsg} (errcode={errcode})")
+            # Subscribe ack received — the socket is live for sends.
+            self._ws_live.set()
+        except BaseException:
+            self._ws = None
+            self._session = None
+            self._ws_live.clear()
+            raise
 
     async def _wait_for_handshake(self, req_id: str) -> Dict[str, Any]:
         """Wait for the subscribe acknowledgement."""
@@ -414,6 +427,14 @@ class WeComAdapter(BasePlatformAdapter):
         """Read websocket frames until the connection closes."""
         if not self._ws:
             raise RuntimeError("WebSocket not connected")
+        # Guard against the post-failed-handshake zombie state: ``_ws`` is set
+        # (line 332) but the server closed the socket during ``_wait_for_handshake``,
+        # so the while-loop body below would skip and the function would
+        # silently return — making ``_listen_loop`` CPU-spin with no reconnect.
+        # Raising here routes the failure back through the listen loop's
+        # reconnect path with proper backoff and logging.
+        if self._ws.closed:
+            raise RuntimeError("WeCom websocket already closed before read")
 
         while self._running and self._ws and not self._ws.closed:
             msg = await self._ws.receive()

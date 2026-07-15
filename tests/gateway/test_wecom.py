@@ -1435,3 +1435,148 @@ class TestWeComStreaming:
         assert calls[1].args[1]["stream"]["finish"] is False
         assert calls[2].args[1]["stream"]["finish"] is True
 
+
+class TestListenLoopReconnectFix:
+    """Regression tests for the post-auth-failure zombie-state deadlock.
+
+    Symptom: when ``_open_connection`` raises mid-handshake (server closed the
+    socket after the SUBSCRIBE frame), ``_ws`` is left set-but-closed. The
+    outer ``_listen_loop`` calls ``_read_events`` which sees ``_ws.closed=True``
+    and silently returns, then resets ``backoff_idx`` and loops again with no
+    sleep — a CPU-spinning tight loop with no logs and no further reconnect
+    attempts. All sends then fail with "WeCom websocket is not connected".
+    """
+
+    @pytest.mark.asyncio
+    async def test_read_events_raises_when_ws_already_closed(self):
+        """If ``_ws`` is set but already closed, ``_read_events`` must raise.
+
+        Otherwise the outer ``_listen_loop`` would treat it as a clean exit,
+        reset ``backoff_idx`` to 0, and spin forever without reconnecting.
+        """
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = MagicMock()
+        adapter._ws.closed = True
+
+        with pytest.raises(RuntimeError, match=r"(?i)closed|not connected"):
+            await adapter._read_events()
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_retries_reconnect_after_open_connection_failure(self):
+        """After ``_open_connection`` fails, ``_listen_loop`` must keep retrying
+        instead of CPU-spinning in a tight no-op loop."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        # Simulate a closed-but-set _ws (the leftover state after a failed
+        # handshake). _read_events should raise so the outer loop reconnects.
+        closed_ws = MagicMock()
+        closed_ws.closed = True
+        adapter._ws = closed_ws
+
+        # Stub _open_connection so we can count reconnect attempts. Each
+        # attempt first calls _cleanup_ws (via _open_connection), which resets
+        # _ws to None; we want to keep _ws in the broken state on the first
+        # attempt to prove the retry loop observes the failure. Easier: have
+        # _open_connection fail every time and assert the call count grows
+        # over time, rather than assuming the loop's backoff sleep fires.
+        attempt_counter = {"n": 0}
+
+        async def always_fail_open_connection():
+            attempt_counter["n"] += 1
+            # Mimic the real failure: _ws is set to a closed socket, then we
+            # raise before subscribe completes.
+            closed = MagicMock()
+            closed.closed = True
+            adapter._ws = closed
+            raise RuntimeError("WeCom websocket closed during authentication")
+
+        adapter._open_connection = always_fail_open_connection
+        # Avoid touching real mark_connected / cleanup branches.
+        adapter._mark_connected = lambda: None
+
+        # Run the listen loop in the background; cap with a short wall clock
+        # and inspect call count. Without the fix the loop spins on a closed
+        # _ws and never reaches _open_connection; with the fix each iteration
+        # sleeps RECONNECT_BACKOFF[0]=2s before the next attempt. We give it
+        # ~2.5s and expect >= 1 attempt to prove the retry path is reachable.
+        task = asyncio.create_task(adapter._listen_loop())
+        try:
+            await asyncio.sleep(2.5)
+        finally:
+            adapter._running = False
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        assert attempt_counter["n"] >= 1, (
+            f"_listen_loop made {attempt_counter['n']} reconnect attempts in "
+            "2.5s — expected >= 1. If this is 0, the loop is CPU-spinning "
+            "because _read_events returned silently on a closed _ws."
+        )
+
+    @pytest.mark.asyncio
+    async def test_open_connection_resets_ws_state_on_mid_handshake_failure(self):
+        """Defense-in-depth: when ``_open_connection`` raises after setting
+        ``_ws`` (e.g. server closes mid-handshake), ``_ws`` must be reset to
+        ``None`` so the next read attempts the "not connected" branch instead
+        of operating on a stale closed-but-set socket.
+        """
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._bot_id = "test-bot"
+        adapter._secret = "test-secret"
+
+        class _ClosedDuringHandshakeWS:
+            # Initially looks connected so _send_json (SUBSCRIBE) succeeds,
+            # then server-side close fires during _wait_for_handshake — the
+            # exact production symptom at 19:06:57.
+            closed = False
+
+            async def send_json(self, payload):
+                # Flip to closed after SUBSCRIBE is sent, mirroring the
+                # race where the server closes mid-handshake.
+                self.closed = True
+                return None
+
+            async def close(self):
+                return None
+
+        class _FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def ws_connect(self, *args, **kwargs):
+                return _ClosedDuringHandshakeWS()
+
+            async def close(self):
+                return None
+
+        async def _fake_handshake(req_id):
+            # Server-side close during handshake — matches the prod symptom.
+            raise RuntimeError("WeCom websocket closed during authentication")
+
+        adapter._cleanup_ws = AsyncMock()
+        adapter._wait_for_handshake = _fake_handshake
+
+        with patch("plugins.platforms.wecom.adapter.aiohttp.ClientSession", _FakeSession):
+            with pytest.raises(RuntimeError, match="during authentication"):
+                await adapter._open_connection()
+
+        # The failure must not leave _ws pointing at a stale closed socket.
+        assert adapter._ws is None, (
+            "_open_connection failed mid-handshake but _ws was not reset; "
+            "next _read_events would see a closed-but-set _ws"
+        )
+        # Session must also be cleaned up to avoid the aiohttp connector leak.
+        assert adapter._session is None, (
+            "_open_connection failed but _session was not reset"
+        )
+
