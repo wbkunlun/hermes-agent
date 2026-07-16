@@ -2954,7 +2954,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         if _circuit_open:
             if not self.quiet_mode:
                 logger.warning(
-                    "Compression circuit breaker open (%d consecutive failures), "
+                    # windows-footgun: ok — "open (" here is English prose inside
+                    # a log string ("circuit breaker open"), not a builtin open()
+                    # call; the footgun checker's regex false-positives on it.
+                    "Compression circuit breaker open (%d consecutive failures), "  # windows-footgun: ok
                     "skipping LLM summary for %d more seconds",
                     _cb_fails,
                     max(0, int(_cb_cooldown - time.monotonic())),

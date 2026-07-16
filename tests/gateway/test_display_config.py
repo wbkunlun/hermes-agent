@@ -256,8 +256,22 @@ class TestPlatformDefaults:
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud"):
+        # Note: wecom was promoted out of this set — see
+        # test_wecom_promoted_to_medium_for_streaming.
+        for plat in ("signal", "bluebubbles", "weixin", "dingtalk", "whatsapp_cloud"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
+
+    def test_wecom_promoted_to_medium_for_streaming(self):
+        """v2026.7.10-fork2 promoted wecom from TIER_LOW to TIER_MEDIUM so it
+        supports streaming output. Regression guard: if wecom is accidentally
+        dropped back to TIER_LOW, streaming breaks silently.
+        """
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "wecom", "tool_progress") == "new", "wecom"
+        # TIER_MEDIUM streaming is None (follow global); it must NOT be the
+        # hard False that TIER_LOW sets (which would disable streaming).
+        assert resolve_display_setting({}, "wecom", "streaming") is not False
 
     def test_whatsapp_cloud_locked_to_low_tier_until_edit_message_lands(self):
         """Regression guard: ``whatsapp_cloud`` must stay TIER_LOW until the

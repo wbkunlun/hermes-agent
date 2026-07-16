@@ -835,7 +835,13 @@ async def test_run_agent_surfaces_real_interim_commentary(monkeypatch, tmp_path)
         tmp_path,
         CommentaryAgent,
         session_id="sess-commentary",
-        config_data={"display": {"interim_assistant_messages": True}},
+        config_data={
+            "display": {"interim_assistant_messages": True},
+            # v2026.7.10-fork4 enabled streaming by default; pin it off here
+            # so this test exercises the non-streaming interim-commentary path
+            # in isolation (already_sent must stay False).
+            "streaming": {"enabled": False},
+        },
     )
 
     assert result.get("already_sent") is not True
@@ -861,7 +867,12 @@ async def test_run_agent_suppresses_interim_commentary_when_disabled(monkeypatch
         tmp_path,
         CommentaryAgent,
         session_id="sess-commentary-disabled",
-        config_data={"display": {"interim_assistant_messages": False}},
+        config_data={
+            "display": {"interim_assistant_messages": False},
+            # v2026.7.10-fork4 enabled streaming by default; pin off to keep
+            # already_sent False so this test isolates the disable behavior.
+            "streaming": {"enabled": False},
+        },
     )
 
     assert result.get("already_sent") is not True
@@ -876,7 +887,12 @@ async def test_run_agent_tool_progress_does_not_control_interim_commentary(monke
         tmp_path,
         CommentaryAgent,
         session_id="sess-commentary-tool-progress",
-        config_data={"display": {"tool_progress": "all", "interim_assistant_messages": False}},
+        config_data={
+            "display": {"tool_progress": "all", "interim_assistant_messages": False},
+            # v2026.7.10-fork4 enabled streaming by default; pin off so
+            # already_sent stays False and we isolate the tool_progress knob.
+            "streaming": {"enabled": False},
+        },
     )
 
     assert result.get("already_sent") is not True
@@ -936,6 +952,9 @@ async def test_run_agent_interim_commentary_works_with_tool_progress_off(monkeyp
                 "tool_progress": "off",
                 "interim_assistant_messages": True,
             },
+            # v2026.7.10-fork4 enabled streaming by default; pin off so
+            # already_sent stays False and we isolate interim commentary.
+            "streaming": {"enabled": False},
         },
     )
 

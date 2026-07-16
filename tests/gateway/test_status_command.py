@@ -388,7 +388,7 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monkeypatch):
+async def test_first_run_slack_no_sethome_nudge_after_fork6_disable(monkeypatch):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -425,14 +425,20 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
     result = await runner._handle_message(_make_event("hello", platform=Platform.SLACK))
 
     assert result == "ok"
-    runner.adapters[Platform.SLACK].send.assert_awaited_once()
-    onboarding = runner.adapters[Platform.SLACK].send.await_args.args[1]
-    assert "/hermes sethome" in onboarding
-    assert "Type /sethome" not in onboarding
+    # FORK(wbkunlun) v2026.7.10-fork6: the one-time /sethome onboarding nudge
+    # is hard-disabled (``False and`` guard in gateway/run.py), so no platform
+    # notice mentioning sethome / home channel should be delivered on first
+    # run. Regression guard: if the nudge is ever re-enabled, this fails.
+    sent_texts = [
+        str(call.args[1]) for call in runner.adapters[Platform.SLACK].send.await_args_list
+    ]
+    assert not any(
+        "sethome" in t.lower() or "home channel" in t.lower() for t in sent_texts
+    )
 
 
 @pytest.mark.asyncio
-async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(monkeypatch):
+async def test_first_run_non_slack_no_sethome_nudge_after_fork6_disable(monkeypatch):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -469,9 +475,13 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
     result = await runner._handle_message(_make_event("hello", platform=Platform.TELEGRAM))
 
     assert result == "ok"
-    runner.adapters[Platform.TELEGRAM].send.assert_awaited_once()
-    onboarding = runner.adapters[Platform.TELEGRAM].send.await_args.args[1]
-    assert "Type /sethome" in onboarding
+    # FORK(wbkunlun) v2026.7.10-fork6: sethome onboarding nudge disabled.
+    sent_texts = [
+        str(call.args[1]) for call in runner.adapters[Platform.TELEGRAM].send.await_args_list
+    ]
+    assert not any(
+        "sethome" in t.lower() or "home channel" in t.lower() for t in sent_texts
+    )
 
 
 @pytest.mark.asyncio
