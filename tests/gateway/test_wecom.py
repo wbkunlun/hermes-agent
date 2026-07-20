@@ -37,10 +37,13 @@ class TestWeComRequirements:
 
 
 class TestWeComAdapterInit:
-    def test_declares_message_edit_capability(self):
+    def test_declares_stream_frames_capability(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
 
-        assert WeComAdapter.SUPPORTS_MESSAGE_EDITING is True
+        # WeCom streams via aibot_respond_msg msgtype:"stream" frames driven by
+        # WeComStreamDelivery (clawrelay-style), not edit-based delivery.
+        assert WeComAdapter.SUPPORTS_STREAM_FRAMES is True
+        assert WeComAdapter.SUPPORTS_MESSAGE_EDITING is False
         assert WeComAdapter.REQUIRES_EDIT_FINALIZE is True
 
     def test_reads_config_from_extra(self):

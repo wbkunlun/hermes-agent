@@ -34,6 +34,7 @@ import os
 import re
 import shlex
 import site
+import uuid
 import sys
 import signal
 import tempfile
@@ -16609,11 +16610,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
+        if _plat_streaming is None:
+            _streaming_enabled = _scfg.enabled and _scfg.transport != "off"
+            # WeCom streams by default (clawrelay-style stream frames) even when
+            # global streaming is off. Disable via display.platforms.wecom.streaming.
+            if not _streaming_enabled and source.platform == Platform.WECOM:
+                _streaming_enabled = True
+        else:
+            _streaming_enabled = bool(_plat_streaming)
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -16630,38 +16634,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ) -> None:
                             _adapter.pause_typing_for_chat(_chat_id)
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                    _buffer_only = False
-                    if source.platform == Platform.MATRIX:
-                        _effective_cursor = ""
-                        _buffer_only = True
-                    # Fresh-final applies to Telegram only — other
-                    # platforms either edit in place cheaply (Discord,
-                    # Slack) or don't have the timestamp-on-edit
-                    # problem.  (Ported from openclaw/openclaw#72038.)
-                    _fresh_final_secs = (
-                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                        if source.platform == Platform.TELEGRAM
-                        else 0.0
-                    )
-                    _consumer_cfg = StreamConsumerConfig(
-                        edit_interval=_scfg.edit_interval,
-                        buffer_threshold=_scfg.buffer_threshold,
-                        cursor=_effective_cursor,
-                        buffer_only=_buffer_only,
-                        fresh_final_after_seconds=_fresh_final_secs,
-                        transport=_scfg.transport or "edit",
-                        chat_type=getattr(source, "chat_type", "") or "",
-                    )
-                    _stream_consumer = GatewayStreamConsumer(
-                        adapter=_adapter,
-                        chat_id=source.chat_id,
-                        config=_consumer_cfg,
-                        metadata=_thread_metadata,
-                        on_before_finalize=_pause_typing_before_finalize,
-                        initial_reply_to_id=event_message_id,
-                        run_still_current=_run_still_current,
-                    )
+                    _supports_stream_frames = getattr(_adapter, "SUPPORTS_STREAM_FRAMES", False)
+                    if _supports_stream_frames:
+                        # WeCom smart bot: stream via stream frames (single bubble
+                        # + <think> block); cannot edit messages. Mirrors
+                        # clawrelay-wecom-server.
+                        _wecom_reply_id = _adapter.resolve_reply_req_id(
+                            event_message_id, source.chat_id
+                        )
+                        if not _wecom_reply_id:
+                            raise RuntimeError(
+                                "skip streaming: no inbound reply_req_id for WeCom"
+                            )
+                        _cr_base = os.getenv("WECOM_CHAT_RECORD_BASE_URL", "").strip()
+                        _wecom_chat_record_url = (
+                            f"{_cr_base.rstrip('/')}/{session_id}"
+                            if _cr_base and session_id
+                            else ""
+                        )
+                        from plugins.platforms.wecom.stream_delivery import (
+                            WeComStreamDelivery,
+                        )
+                        _stream_consumer = WeComStreamDelivery(
+                            adapter=_adapter,
+                            reply_req_id=_wecom_reply_id,
+                            stream_id=uuid.uuid4().hex[:12],
+                            chat_id=source.chat_id,
+                            chat_record_url=_wecom_chat_record_url,
+                        )
+                    else:
+                        _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
+                        _buffer_only = False
+                        if source.platform == Platform.MATRIX:
+                            _effective_cursor = ""
+                            _buffer_only = True
+                        # Fresh-final applies to Telegram only — other
+                        # platforms either edit in place cheaply (Discord,
+                        # Slack) or don't have the timestamp-on-edit
+                        # problem.  (Ported from openclaw/openclaw#72038.)
+                        _fresh_final_secs = (
+                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                            if source.platform == Platform.TELEGRAM
+                            else 0.0
+                        )
+                        _consumer_cfg = StreamConsumerConfig(
+                            edit_interval=_scfg.edit_interval,
+                            buffer_threshold=_scfg.buffer_threshold,
+                            cursor=_effective_cursor,
+                            buffer_only=_buffer_only,
+                            fresh_final_after_seconds=_fresh_final_secs,
+                            transport=_scfg.transport or "edit",
+                            chat_type=getattr(source, "chat_type", "") or "",
+                        )
+                        _stream_consumer = GatewayStreamConsumer(
+                            adapter=_adapter,
+                            chat_id=source.chat_id,
+                            config=_consumer_cfg,
+                            metadata=_thread_metadata,
+                            on_before_finalize=_pause_typing_before_finalize,
+                            initial_reply_to_id=event_message_id,
+                            run_still_current=_run_still_current,
+                        )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
 
@@ -17189,6 +17222,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
+                return
+
+            # WeCom single-bubble streaming: fold tool calls into the <think>
+            # block of the active stream bubble instead of emitting a separate
+            # progress bubble. GatewayStreamConsumer has no on_tool_start, so
+            # this duck-type check only matches WeComStreamDelivery.
+            _wecom_delivery = stream_consumer_holder[0]
+            if _wecom_delivery is not None and hasattr(_wecom_delivery, "on_tool_start"):
+                try:
+                    _wecom_delivery.on_tool_start(tool_name or "")
+                except Exception:
+                    logger.debug("WeCom on_tool_start routing failed", exc_info=True)
                 return
 
             # Suppress tool-progress bubbles once the user has sent `stop`.
@@ -17932,11 +17977,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config, platform_key, "streaming"
             )
             # None = no per-platform override → follow global config
-            _streaming_enabled = (
-                _scfg.enabled and _scfg.transport != "off"
-                if _plat_streaming is None
-                else bool(_plat_streaming)
-            )
+            if _plat_streaming is None:
+                _streaming_enabled = _scfg.enabled and _scfg.transport != "off"
+                # WeCom streams by default (clawrelay-style stream frames) even
+                # when global streaming is off. Disable via
+                # display.platforms.wecom.streaming.
+                if not _streaming_enabled and source.platform == Platform.WECOM:
+                    _streaming_enabled = True
+            else:
+                _streaming_enabled = bool(_plat_streaming)
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -17958,53 +18007,91 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # first message that can never be updated, resulting in
                         # duplicate messages (partial + final).
                         _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
+                        _supports_stream_frames = getattr(_adapter, "SUPPORTS_STREAM_FRAMES", False)
+                        if not _adapter_supports_edit and not _supports_stream_frames:
                             raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        _buffer_only = False
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                            _buffer_only = True
-                        # Fresh-final applies to Telegram only — other
-                        # platforms either edit in place cheaply or don't
-                        # have the edit-timestamp-stays-stale problem.
-                        # (Ported from openclaw/openclaw#72038.)
-                        _fresh_final_secs = (
-                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                            if source.platform == Platform.TELEGRAM
-                            else 0.0
-                        )
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                            buffer_only=_buffer_only,
-                            fresh_final_after_seconds=_fresh_final_secs,
-                            transport=_scfg.transport or "edit",
-                            chat_type=getattr(source, "chat_type", "") or "",
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
-                            on_new_message=(
-                                (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
-                                else None
-                            ),
-                            on_before_finalize=_pause_typing_before_finalize,
-                            initial_reply_to_id=event_message_id,
-                            run_still_current=_run_still_current,
-                        )
-                        if _want_stream_deltas:
-                            def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
-                                    _stream_consumer.on_delta(text)
-                        stream_consumer_holder[0] = _stream_consumer
+                        if _supports_stream_frames:
+                            # WeCom smart bot streams via aibot_respond_msg stream
+                            # frames (single growing bubble + <think> block) rather
+                            # than edit-based delivery — it cannot edit messages.
+                            # Mirrors clawrelay-wecom-server. WeComStreamDelivery
+                            # shares GatewayStreamConsumer's sync interface, so the
+                            # on_delta / on_commentary / finish wiring below works
+                            # unchanged.
+                            _wecom_reply_id = _adapter.resolve_reply_req_id(
+                                event_message_id, source.chat_id
+                            )
+                            if not _wecom_reply_id:
+                                raise RuntimeError(
+                                    "skip streaming: no inbound reply_req_id for WeCom"
+                                )
+                            _cr_base = os.getenv("WECOM_CHAT_RECORD_BASE_URL", "").strip()
+                            _wecom_chat_record_url = (
+                                f"{_cr_base.rstrip('/')}/{session_id}"
+                                if _cr_base and session_id
+                                else ""
+                            )
+                            from plugins.platforms.wecom.stream_delivery import (
+                                WeComStreamDelivery,
+                            )
+                            _stream_consumer = WeComStreamDelivery(
+                                adapter=_adapter,
+                                reply_req_id=_wecom_reply_id,
+                                stream_id=uuid.uuid4().hex[:12],
+                                chat_id=source.chat_id,
+                                chat_record_url=_wecom_chat_record_url,
+                            )
+                            if _want_stream_deltas:
+                                def _stream_delta_cb(text: str) -> None:
+                                    if _run_still_current():
+                                        _stream_consumer.on_delta(text)
+                            stream_consumer_holder[0] = _stream_consumer
+                        else:
+                            _effective_cursor = _scfg.cursor
+                            # Some Matrix clients render the streaming cursor
+                            # as a visible tofu/white-box artifact.  Keep
+                            # streaming text on Matrix, but suppress the cursor.
+                            _buffer_only = False
+                            if source.platform == Platform.MATRIX:
+                                _effective_cursor = ""
+                                _buffer_only = True
+                            # Fresh-final applies to Telegram only — other
+                            # platforms either edit in place cheaply or don't
+                            # have the edit-timestamp-stays-stale problem.
+                            # (Ported from openclaw/openclaw#72038.)
+                            _fresh_final_secs = (
+                                float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                                if source.platform == Platform.TELEGRAM
+                                else 0.0
+                            )
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=_scfg.edit_interval,
+                                buffer_threshold=_scfg.buffer_threshold,
+                                cursor=_effective_cursor,
+                                buffer_only=_buffer_only,
+                                fresh_final_after_seconds=_fresh_final_secs,
+                                transport=_scfg.transport or "edit",
+                                chat_type=getattr(source, "chat_type", "") or "",
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata=_status_thread_metadata,
+                                on_new_message=(
+                                    (lambda: progress_queue.put(("__reset__",)))
+                                    if progress_queue is not None
+                                    else None
+                                ),
+                                on_before_finalize=_pause_typing_before_finalize,
+                                initial_reply_to_id=event_message_id,
+                                run_still_current=_run_still_current,
+                            )
+                            if _want_stream_deltas:
+                                def _stream_delta_cb(text: str) -> None:
+                                    if _run_still_current():
+                                        _stream_consumer.on_delta(text)
+                            stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
@@ -18227,7 +18314,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # None callback — so _thinking scratch bubbles never relayed even
             # though the progress queue was created for them.
             agent.tool_progress_callback = (
-                progress_callback if (needs_progress_queue or log_mode_enabled) else None
+                progress_callback
+                if (
+                    needs_progress_queue
+                    or log_mode_enabled
+                    # WeCom single-bubble streaming folds tool.started into the
+                    # <think> block via progress_callback, so attach it whenever
+                    # a WeCom stream delivery is active even if tool_progress is off.
+                    or (
+                        stream_consumer_holder[0] is not None
+                        and hasattr(stream_consumer_holder[0], "on_tool_start")
+                    )
+                )
+                else None
             )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).

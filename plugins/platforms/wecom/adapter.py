@@ -80,6 +80,7 @@ APP_CMD_LEGACY_CALLBACK = "aibot_callback"
 APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
 APP_CMD_SEND = "aibot_send_msg"
 APP_CMD_RESPONSE = "aibot_respond_msg"
+APP_CMD_RESPONSE_WELCOME = "aibot_respond_welcome_msg"
 APP_CMD_PING = "ping"
 APP_CMD_PONG = "pong"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
@@ -96,6 +97,9 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 HEARTBEAT_TIMEOUT_SECONDS = 10.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 SUBSCRIPTION_DEAD_ERROR_CODES = {846609}
+# Server-side stream expiry: the stream bubble can no longer be updated.
+# On this errcode we fall back to proactive markdown via ``aibot_send_msg``.
+STREAM_EXPIRED_ERRCODE = 846608
 # Send retry: ride out the ~2-3s reconnect window (RECONNECT_BACKOFF[0]=2s +
 # WS handshake) instead of failing the in-flight send on 846609 / the
 # pre-send "not connected" guard. Heartbeat pings are excluded (they own
@@ -153,7 +157,13 @@ class WeComAdapter(BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
-    SUPPORTS_MESSAGE_EDITING = True
+    # WeCom streams via aibot_respond_msg msgtype:"stream" frames driven by a
+    # dedicated WeComStreamDelivery (clawrelay-style single bubble + <think>
+    # block), NOT via edit-based GatewayStreamConsumer. So we do NOT advertise
+    # message editing — the gateway routes WeCom through WeComStreamDelivery
+    # instead (see gateway/run.py SUPPORTS_STREAM_FRAMES branch).
+    SUPPORTS_MESSAGE_EDITING = False
+    SUPPORTS_STREAM_FRAMES = True
 
     # WeCom stream protocol requires an explicit finalize frame (stream.finish=true)
     # to mark a streaming message as permanent. Set REQUIRES_EDIT_FINALIZE = True so
@@ -200,6 +210,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        # Stream IDs whose server-side bubble has expired (errcode 846608).
+        # Subsequent frames for these IDs fall back to proactive markdown.
+        self._expired_stream_ids: set = set()
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -492,6 +505,7 @@ class WeComAdapter(BasePlatformAdapter):
                 })
             return
         if cmd == APP_CMD_EVENT_CALLBACK:
+            await self._on_event(payload)
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -624,6 +638,96 @@ class WeComAdapter(BasePlatformAdapter):
         if last_exc is not None:
             raise last_exc
         return {"errcode": -1, "errmsg": "WeCom send retry budget exhausted"}
+
+    # ------------------------------------------------------------------
+    # Stream-frame replies (clawrelay-style streaming, driven by
+    # WeComStreamDelivery — see plugins/platforms/wecom/stream_delivery.py)
+    # ------------------------------------------------------------------
+
+    async def send_stream_frame(
+        self,
+        reply_req_id: str,
+        stream_id: str,
+        content: str,
+        finish: bool,
+        chat_id: Optional[str] = None,
+    ) -> None:
+        """Send one ``msgtype: "stream"`` reply frame.
+
+        Best-effort: never raises. On stream expiry (errcode 846608) the bubble
+        can no longer be updated, so subsequent frames fall back to proactive
+        markdown via ``aibot_send_msg`` (requires ``chat_id``).
+        """
+        truncated = content[: self.MAX_MESSAGE_LENGTH]
+
+        if stream_id in self._expired_stream_ids:
+            await self._stream_fallback_send(chat_id, truncated)
+            return
+
+        body: Dict[str, Any] = {
+            "msgtype": "stream",
+            "stream": {"id": stream_id, "finish": finish, "content": truncated},
+        }
+        try:
+            response = await self._send_reply_request(reply_req_id, body)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] stream frame timed out: stream=%s", self.name, stream_id)
+            self._expired_stream_ids.add(stream_id)
+            await self._stream_fallback_send(chat_id, truncated)
+            return
+        except Exception as exc:
+            logger.debug("[%s] stream frame send failed: %s", self.name, exc)
+            return
+
+        if response.get("errcode") == STREAM_EXPIRED_ERRCODE:
+            logger.warning(
+                "[%s] stream %s expired (errcode 846608), falling back to markdown",
+                self.name, stream_id,
+            )
+            self._expired_stream_ids.add(stream_id)
+            await self._stream_fallback_send(chat_id, truncated)
+
+    async def _stream_fallback_send(self, chat_id: Optional[str], content: str) -> None:
+        """Proactive markdown fallback when a stream bubble has expired."""
+        if not chat_id:
+            return
+        try:
+            await self._send_request(
+                APP_CMD_SEND,
+                {
+                    "chatid": chat_id,
+                    "msgtype": "markdown",
+                    "markdown": {"content": content[: self.MAX_MESSAGE_LENGTH]},
+                },
+            )
+        except Exception as exc:
+            logger.warning("[%s] stream fallback markdown failed: %s", self.name, exc)
+
+    async def send_welcome(self, reply_req_id: str, content: str) -> None:
+        """Send a welcome message via ``aibot_respond_welcome_msg``."""
+        try:
+            await self._send_reply_request(
+                reply_req_id,
+                {"msgtype": "text", "text": {"content": content[: self.MAX_MESSAGE_LENGTH]}},
+                cmd=APP_CMD_RESPONSE_WELCOME,
+            )
+        except Exception as exc:
+            logger.debug("[%s] welcome send failed: %s", self.name, exc)
+
+    async def _on_event(self, payload: Dict[str, Any]) -> None:
+        """Handle ``aibot_event_callback`` events (e.g. enter_chat welcome)."""
+        body = payload.get("body") or {}
+        event = body.get("event") or {}
+        eventtype = str(event.get("eventtype") or "")
+        req_id = self._payload_req_id(payload)
+
+        if eventtype == "enter_chat" and req_id:
+            user_id = str((body.get("from") or {}).get("userid") or "")
+            name = user_id or "朋友"
+            await self.send_welcome(req_id, f"你好 {name}！我是 AI 助手，有什么可以帮您的吗？")
+            return
+
+        logger.debug("[%s] Ignoring WeCom event: %s", self.name, eventtype)
 
     async def _send_reply_request_once(
         self,
@@ -1144,6 +1248,22 @@ class WeComAdapter(BasePlatformAdapter):
         if not normalized or normalized.startswith("quote:"):
             return None
         return self._reply_req_ids.get(normalized)
+
+    def resolve_reply_req_id(
+        self, message_id: Optional[str], chat_id: Optional[str]
+    ) -> Optional[str]:
+        """Resolve the inbound ``req_id`` to correlate a stream/reply frame.
+
+        Tries the per-message cache first, then falls back to the most recent
+        inbound ``req_id`` for the chat (mirrors the lookup in :meth:`send`).
+        """
+        rid = self._reply_req_id_for_message(message_id)
+        if rid:
+            return rid
+        ids = self._last_chat_req_ids.get(str(chat_id or "")) if chat_id else None
+        if ids:
+            return ids[-1]
+        return None
 
     # ------------------------------------------------------------------
     # Outbound messaging
@@ -1858,50 +1978,16 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Show a thinking indicator via a ``msgtype: "stream"`` placeholder.
+        """No-op — the thinking indicator is owned by WeComStreamDelivery.
 
-        Sends a stream frame with ``finish: false`` and "思考中…" as content so
-        the WeCom client renders an animated-in-progress indicator.  When the
-        actual response arrives through ``send()`` with ``expect_edits=True``,
-        the placeholder is seamlessly replaced by reusing the same ``stream.id``.
-
-        Idempotent per chat — a second call within the same turn is a no-op
-        (avoids flooding the rate limit).
+        The gateway still calls send_typing() once per turn (run.py), but with
+        clawrelay-style streaming the delivery's first frame (an open ``<think>``
+        block with "🤔 正在思考中...") IS the thinking indicator. Sending a
+        separate "思考中…" placeholder here would spawn a second bubble with a
+        different stream_id, so we deliberately do nothing.
         """
-        del metadata
-        if not chat_id or not self._ws_live.is_set():
-            return
-        if chat_id in self._thinking_streams:
-            return
-
-        reply_req_id = self._reply_req_id_for_message(None)
-        if not reply_req_id and chat_id in self._last_chat_req_ids:
-            ids = self._last_chat_req_ids[chat_id]
-            if ids:
-                reply_req_id = ids[-1]
-        if not reply_req_id:
-            return
-
-        stream_id = uuid.uuid4().hex[:12]
-        try:
-            await self._send_reply_request(
-                reply_req_id,
-                {
-                    "msgtype": "stream",
-                    "stream": {
-                        "id": stream_id,
-                        "finish": False,
-                        "content": "思考中…",
-                    },
-                },
-            )
-        except Exception:
-            return  # non-critical; stream consumer will still deliver content
-
-        self._thinking_streams[chat_id] = {
-            "stream_id": stream_id,
-            "reply_req_id": reply_req_id,
-        }
+        del chat_id, metadata
+        return
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
