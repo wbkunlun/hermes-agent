@@ -18596,6 +18596,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _adapter.pause_typing_for_chat(_chat_id)
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                     _supports_stream_frames = getattr(_adapter, "SUPPORTS_STREAM_FRAMES", False)
+                    if not _adapter_supports_edit and not _supports_stream_frames:
+                        raise RuntimeError(
+                            "skip streaming for non-editable platform"
+                        )
                     if _supports_stream_frames:
                         # WeCom smart bot: stream via stream frames (single bubble
                         # + <think> block); cannot edit messages. Mirrors

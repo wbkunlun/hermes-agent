@@ -180,6 +180,10 @@ class _DedupCache:
 class WeWorkAdapter(BasePlatformAdapter):
     """Webhook-based WeWork adapter."""
 
+    # WeWork API 不支持编辑已发送消息 — 跳过 GatewayStreamConsumer
+    # 流式路径，改为完整回答 → send() → _chunk_text 分片。
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(self, config: PlatformConfig):
         platform = Platform("wework")
         super().__init__(config=config, platform=platform)
