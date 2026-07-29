@@ -569,6 +569,98 @@ def _user_deny_block_result(pattern: str) -> dict:
     }
 
 
+def _load_command_allowlist_globs():
+    """Return the set of allowlist fnmatch globs, or None when unset.
+
+    Sources, in priority order: the ``HERMES_COMMAND_ALLOWLIST`` env var
+    (comma-separated), then ``approvals.allow`` in config.yaml (a YAML list).
+    An empty/absent configuration returns None, which the guard treats as
+    "feature off" — the rest of the pipeline runs unchanged. This is the
+    user-editable strict counterpart to ``approvals.deny``: when an operator
+    pins the allowed command set, nothing outside it may run.
+    """
+    raw = os.environ.get("HERMES_COMMAND_ALLOWLIST", "").strip()
+    if raw:
+        items = [p.strip() for p in raw.split(",") if p.strip()]
+        return set(items) if items else None
+    try:
+        raw = _get_approval_config().get("allow") or []
+    except Exception:
+        return None
+    if isinstance(raw, list):
+        items = {p.strip() for p in raw if isinstance(p, str) and p.strip()}
+        return items or None
+    return None
+
+
+def _match_user_allow_rule(command: str):
+    """Three-state command allowlist check.
+
+    Returns:
+        True  — command matches a configured allowlist entry (explicitly allowed).
+        False — an allowlist IS configured but the command does not match
+                (must be blocked).
+        None  — no allowlist configured (feature off; defer to the rest of
+                the pipeline).
+
+    Matching runs over the same normalized / deobfuscated command variants
+    the dangerous-pattern detector uses, so quoting tricks (``r\\m``,
+    ``git st""atus``) can't sidestep an allow rule any more easily than they
+    sidestep detection. A bare ``*`` entry means allow-all.
+
+    Entry semantics (more intuitive than raw fnmatch for a command allowlist):
+
+    * A bare program name (no spaces, no ``*``) — e.g. ``git`` — allows that
+      program with ANY arguments (``git status``, ``git push ...``). This is
+      the common "allow this tool" case. Chained dangerous tails
+      (``ls; rm -rf /``) are still caught: the hardline floor and
+      ``approvals.deny`` run BEFORE this check, and ``_command_detection_variants``
+      splits on ``;``/``&&``/``|`` so each sub-command is independently matched.
+    * An entry with spaces or ``*`` — e.g. ``git push --force*`` or ``git *`` —
+      is matched against the WHOLE command string with fnmatch, the same grain
+      as ``approvals.deny``. Use this for precise allow-scoping.
+    """
+    globs = _load_command_allowlist_globs()
+    if globs is None:
+        return None
+    if "*" in globs:  # explicit allow-all entry
+        return True
+    for command_variant in _command_detection_variants(command):
+        candidate = command_variant.lower().strip()
+        if not candidate:
+            continue
+        first_token = candidate.split(None, 1)[0]
+        for pattern in globs:
+            pl = pattern.lower().strip()
+            if not pl:
+                continue
+            if "*" in pl or " " in pl:
+                # Precise multi-token / wildcard pattern: whole-string fnmatch.
+                if fnmatch.fnmatchcase(candidate, pl):
+                    return True
+            else:
+                # Bare program name: allow it with any arguments.
+                if first_token == pl:
+                    return True
+    return False
+
+
+def _user_allow_block_result() -> dict:
+    """Build the standard block result for a non-whitelisted command."""
+    return {
+        "approved": False,
+        "user_allow": True,
+        "message": (
+            "BLOCKED: this command is not in the operator command allowlist "
+            "(HERMES_COMMAND_ALLOWLIST / approvals.allow). Only explicitly "
+            "whitelisted commands may run in this deployment — not even "
+            "--yolo, /yolo, or approvals.mode=off can bypass this. Do NOT "
+            "retry or rephrase this command; ask the operator to add it to "
+            "the allowlist if it is legitimately needed."
+        ),
+    }
+
+
 def _hardline_block_result(description: str) -> dict:
     """Build the standard block result for a hardline match."""
     return {
@@ -3217,6 +3309,23 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # User-defined allow rules (HERMES_COMMAND_ALLOWLIST env var, or
+    # approvals.allow in config.yaml): a STRICT allowlist. Like the deny
+    # rule above, this fires BEFORE the yolo / mode=off bypass — when an
+    # operator pins the allowed command set, nothing outside it may run,
+    # not even under yolo. Three-state: None = feature off (env/config
+    # unset) and the rest of the pipeline is unchanged; True = explicitly
+    # whitelisted, short-circuit to approved; False = not whitelisted, hard
+    # block. Hardline (checked above) still wins, so even an allowlisted
+    # ``rm -rf /`` remains blocked.
+    _allow = _match_user_allow_rule(command)
+    if _allow is False:
+        logger.warning("User allowlist blocked command (not whitelisted): %s",
+                       command[:200])
+        return _user_allow_block_result()
+    if _allow is True:
+        return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
