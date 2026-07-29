@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -802,7 +803,7 @@ class TestWeComZombieSessionFix:
         }
 
         await adapter._on_message(payload)
-        assert adapter._last_chat_req_ids["group-1"] == ["req-abc"]
+        assert adapter._last_chat_req_ids["group-1"][-1][0] == "req-abc"
 
     @pytest.mark.asyncio
     async def test_on_message_does_not_cache_blocked_sender_req_id(self):
@@ -844,7 +845,7 @@ class TestWeComZombieSessionFix:
         assert len(adapter._last_chat_req_ids) <= DEDUP_MAX_SIZE
         # The most recently remembered chat must still be present.
         latest = f"chat-{DEDUP_MAX_SIZE + 49}"
-        assert adapter._last_chat_req_ids[latest] == [f"req-{DEDUP_MAX_SIZE + 49}"]
+        assert adapter._last_chat_req_ids[latest][-1][0] == f"req-{DEDUP_MAX_SIZE + 49}"
 
     def test_remember_chat_req_id_ignores_empty_values(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
@@ -863,7 +864,7 @@ class TestWeComZombieSessionFix:
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._last_chat_req_ids["group-1"] = ["inbound-req-42"]
+        adapter._remember_chat_req_id("group-1", "inbound-req-42")
         adapter._send_reply_request = AsyncMock(
             return_value={"headers": {"req_id": "inbound-req-42"}, "errcode": 0}
         )
@@ -899,6 +900,132 @@ class TestWeComZombieSessionFix:
         cmd = adapter._send_request.await_args.args[0]
         assert cmd == APP_CMD_SEND
 
+
+class TestReplyReqIdExpiry:
+    """Tests for TTL-based reply req_id caching and 846604 fallback.
+
+    WeCom callback req_ids expire server-side ~60s after the inbound message.
+    Using an expired one returns errcode 846604 ("websocket request expired").
+    The adapter must (a) skip stale cache entries via TTL, and (b) fall back
+    from aibot_respond_msg to aibot_send_msg when 846604 does slip through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_skips_expired_cached_req_id_and_uses_proactive(self):
+        """A cached req_id older than REPLY_REQ_ID_TTL_SECONDS must not be
+        used — falls through to aibot_send_msg instead of a doomed reply."""
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        # Inject a stale entry (2 minutes ago — well past the 50s TTL).
+        adapter._last_chat_req_ids["chat-1"] = [
+            ("req-old", time.monotonic() - 120),
+        ]
+        adapter._send_reply_request = AsyncMock()
+        adapter._send_request = AsyncMock(
+            return_value={"headers": {"req_id": "new"}, "errcode": 0}
+        )
+
+        result = await adapter.send("chat-1", "hello")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_not_awaited()
+        adapter._send_request.assert_awaited_once()
+        assert adapter._send_request.await_args.args[0] == APP_CMD_SEND
+
+    @pytest.mark.asyncio
+    async def test_send_uses_fresh_cached_req_id_for_reply(self):
+        """A cached req_id within TTL should use aibot_respond_msg."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._remember_chat_req_id("chat-1", "req-fresh")
+        adapter._send_reply_request = AsyncMock(return_value={"errcode": 0})
+        adapter._send_request = AsyncMock()
+
+        result = await adapter.send("chat-1", "hello")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        adapter._send_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_proactive_on_846604(self):
+        """When reply returns 846604 (expired), retry the same content via
+        aibot_send_msg so the message is still delivered."""
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._remember_chat_req_id("chat-1", "req-stale")
+
+        reply_response = {
+            "errcode": 846604,
+            "errmsg": "websocket request expired, response is invalid",
+        }
+        proactive_response = {"errcode": 0, "headers": {"req_id": "new"}}
+        adapter._send_reply_request = AsyncMock(return_value=reply_response)
+        adapter._send_request = AsyncMock(return_value=proactive_response)
+
+        result = await adapter.send("chat-1", "hello")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        adapter._send_request.assert_awaited_once()
+        assert adapter._send_request.await_args.args[0] == APP_CMD_SEND
+        # The stale req_id must be evicted so the next send doesn't retry it.
+        remaining = [rid for rid, _ in adapter._last_chat_req_ids.get("chat-1", [])]
+        assert "req-stale" not in remaining
+
+    @pytest.mark.asyncio
+    async def test_send_846604_then_proactive_also_fails_returns_error(self):
+        """If the proactive fallback ALSO fails, the error surfaces."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._remember_chat_req_id("chat-1", "req-stale")
+        adapter._send_reply_request = AsyncMock(
+            return_value={"errcode": 846604, "errmsg": "expired"}
+        )
+        adapter._send_request = AsyncMock(
+            return_value={"errcode": 600039, "errmsg": "cannot send to group"}
+        )
+
+        result = await adapter.send("chat-1", "hello")
+
+        assert result.success is False
+        assert "600039" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_cleanup_ws_clears_req_id_caches(self):
+        """Subscription death invalidates all cached reply req_ids — they
+        belonged to the dead subscription and would trigger 846604."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._remember_chat_req_id("chat-1", "req-1")
+        adapter._remember_reply_req_id("msg-1", "req-1")
+        assert adapter._last_chat_req_ids
+        assert adapter._reply_req_ids
+
+        await adapter._cleanup_ws()
+
+        assert not adapter._last_chat_req_ids
+        assert not adapter._reply_req_ids
+
+    def test_cached_reply_req_id_filters_by_ttl(self):
+        """_cached_reply_req_id returns None when all entries are stale."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_chat_req_ids["chat-1"] = [
+            ("req-old", time.monotonic() - 200),
+            ("req-stale", time.monotonic() - 100),
+        ]
+        assert adapter._cached_reply_req_id("chat-1") is None
+
+        # Fresh entry should be returned.
+        adapter._remember_chat_req_id("chat-1", "req-fresh")
+        assert adapter._cached_reply_req_id("chat-1") == "req-fresh"
 
 
 class TestTextBatchFlushRace:

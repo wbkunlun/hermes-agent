@@ -107,6 +107,14 @@ STREAM_EXPIRED_ERRCODE = 846608
 SEND_RETRY_BUDGET_SECONDS = 8.0
 SEND_MAX_RETRIES = 2
 
+# Inbound reply req_ids (for aibot_respond_msg) expire server-side ~60s after
+# the user message arrives. Using an expired one returns errcode 846604
+# ("websocket request expired, response is invalid"). Lookups skip cache
+# entries older than this so cron/proactive sends fall through to
+# aibot_send_msg instead of firing a doomed aibot_respond_msg.
+REPLY_REQ_ID_TTL_SECONDS = 50.0
+REQUEST_EXPIRED_ERRCODE = 846604
+
 DEDUP_MAX_SIZE = 1000
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -232,7 +240,7 @@ class WeComAdapter(BasePlatformAdapter):
             os.getenv("WECOM_DEVICE_ID")
             or uuid.uuid4().hex
         )
-        self._last_chat_req_ids: Dict[str, List[str]] = {}
+        self._last_chat_req_ids: Dict[str, List[Tuple[str, float]]] = {}
         # Set while a subscribed websocket is live; cleared on death/cleanup so
         # retrying senders block until _listen_loop brings the socket back.
         self._ws_live: asyncio.Event = asyncio.Event()
@@ -326,6 +334,11 @@ class WeComAdapter(BasePlatformAdapter):
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
         self._ws_live.clear()
+        # Subscription is gone → all cached reply req_ids are now invalid.
+        # Clearing here prevents post-reconnect sends from using stale ids
+        # that belonged to the dead subscription (would trigger 846604).
+        self._reply_req_ids.clear()
+        self._last_chat_req_ids.clear()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = None
@@ -386,7 +399,23 @@ class WeComAdapter(BasePlatformAdapter):
             # Subscribe ack received — the socket is live for sends.
             self._ws_live.set()
         except BaseException:
+            # Close the session/ws we just opened so a failed handshake
+            # doesn't leak an aiohttp ClientSession (seen as "Unclosed
+            # client session" warnings during network outages with
+            # repeated reconnect attempts). try/except guards against
+            # CancelledError during the close itself; aiohttp close() is
+            # idempotent so calling on an already-closed object is safe.
+            if self._ws:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
             self._ws = None
+            if self._session:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
             self._session = None
             self._ws_live.clear()
             raise
@@ -1240,17 +1269,49 @@ class WeComAdapter(BasePlatformAdapter):
         prior req_id. Keeping a small window prevents a burst of messages
         during AI inference from overwriting the req_id that the in-flight
         response needs.
+
+        Each entry is stored as ``(req_id, monotonic_timestamp)`` so that
+        ``_cached_reply_req_id`` can skip entries older than
+        ``REPLY_REQ_ID_TTL_SECONDS`` — WeCom callback req_ids expire
+        server-side ~60s after the inbound message.
         """
         normalized_chat_id = str(chat_id or "").strip()
         normalized_req_id = str(req_id or "").strip()
         if not normalized_chat_id or not normalized_req_id:
             return
         ids = self._last_chat_req_ids.setdefault(normalized_chat_id, [])
-        ids.append(normalized_req_id)
+        ids.append((normalized_req_id, time.monotonic()))
         if len(ids) > 3:
             ids[:] = ids[-3:]
         while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
             self._last_chat_req_ids.pop(next(iter(self._last_chat_req_ids)))
+
+    def _cached_reply_req_id(self, chat_id: str) -> Optional[str]:
+        """Return the most recent non-expired cached req_id for a chat.
+
+        Returns ``None`` when the chat has no cached entries or all of them
+        are older than ``REPLY_REQ_ID_TTL_SECONDS``, so the caller falls
+        through to ``aibot_send_msg`` instead of using a stale
+        ``aibot_respond_msg`` target that would trigger errcode 846604.
+        """
+        ids = self._last_chat_req_ids.get(str(chat_id or ""))
+        if not ids:
+            return None
+        now = time.monotonic()
+        for rid, ts in reversed(ids):  # most recent first
+            if now - ts < REPLY_REQ_ID_TTL_SECONDS:
+                return rid
+        return None
+
+    def _evict_cached_reply_req_id(self, chat_id: str, req_id: str) -> None:
+        """Remove a specific req_id from the chat's cache (e.g. after 846604)."""
+        key = str(chat_id or "")
+        ids = self._last_chat_req_ids.get(key)
+        if not ids:
+            return
+        ids[:] = [(rid, ts) for rid, ts in ids if rid != req_id]
+        if not ids:
+            self._last_chat_req_ids.pop(key, None)
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -1264,15 +1325,13 @@ class WeComAdapter(BasePlatformAdapter):
         """Resolve the inbound ``req_id`` to correlate a stream/reply frame.
 
         Tries the per-message cache first, then falls back to the most recent
-        inbound ``req_id`` for the chat (mirrors the lookup in :meth:`send`).
+        non-expired inbound ``req_id`` for the chat (mirrors the lookup in
+        :meth:`send`).
         """
         rid = self._reply_req_id_for_message(message_id)
         if rid:
             return rid
-        ids = self._last_chat_req_ids.get(str(chat_id or "")) if chat_id else None
-        if ids:
-            return ids[-1]
-        return None
+        return self._cached_reply_req_id(chat_id) if chat_id else None
 
     # ------------------------------------------------------------------
     # Outbound messaging
@@ -1664,10 +1723,8 @@ class WeComAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=prepared["reject_reason"])
 
         reply_req_id = self._reply_req_id_for_message(reply_to)
-        if not reply_req_id and chat_id in self._last_chat_req_ids:
-            ids = self._last_chat_req_ids[chat_id]
-            if ids:
-                reply_req_id = ids[-1]
+        if not reply_req_id:
+            reply_req_id = self._cached_reply_req_id(chat_id)
 
         try:
             upload_result = await self._upload_media_bytes(
@@ -1745,10 +1802,8 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
 
-            if not reply_req_id and chat_id in self._last_chat_req_ids:
-                ids = self._last_chat_req_ids[chat_id]
-                if ids:
-                    reply_req_id = ids[-1]
+            if not reply_req_id:
+                reply_req_id = self._cached_reply_req_id(chat_id)
 
             # Detect streaming first-frame request from the stream consumer.
             # The consumer sets expect_edits=True in metadata when it will call
@@ -1796,7 +1851,34 @@ class WeComAdapter(BasePlatformAdapter):
                 )
 
             if reply_req_id:
-                response = await self._send_reply_markdown(reply_req_id, content)
+                # Send via aibot_respond_msg (reply mode). If the cached
+                # req_id has expired server-side (errcode 846604), evict it
+                # and fall back to aibot_send_msg (proactive) so the message
+                # is still delivered instead of being silently dropped.
+                response = await self._send_reply_request(
+                    reply_req_id,
+                    {
+                        "msgtype": "markdown",
+                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                    },
+                )
+                if response.get("errcode") == REQUEST_EXPIRED_ERRCODE:
+                    logger.info(
+                        "[%s] Reply req_id expired (846604) for chat %s, "
+                        "falling back to aibot_send_msg",
+                        self.name, chat_id,
+                    )
+                    self._evict_cached_reply_req_id(chat_id, reply_req_id)
+                    response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "markdown",
+                            "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                        },
+                    )
+                elif response.get("errcode") not in {0, None}:
+                    self._raise_for_wecom_error(response, "send reply markdown")
             else:
                 response = await self._send_request(
                     APP_CMD_SEND,
@@ -2190,20 +2272,35 @@ async def _standalone_send(
         _adapters = getattr(_runner, "adapters", None) or {}
         _live = _adapters.get(Platform.WECOM) if hasattr(_adapters, "get") else None
         if _live is not None:
+            _live_error: Optional[str] = None
             try:
                 _result = await _live.send(chat_id, message)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                return {"error": f"WeCom send failed: {e}"}
-            if getattr(_result, "success", False):
-                return {
-                    "success": True,
-                    "platform": "wecom",
-                    "chat_id": chat_id,
-                    "message_id": getattr(_result, "message_id", None),
-                }
-            return {"error": f"WeCom send failed: {getattr(_result, 'error', None)}"}
+                _live_error = f"WeCom send failed: {e}"
+            else:
+                if getattr(_result, "success", False):
+                    return {
+                        "success": True,
+                        "platform": "wecom",
+                        "chat_id": chat_id,
+                        "message_id": getattr(_result, "message_id", None),
+                    }
+                _live_error = f"WeCom send failed: {getattr(_result, 'error', None)}"
+            # If the live adapter failed because we're on a different event
+            # loop (the cron scheduler's asyncio.run fallback creates a new
+            # loop, but the adapter's websocket futures are bound to the
+            # gateway loop), fall through to the ephemeral connect below.
+            # For genuine send errors (expired req_id, group policy, etc.)
+            # the ephemeral path won't help — return the error as before.
+            if _live_error and "different loop" not in _live_error.lower():
+                return {"error": _live_error}
+            logger.debug(
+                "[%s] standalone_send: live adapter unavailable (%s), "
+                "trying ephemeral connect",
+                "wecom", _live_error,
+            )
 
     if not check_wecom_requirements():
         return {"error": "WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET."}
