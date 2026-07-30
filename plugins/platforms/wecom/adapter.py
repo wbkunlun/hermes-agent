@@ -334,11 +334,14 @@ class WeComAdapter(BasePlatformAdapter):
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
         self._ws_live.clear()
-        # Subscription is gone → all cached reply req_ids are now invalid.
-        # Clearing here prevents post-reconnect sends from using stale ids
-        # that belonged to the dead subscription (would trigger 846604).
-        self._reply_req_ids.clear()
-        self._last_chat_req_ids.clear()
+        # NOTE: do NOT clear _reply_req_ids / _last_chat_req_ids here.
+        # WeCom groups can ONLY receive via aibot_respond_msg (reply), not
+        # aibot_send_msg (proactive). Clearing the cache on every ws teardown
+        # (heartbeat timeout, 846609, etc.) would destroy fresh req_ids that
+        # are still within the 50s TTL — making group replies impossible
+        # after any reconnect. The TTL in _cached_reply_req_id + the 846604
+        # fallback in send() handle stale entries correctly without needing
+        # a blanket clear.
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = None

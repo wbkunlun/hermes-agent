@@ -996,9 +996,13 @@ class TestReplyReqIdExpiry:
         assert "600039" in (result.error or "")
 
     @pytest.mark.asyncio
-    async def test_cleanup_ws_clears_req_id_caches(self):
-        """Subscription death invalidates all cached reply req_ids — they
-        belonged to the dead subscription and would trigger 846604."""
+    async def test_cleanup_ws_preserves_req_id_caches(self):
+        """_cleanup_ws must NOT clear req_id caches — WeCom groups can only
+        receive via aibot_respond_msg (reply), and clearing on every ws
+        teardown (heartbeat timeout, 846609) would destroy fresh req_ids
+        that are still within TTL, making group replies impossible after
+        any reconnect. The TTL in _cached_reply_req_id + the 846604
+        fallback handle staleness without a blanket clear."""
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
@@ -1009,8 +1013,9 @@ class TestReplyReqIdExpiry:
 
         await adapter._cleanup_ws()
 
-        assert not adapter._last_chat_req_ids
-        assert not adapter._reply_req_ids
+        # Caches must survive — the req_ids are still within TTL.
+        assert adapter._last_chat_req_ids
+        assert adapter._reply_req_ids
 
     def test_cached_reply_req_id_filters_by_ttl(self):
         """_cached_reply_req_id returns None when all entries are stale."""
