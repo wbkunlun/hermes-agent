@@ -2302,19 +2302,55 @@ async def _standalone_send(
                         "message_id": getattr(_result, "message_id", None),
                     }
                 _live_error = f"WeCom send failed: {getattr(_result, 'error', None)}"
-            # If the live adapter failed because we're on a different event
-            # loop (the cron scheduler's asyncio.run fallback creates a new
-            # loop, but the adapter's websocket futures are bound to the
-            # gateway loop), fall through to the ephemeral connect below.
-            # For genuine send errors (expired req_id, group policy, etc.)
-            # the ephemeral path won't help — return the error as before.
+            # Genuine send errors (expired req_id, group policy, etc.) return
+            # immediately — an ephemeral path won't help.
             if _live_error and "different loop" not in _live_error.lower():
                 return {"error": _live_error}
-            logger.debug(
-                "[%s] standalone_send: live adapter unavailable (%s), "
-                "trying ephemeral connect",
-                "wecom", _live_error,
-            )
+            # Cross-loop: the live adapter failed because we're on a different
+            # event loop (cron's asyncio.run fallback creates a new loop, but
+            # the adapter's websocket futures are bound to the gateway loop).
+            # Schedule the send back onto the gateway loop via
+            # safe_schedule_threadsafe instead of opening an ephemeral WS —
+            # an ephemeral connection would displace the gateway's sole
+            # subscription (errcode 846609), disrupting all live traffic.
+            if _live_error:
+                _gateway_loop = getattr(_runner, "_gateway_loop", None)
+                if _gateway_loop is not None and not _gateway_loop.is_closed():
+                    try:
+                        from agent.async_utils import safe_schedule_threadsafe
+                        _future = safe_schedule_threadsafe(
+                            _live.send(chat_id, message),
+                            _gateway_loop,
+                        )
+                    except Exception as _sched_err:
+                        logger.debug(
+                            "[%s] standalone_send: cross-loop schedule failed (%s)",
+                            "wecom", _sched_err,
+                        )
+                        return {"error": _live_error}
+                    if _future is not None:
+                        try:
+                            _cross_result = _future.result(timeout=30)
+                        except Exception as _cross_err:
+                            logger.debug(
+                                "[%s] standalone_send: cross-loop send failed (%s)",
+                                "wecom", _cross_err,
+                            )
+                            return {"error": f"WeCom cross-loop send failed: {_cross_err}"}
+                        if getattr(_cross_result, "success", False):
+                            return {
+                                "success": True,
+                                "platform": "wecom",
+                                "chat_id": chat_id,
+                                "message_id": getattr(_cross_result, "message_id", None),
+                            }
+                        return {
+                            "error": f"WeCom send failed: {getattr(_cross_result, 'error', None)}",
+                        }
+                # No reachable gateway loop: do NOT open an ephemeral WS here —
+                # it would displace the live subscription (846609). Return the
+                # original error; the caller may retry.
+                return {"error": _live_error}
 
     if not check_wecom_requirements():
         return {"error": "WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET."}

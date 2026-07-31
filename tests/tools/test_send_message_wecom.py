@@ -11,6 +11,7 @@ via sys.modules (the real module pulls in the full agent stack).
 
 import asyncio
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -133,3 +134,102 @@ class TestWecomStandaloneSend:
         ephemeral.connect.assert_awaited_once()
         ephemeral.send.assert_awaited_once()
         ephemeral.disconnect.assert_awaited_once()
+
+    def test_cross_loop_falls_back_to_gateway_loop_schedule_not_ephemeral(self):
+        """A live adapter whose send fails with a "different event loop" error
+        (cron's asyncio.run fallback creates a new loop, but the adapter's
+        websocket futures are bound to the gateway loop) must be re-scheduled
+        onto the gateway loop — NOT re-sent via an ephemeral WS, which would
+        displace the main subscription (errcode 846609)."""
+        # Gateway loop runs in a background thread (as the real gateway does);
+        # asyncio.run_coroutine_threadsafe requires a running loop.
+        gateway_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=gateway_loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            send_calls = []
+
+            async def _send(*args, **kwargs):
+                send_calls.append(len(send_calls))
+                if len(send_calls) == 1:
+                    raise RuntimeError("Future attached to a different loop")
+                return SimpleNamespace(success=True, message_id="cross-m1")
+
+            live_adapter = SimpleNamespace(send=_send)
+            runner = SimpleNamespace(
+                adapters={Platform.WECOM: live_adapter},
+                _gateway_loop=gateway_loop,
+            )
+            fake_run = ModuleType("gateway.run")
+            fake_run._gateway_runner_ref = lambda: runner
+
+            ephemeral = SimpleNamespace(
+                connect=AsyncMock(return_value=True),
+                send=AsyncMock(),
+                disconnect=AsyncMock(),
+            )
+
+            with patch.dict(sys.modules, {"gateway.run": fake_run}), \
+                 patch(
+                     "plugins.platforms.wecom.adapter.check_wecom_requirements",
+                     return_value=True,
+                 ), \
+                 patch(
+                     "plugins.platforms.wecom.adapter.WeComAdapter",
+                     return_value=ephemeral,
+                 ):
+                result = asyncio.run(
+                    _standalone_send(SimpleNamespace(extra={}), "brycehuang", "hello")
+                )
+
+            assert result["success"] is True
+            assert result["message_id"] == "cross-m1"
+            assert len(send_calls) == 2, "must retry on the gateway loop"
+            # CRITICAL: no ephemeral WS was opened (would displace subscription).
+            ephemeral.connect.assert_not_awaited()
+            ephemeral.send.assert_not_awaited()
+            ephemeral.disconnect.assert_not_awaited()
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            thread.join(timeout=5)
+            gateway_loop.close()
+
+    def test_cross_loop_without_gateway_loop_returns_error_not_ephemeral(self):
+        """If the live adapter fails cross-loop but the runner exposes no
+        reachable _gateway_loop, the send must return an error rather than
+        open an ephemeral WS — an ephemeral connection would displace the
+        gateway's sole subscription (errcode 846609)."""
+        async def _send(*args, **kwargs):
+            raise RuntimeError("Future attached to a different loop")
+
+        live_adapter = SimpleNamespace(send=_send)
+        runner = SimpleNamespace(
+            adapters={Platform.WECOM: live_adapter},
+            _gateway_loop=None,
+        )
+        fake_run = ModuleType("gateway.run")
+        fake_run._gateway_runner_ref = lambda: runner
+
+        ephemeral = SimpleNamespace(
+            connect=AsyncMock(return_value=True),
+            send=AsyncMock(),
+            disconnect=AsyncMock(),
+        )
+
+        with patch.dict(sys.modules, {"gateway.run": fake_run}), \
+             patch(
+                 "plugins.platforms.wecom.adapter.check_wecom_requirements",
+                 return_value=True,
+             ), \
+             patch(
+                 "plugins.platforms.wecom.adapter.WeComAdapter",
+                 return_value=ephemeral,
+             ):
+            result = asyncio.run(
+                _standalone_send(SimpleNamespace(extra={}), "brycehuang", "hello")
+            )
+
+        assert result.get("success") is not True
+        ephemeral.connect.assert_not_awaited()
+        ephemeral.send.assert_not_awaited()
+        ephemeral.disconnect.assert_not_awaited()
