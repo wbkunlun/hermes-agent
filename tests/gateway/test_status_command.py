@@ -246,9 +246,13 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
     result = await runner._handle_message(_make_event("hello"))
 
     assert result == "ok"
+    # Upstream v0.20.1 added touch_activity to update_session (internal/system
+    # turns don't advance the user-activity clock). A normal user message is
+    # not internal, so touch_activity=True.
     runner.session_store.update_session.assert_called_once_with(
         session_entry.session_key,
         last_prompt_tokens=80,
+        touch_activity=True,
     )
 
 
