@@ -942,7 +942,7 @@ class WeComAdapter(BasePlatformAdapter):
                 or os.getenv("WECOM_GROUP_SESSIONS_PER_USER", "false")
             ).strip().lower() in {"true", "1", "yes", "on"},
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
