@@ -361,3 +361,61 @@ class TestPlainHttpWarning:
             )
         assert plugin._HTTP_WARNED is True
         assert any("http://" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# execute_code risk-classification regex (spawn-family FN / dot-exec FP)
+# ---------------------------------------------------------------------------
+
+class TestCodeRiskClassification:
+    def test_os_exec_family_is_high(self, plugin):
+        for code in (
+            "os.execv('/bin/sh', ['sh'])",
+            "os.execve('/bin/sh', ['sh'], {})",
+            "os.spawnl(os.P_WAIT, '/bin/sh', 'sh')",
+            "os.posix_spawn('/bin/sh', ['sh'], os.environ)",
+            "pty.fork()",
+            "from multiprocessing import Process\nProcess(target=print).start()",
+        ):
+            plugin._on_post_tool_call(
+                tool_name="execute_code", args={"code": code},
+                result=json.dumps({"status": "success", "output": "", "exit_code": 0}),
+                status="ok",
+            )
+            body = plugin._QUEUE.get_nowait()
+            assert body["risk_level"] == "high", code
+            assert body["payload"]["spawned_process_hint"] is True, code
+
+    def test_dot_prefixed_exec_stays_medium(self, plugin):
+        """QT-style qt_app.exec() is an event loop, not dynamic exec."""
+        plugin._on_post_tool_call(
+            tool_name="execute_code", args={"code": "qt_app.exec()"},
+            result=json.dumps({"status": "success", "output": "", "exit_code": 0}),
+            status="ok",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["risk_level"] == "medium"
+
+    def test_second_http_call_does_not_rewarn(self, plugin, caplog):
+        plugin._HTTP_WARNED = False
+        with caplog.at_level("WARNING", logger="audit_callback_under_test"):
+            plugin._on_post_tool_call(
+                tool_name="skill_manage", args={"action": "install", "name": "x"},
+                result="{}", status="ok")
+            plugin._on_post_tool_call(
+                tool_name="skill_manage", args={"action": "install", "name": "y"},
+                result="{}", status="ok")
+        warn_count = sum(
+            1 for r in caplog.records if "http://" in r.message)
+        assert warn_count == 1
+
+    def test_https_url_never_warns(self, plugin, monkeypatch, caplog):
+        monkeypatch.setenv("HERMES_AUDIT_CALLBACK_URL",
+                           "https://audit/api/v1/agent/audit")
+        plugin._HTTP_WARNED = False
+        with caplog.at_level("WARNING", logger="audit_callback_under_test"):
+            plugin._on_post_tool_call(
+                tool_name="skill_manage", args={"action": "install", "name": "x"},
+                result="{}", status="ok")
+        assert plugin._HTTP_WARNED is False
+        assert not any("http://" in r.message for r in caplog.records)

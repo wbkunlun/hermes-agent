@@ -81,8 +81,9 @@ _RISK_LEVEL = {
 # Process-spawn / dynamic-exec indicators for execute_code risk classification.
 _CODE_RISKY_RE = re.compile(
     r"subprocess|os\.system|os\.popen|\bpopen\s*\(|shell\s*=\s*True"
-    r"|\beval\s*\(|\bexec\s*\(|\b__import__\s*\(|ctypes|pty\.spawn"
-    r"|commands\.getoutput",
+    r"|(?<!\.)\beval\s*\(|(?<!\.)\bexec\s*\(|\b__import__\s*\("
+    r"|os\.exec\w*|os\.spawn\w*|posix_spawn|pty\.spawn|pty\.fork"
+    r"|multiprocessing|ctypes|commands\.getoutput",
     re.IGNORECASE,
 )
 
