@@ -231,6 +231,31 @@ class TestCompoundCommandScope:
         monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "diff")
         assert mod._match_user_allow_rule("diff <(ls) <(ls)") is False
 
+    def test_redirect_fd_dup_not_split(self, monkeypatch):
+        """`2>&1` is a redirection, not a command separator — the allowlist
+        must not demand a program literally named `1`."""
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "ls")
+        assert mod._match_user_allow_rule("ls 2>&1") is True
+
+    def test_redirect_append_with_fd_dup_not_split(self, monkeypatch):
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "grep")
+        assert mod._match_user_allow_rule("grep foo bar >> log 2>&1") is True
+
+    def test_redirect_all_not_split(self, monkeypatch):
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "ls")
+        assert mod._match_user_allow_rule("ls &> /tmp/out") is True
+
+    def test_redirect_stdin_fd_not_split(self, monkeypatch):
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "ls")
+        assert mod._match_user_allow_rule("ls <&0") is True
+
+    def test_background_amp_still_requires_both(self, monkeypatch):
+        """A real `cmd & cmd2` background separator still splits."""
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "sleep,echo")
+        assert mod._match_user_allow_rule("sleep 1 & echo done") is True
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "sleep")
+        assert mod._match_user_allow_rule("sleep 1 & echo done") is False
+
 
 class TestCompoundCommandGuardsIntegration:
     def test_chained_exploit_blocked_in_pipeline(self, clean_env, monkeypatch):

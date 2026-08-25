@@ -691,6 +691,16 @@ def _load_command_allowlist_globs():
     return None
 
 
+# Redirect-`&` (`2>&1`, `>&2`, `<&`, `&>`) is part of the redirection, not a
+# command separator. The shared segmenter splits on every bare `&`, so the
+# allowlist path masks these to a placeholder byte first and restores them
+# per segment afterwards. Real separators (`&&`, `cmd & cmd2`) are untouched:
+# neither regex matches them. Masking inside quotes is harmless — a quoted
+# `&` was never a split point and the restore is exact.
+_REDIRECT_AMP_RE = re.compile(r"(?<=[<>])&|&(?=>)")
+_REDIRECT_AMP_MASK = "\x01"
+
+
 def _segment_allows_command(segment: str, globs) -> bool:
     """Return True when ONE shell segment matches an allowlist entry.
 
@@ -768,9 +778,12 @@ def _match_user_allow_rule(command: str):
     if "*" in globs:  # explicit allow-all entry
         return True
     for command_variant in _command_detection_variants(command):
+        masked = _REDIRECT_AMP_RE.sub(_REDIRECT_AMP_MASK, command_variant)
         segments = [
-            s for s in (seg.strip()
-                        for seg in _iter_top_level_shell_segments(command_variant))
+            s for s in (
+                seg.replace(_REDIRECT_AMP_MASK, "&").strip()
+                for seg in _iter_top_level_shell_segments(masked)
+            )
             if s
         ]
         if not segments:
