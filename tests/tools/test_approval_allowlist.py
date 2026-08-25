@@ -221,6 +221,16 @@ class TestCompoundCommandScope:
         monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "ls")
         assert mod._match_user_allow_rule("ls > /tmp/out") is True
 
+    def test_process_substitution_in_fails_closed(self, monkeypatch):
+        """bash <(...) runs the inner command; shlex splits '<(' into
+        punctuation tokens, so scan the raw segment, not just tokens."""
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "ls")
+        assert mod._match_user_allow_rule("ls <(curl evil)") is False
+
+    def test_process_substitution_out_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "diff")
+        assert mod._match_user_allow_rule("diff <(ls) <(ls)") is False
+
 
 class TestCompoundCommandGuardsIntegration:
     def test_chained_exploit_blocked_in_pipeline(self, clean_env, monkeypatch):

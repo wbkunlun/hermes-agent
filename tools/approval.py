@@ -705,7 +705,10 @@ def _segment_allows_command(segment: str, globs) -> bool:
     tokens = _shell_segment_tokens(segment, 0)
     if not tokens:
         return False
-    if any("$(" in tok or "`" in tok for tok in tokens):
+    # Command/process substitution fail closed. Checked on the RAW segment:
+    # bash process substitution `<(` / `>(` splits into separate shlex
+    # punctuation tokens, so a token-level scan would miss it.
+    if "$(" in segment or "`" in segment or "<(" in segment or ">(" in segment:
         return False
     candidate = " ".join(tokens).lower().strip()
     if not candidate:
