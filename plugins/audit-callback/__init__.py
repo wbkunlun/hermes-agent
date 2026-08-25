@@ -36,6 +36,10 @@ Reportable events
 * ``terminal`` commands classified as ``hardline`` (→ ``risk_level=critical``)
   or ``dangerous`` (→ ``high``) by the SAME detectors the command guard uses.
 * ``skill_manage`` calls (install / update / delete) → ``risk_level=medium``.
+* ``execute_code`` calls (arbitrary local Python — can spawn subprocesses
+  that bypass the terminal guard) → ``high`` when the code matches process-
+  spawn / dynamic-exec indicators, else ``medium``.
+* ``computer_use`` calls (desktop control) → ``medium``.
 * Optionally EVERY ``terminal`` command at ``info`` when
   ``HERMES_AUDIT_REPORT_ALL_COMMANDS=1``.
 
@@ -51,6 +55,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -72,6 +77,16 @@ _RISK_LEVEL = {
     "skill": "medium",
     "info": "info",
 }
+
+# Process-spawn / dynamic-exec indicators for execute_code risk classification.
+_CODE_RISKY_RE = re.compile(
+    r"subprocess|os\.system|os\.popen|\bpopen\s*\(|shell\s*=\s*True"
+    r"|\beval\s*\(|\bexec\s*\(|\b__import__\s*\(|ctypes|pty\.spawn"
+    r"|commands\.getoutput",
+    re.IGNORECASE,
+)
+
+_HTTP_WARNED = False  # plain-http intake URL warned once per process
 
 
 def _intake_url() -> str:
@@ -236,16 +251,20 @@ def _classify_terminal(command: str) -> Tuple[str, str, list]:
     return ("info", "", [])
 
 
-def _parse_terminal_result(result: Any) -> Tuple[Optional[int], str, str, str]:
-    """Best-effort (exit_code, stdout, stderr, cwd) from a terminal tool result."""
+def _parse_terminal_result(result: Any) -> Tuple[Optional[int], str, str, str, bool]:
+    """Best-effort (exit_code, stdout, stderr, cwd, blocked) from a tool result.
+
+    ``blocked`` is the machine-readable refusal flag: the terminal tool
+    returns ``{"status": "blocked", ...}`` when a guard refuses the call.
+    """
     if not isinstance(result, str):
-        return (None, "", "", "")
+        return (None, "", "", "", False)
     try:
         data = json.loads(result)
     except Exception:
-        return (None, "", "", "")
+        return (None, "", "", "", False)
     if not isinstance(data, dict):
-        return (None, "", "", "")
+        return (None, "", "", "", False)
     exit_code = data.get("exit_code", data.get("returncode"))
     if exit_code is not None:
         try:
@@ -255,7 +274,8 @@ def _parse_terminal_result(result: Any) -> Tuple[Optional[int], str, str, str]:
     stdout = str(data.get("output", data.get("stdout", "")) or "")
     stderr = str(data.get("error", data.get("stderr", "")) or "")
     cwd = str(data.get("cwd", "") or "")
-    return (exit_code, stdout, stderr, cwd)
+    blocked = data.get("status") == "blocked"
+    return (exit_code, stdout, stderr, cwd, blocked)
 
 
 def _sha_and_preview(text: str, limit: int = 2048) -> Tuple[str, str]:
@@ -265,15 +285,18 @@ def _sha_and_preview(text: str, limit: int = 2048) -> Tuple[str, str]:
     return (hashlib.sha256(data).hexdigest(), text[:limit])
 
 
-def _decide(status: str, result_text: Any, exit_code: Optional[int]) -> Tuple[str, str]:
+def _decide(status: str, result_text: Any, exit_code: Optional[int],
+            blocked_flag: bool = False) -> Tuple[str, str]:
     """Infer (decision, result_enum) from post-hook signals.
 
     decision ∈ {"allowed", "blocked"}; result ∈ {"success", "error", "timeout"}.
-    Blocked = a guard/allowlist/plugin refused the call (status or result text).
+    Blocked = a guard/allowlist/plugin refused the call: prefer the machine-
+    readable ``status:"blocked"`` from the tool result, fall back to the
+    historical substring heuristic.
     """
     rt = result_text if isinstance(result_text, str) else ""
     rt_lower = rt.lower()
-    blocked = (status == "blocked") or ("blocked" in rt_lower)
+    blocked = blocked_flag or (status == "blocked") or ("blocked" in rt_lower)
     if "timeout" in rt_lower or status == "timeout":
         return ("blocked" if blocked else "allowed", "timeout")
     if blocked:
@@ -325,8 +348,8 @@ def _build_command_body(
     tool_call_id: str,
     trace_id: str,
 ) -> Dict[str, Any]:
-    exit_code, stdout, stderr, result_cwd = _parse_terminal_result(result)
-    decision, result_enum = _decide(status, result, exit_code)
+    exit_code, stdout, stderr, result_cwd, blocked = _parse_terminal_result(result)
+    decision, result_enum = _decide(status, result, exit_code, blocked)
     stdout_sha, stdout_preview = _sha_and_preview(stdout)
     stderr_sha, stderr_preview = _sha_and_preview(stderr)
     cwd = result_cwd or (str(args.get("workdir") or "") if isinstance(args, dict) else "")
@@ -371,8 +394,8 @@ def _build_skill_body(
     trace_id: str,
 ) -> Dict[str, Any]:
     summary = _summarize_skill_args(args)
-    exit_code, _stdout, _stderr, _cwd = _parse_terminal_result(result)
-    decision, result_enum = _decide(status, result, exit_code)
+    exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
+    decision, result_enum = _decide(status, result, exit_code, blocked)
     action = str(summary.get("action") or "")
     name = str(summary.get("name") or summary.get("skill_name") or summary.get("skill") or "")
     version = str(summary.get("version") or "")
@@ -403,6 +426,79 @@ def _build_skill_body(
     return body
 
 
+def _build_code_body(
+    code: str,
+    result: Any,
+    status: str,
+    duration_ms: int,
+    tool_call_id: str,
+    trace_id: str,
+) -> Dict[str, Any]:
+    """execute_code runs arbitrary local Python — subprocess/os.system never
+    pass through the terminal guard, so every call is reported (HIGH when the
+    code matches process-spawn / dynamic-exec indicators, else MEDIUM)."""
+    exit_code, stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
+    decision, result_enum = _decide(status, result, exit_code, blocked)
+    code_sha, code_preview = _sha_and_preview(code)
+    risky = _CODE_RISKY_RE.search(code) is not None
+
+    payload: Dict[str, Any] = {
+        "code_sha256": code_sha,
+        "code_preview": code_preview,
+        "spawned_process_hint": risky,
+        "caller_type": "agent",
+    }
+
+    body = _common_fields(tool_call_id, trace_id)
+    body.update({
+        "event_type": "command",
+        "action": "code.exec",
+        "risk_level": "high" if risky else "medium",
+        "risk_reason": (
+            "code spawns processes / dynamic exec" if risky
+            else "arbitrary python execution (can bypass terminal guard)"
+        ),
+        "decision": decision,
+        "result": result_enum,
+        "exit_code": exit_code,
+        "duration_ms": int(duration_ms or 0),
+        "payload": payload,
+    })
+    return body
+
+
+def _build_computer_use_body(
+    args: Any,
+    result: Any,
+    status: str,
+    duration_ms: int,
+    tool_call_id: str,
+    trace_id: str,
+) -> Dict[str, Any]:
+    exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
+    decision, result_enum = _decide(status, result, exit_code, blocked)
+    action = str(args.get("action") or "") if isinstance(args, dict) else ""
+
+    payload: Dict[str, Any] = {
+        "summary": action,
+        "caller_type": "agent",
+    }
+
+    body = _common_fields(tool_call_id, trace_id)
+    body.update({
+        "event_type": "command",
+        "action": "desktop.control",
+        "risk_level": "medium",
+        "risk_reason": "desktop control via cua-driver",
+        "decision": decision,
+        "result": result_enum,
+        "exit_code": exit_code,
+        "duration_ms": int(duration_ms or 0),
+        "payload": payload,
+    })
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Hook
 # ---------------------------------------------------------------------------
@@ -429,8 +525,16 @@ def _on_post_tool_call(
     propagate into the dispatch path.
     """
     try:
-        if not _intake_url():
+        url = _intake_url()
+        if not url:
             return None  # feature off — no-op, no worker
+        global _HTTP_WARNED
+        if not _HTTP_WARNED and url.lower().startswith("http://"):
+            _HTTP_WARNED = True
+            logger.warning(
+                "audit-callback: HERMES_AUDIT_CALLBACK_URL is plain http:// — "
+                "audit payloads and the auth header travel unencrypted"
+            )
 
         trace_id = api_request_id or turn_id or ""
         body: Optional[Dict[str, Any]] = None
@@ -445,6 +549,15 @@ def _on_post_tool_call(
                 )
         elif tool_name == "skill_manage":
             body = _build_skill_body(
+                args, result, status, duration_ms, tool_call_id, trace_id,
+            )
+        elif tool_name == "execute_code" and isinstance(args, dict):
+            body = _build_code_body(
+                str(args.get("code") or ""), result, status, duration_ms,
+                tool_call_id, trace_id,
+            )
+        elif tool_name == "computer_use":
+            body = _build_computer_use_body(
                 args, result, status, duration_ms, tool_call_id, trace_id,
             )
 

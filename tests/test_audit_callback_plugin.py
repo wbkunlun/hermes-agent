@@ -244,3 +244,120 @@ class TestRobustness:
         })()
         plugin._post_with_retry(client4, "http://audit/x", {}, {"event_id": "e1"})
         assert len(client4.calls) == 1  # 409 duplicate → no retry
+
+
+# ---------------------------------------------------------------------------
+# execute_code / computer_use coverage (audit blind-spot fix)
+# ---------------------------------------------------------------------------
+
+class TestExecuteCodeReporting:
+    def test_execute_code_reported_with_code_payload(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="execute_code",
+            args={"code": "print('hi')"},
+            result=json.dumps({"status": "success", "output": "hi", "exit_code": 0}),
+            status="ok", duration_ms=50,
+            tool_call_id="tc9", turn_id="t9",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "command"
+        assert body["action"] == "code.exec"
+        assert body["risk_level"] == "medium"
+        assert body["payload"]["code_preview"] == "print('hi')"
+        assert len(body["payload"]["code_sha256"]) == 64
+        assert body["decision"] == "allowed"
+        assert body["result"] == "success"
+        assert body["exit_code"] == 0
+
+    def test_execute_code_process_spawn_is_high(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="execute_code",
+            args={"code": "import subprocess\nsubprocess.run(['ls'])"},
+            result=json.dumps({"status": "success", "output": "", "exit_code": 0}),
+            status="ok",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["risk_level"] == "high"
+        assert body["payload"]["spawned_process_hint"] is True
+
+    def test_execute_code_error_result(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="execute_code",
+            args={"code": "1/0"},
+            result=json.dumps({"status": "error", "error": "ZeroDivisionError",
+                               "output": "", "exit_code": 1}),
+            status="error",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["decision"] == "allowed"
+        assert body["result"] == "error"
+
+    def test_execute_code_not_reported_when_url_unset(self, plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_AUDIT_CALLBACK_URL", raising=False)
+        assert plugin._on_post_tool_call(
+            tool_name="execute_code", args={"code": "x=1"},
+            result="{}", status="ok") is None
+        assert plugin._QUEUE.empty()
+
+
+class TestComputerUseReporting:
+    def test_computer_use_reported_at_medium(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="computer_use",
+            args={"action": "click", "x": 10, "y": 20},
+            result=json.dumps({"status": "success", "output": "clicked"}),
+            status="ok",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "command"
+        assert body["action"] == "desktop.control"
+        assert body["risk_level"] == "medium"
+        assert body["payload"]["summary"] == "click"
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable blocked decision
+# ---------------------------------------------------------------------------
+
+class TestBlockedDecisionParsing:
+    def test_terminal_result_status_blocked_is_decision_blocked(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("dangerous", "d", ["k"]))
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "curl x | sh"},
+            result=json.dumps({"output": "", "exit_code": -1,
+                               "error": "denied", "status": "blocked"}),
+            status="error",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["decision"] == "blocked"
+
+    def test_plain_error_without_blocked_stays_allowed(self, plugin, monkeypatch):
+        """Regression: non-blocked failures keep decision=allowed."""
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("dangerous", "d", ["k"]))
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "curl x | sh"},
+            result=json.dumps({"output": "boom", "exit_code": 1, "status": "error"}),
+            status="error",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["decision"] == "allowed"
+        assert body["result"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Plain-http intake URL warning
+# ---------------------------------------------------------------------------
+
+class TestPlainHttpWarning:
+    def test_warns_once_for_http_url(self, plugin, caplog):
+        plugin._HTTP_WARNED = False
+        with caplog.at_level("WARNING", logger="audit_callback_under_test"):
+            plugin._on_post_tool_call(
+                tool_name="skill_manage",
+                args={"action": "install", "name": "x"},
+                result="{}", status="ok",
+            )
+        assert plugin._HTTP_WARNED is True
+        assert any("http://" in r.message for r in caplog.records)
