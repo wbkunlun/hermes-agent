@@ -210,7 +210,11 @@ def _patch_http(monkeypatch):
     _FakeAsyncClient.requests = []
     monkeypatch.setattr(
         cpwl_mod, "httpx",
-        SimpleNamespace(AsyncClient=_FakeAsyncClient, HTTPError=httpx.HTTPError),
+        SimpleNamespace(
+            AsyncClient=_FakeAsyncClient,
+            HTTPError=httpx.HTTPError,
+            InvalidURL=httpx.InvalidURL,
+        ),
     )
 
 
@@ -311,6 +315,26 @@ class TestRefresh:
         _FakeAsyncClient.responses = [_FakeResponse(200, None)]
         assert asyncio.run(cp_enabled.refresh()) is False
 
+    def test_invalid_url_raises_never(self, cp_enabled, monkeypatch):
+        """httpx.InvalidURL (not an HTTPError subclass) must not escape —
+        refresh() promises to never raise."""
+        _patch_http(monkeypatch)
+
+        async def _boom(*args, **kwargs):
+            raise httpx.InvalidURL("bad url")
+
+        monkeypatch.setattr(_FakeAsyncClient, "get", staticmethod(_boom))
+        assert asyncio.run(cp_enabled.refresh()) is False
+
+    def test_unexpected_4xx_terminal_keep_cache(self, cp_enabled, monkeypatch):
+        """Non-auth 4xx (e.g. 404) is terminal: one request, cache kept."""
+        _patch_http(monkeypatch)
+        _install(cp_enabled, users=["zhangsan"])
+        _FakeAsyncClient.responses = [_FakeResponse(404, {"success": False})]
+        assert asyncio.run(cp_enabled.refresh()) is False
+        assert len(_FakeAsyncClient.requests) == 1
+        assert cp_enabled.snapshot.users == ("zhangsan",)
+
 
 class TestCommandGate:
     def test_no_snapshot_is_deny(self, cp_enabled):
@@ -366,3 +390,96 @@ class TestCommandGate:
         """A bare `*` entry is an explicit allow-all."""
         _install(cp_enabled, commands=["*"])
         assert cp_enabled.command_gate("anything at all") == "bypass"
+
+
+class TestPollLoop:
+    def test_boot_backoff_then_steady_30s(self, tmp_path):
+        """No-snapshot failures back off 1/5/15s; after first success the
+        cadence locks to 30s even if later polls fail (cache holds)."""
+        client = cpwl_mod.WhitelistClient(
+            url="https://x/api", auth="Bearer t", cache_path=tmp_path / "c.json",
+        )
+        calls = {"n": 0}
+
+        async def fake_refresh():
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return False
+            client._snapshot = WhitelistSnapshot((), (), None, 1.0)
+            return True
+
+        client.refresh = fake_refresh
+        delays = []
+
+        class _Stop(Exception):
+            pass
+
+        async def fake_sleep(d):
+            delays.append(d)
+            if len(delays) >= 6:
+                raise _Stop()
+
+        async def run():
+            try:
+                await cpwl_mod._poll_loop(client, sleep=fake_sleep)
+            except _Stop:
+                pass
+
+        asyncio.run(run())
+        assert delays == [1.0, 5.0, 15.0, 30.0, 30.0, 30.0]
+
+    def test_with_snapshot_failures_stay_30s(self, tmp_path):
+        """Once a snapshot exists, failures don't trigger boot backoff."""
+        client = cpwl_mod.WhitelistClient(
+            url="https://x/api", auth="Bearer t", cache_path=tmp_path / "c.json",
+        )
+        client._snapshot = WhitelistSnapshot(("ls*",), (), None, 1.0)
+
+        async def fake_refresh():
+            return False
+
+        client.refresh = fake_refresh
+        delays = []
+
+        class _Stop(Exception):
+            pass
+
+        async def fake_sleep(d):
+            delays.append(d)
+            if len(delays) >= 3:
+                raise _Stop()
+
+        async def run():
+            try:
+                await cpwl_mod._poll_loop(client, sleep=fake_sleep)
+            except _Stop:
+                pass
+
+        asyncio.run(run())
+        assert delays == [30.0, 30.0, 30.0]
+
+
+class TestStartPollTask:
+    def test_disabled_returns_none(self, monkeypatch):
+        """Feature off → no task is created."""
+        cpwl_mod._reset_for_tests()
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_AUTH", raising=False)
+        assert cpwl_mod.start_poll_task() is None
+        cpwl_mod._reset_for_tests()
+
+    def test_idempotent_same_task(self, cp_enabled, monkeypatch):
+        """Second start returns the same live task (no duplicate loops)."""
+
+        async def _fake_loop(client, sleep=asyncio.sleep):
+            await asyncio.sleep(999)
+
+        monkeypatch.setattr(cpwl_mod, "_poll_loop", _fake_loop)
+
+        async def run():
+            t1 = cpwl_mod.start_poll_task()
+            t2 = cpwl_mod.start_poll_task()
+            assert t1 is not None and t1 is t2 and not t1.done()
+            cpwl_mod.stop_poll_task()
+
+        asyncio.run(run())

@@ -159,7 +159,7 @@ class WhitelistClient:
                         headers={"Authorization": self._auth},
                         timeout=_FETCH_TIMEOUT_S,
                     )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 last_error = f"network error: {type(exc).__name__}"
                 transient = True
             else:
@@ -324,3 +324,54 @@ def _reset_for_tests() -> None:
     global _client, _client_resolved
     _client = None
     _client_resolved = False
+
+
+# ---- background poll -----------------------------------------------------
+
+_poll_task: Optional["asyncio.Task[None]"] = None
+
+
+async def _poll_loop(client: WhitelistClient, sleep=asyncio.sleep) -> None:
+    """Refresh forever. Boot phase (no snapshot yet) backs off 1/5/15s to
+    shrink the fail-closed window; once data exists the cadence is a flat
+    30s — fetch failures just keep serving the cache."""
+    failures = 0
+    while True:
+        try:
+            ok = await client.refresh()
+        except Exception:
+            logger.warning("control-plane whitelist poll error", exc_info=True)
+            ok = False
+        if ok:
+            failures = 0
+            delay = _POLL_INTERVAL_S
+        else:
+            failures += 1
+            if client.snapshot is None:
+                delay = _BOOT_BACKOFF_S[min(failures - 1, len(_BOOT_BACKOFF_S) - 1)]
+            else:
+                delay = _POLL_INTERVAL_S
+        await sleep(delay)
+
+
+def start_poll_task() -> Optional["asyncio.Task[None]"]:
+    """Start the shared poll task (idempotent). None when disabled.
+
+    Call once from gateway startup; the returned task can be registered
+    with the gateway's background-task set for shutdown cancellation.
+    """
+    global _poll_task
+    client = get_platform_whitelist()
+    if client is None:
+        return None
+    if _poll_task is not None and not _poll_task.done():
+        return _poll_task
+    _poll_task = asyncio.create_task(_poll_loop(client))
+    return _poll_task
+
+
+def stop_poll_task() -> None:
+    global _poll_task
+    if _poll_task is not None and not _poll_task.done():
+        _poll_task.cancel()
+    _poll_task = None
