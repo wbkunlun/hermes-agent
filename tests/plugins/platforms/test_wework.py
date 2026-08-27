@@ -8,6 +8,8 @@ the ``Platform`` enum reaches it — leaving it orphaned and the platform
 silently unavailable. These tests pin the discoverable location.
 """
 
+import pytest
+
 
 def test_wework_resolves_as_platform():
     """plugin.yaml under plugins/platforms/wework/ makes Platform('wework')
@@ -106,3 +108,125 @@ def test_parse_inbound_group_targets_wechat_id():
     assert inbound is not None
     assert inbound.is_group is True
     assert inbound.chat_id == "S:1688858099504500_8444250708322274;R:3284275877"
+
+
+class TestControlPlaneWhitelistGate:
+    """Platform (control-plane) whitelist REPLACES the env allow/policy
+    config for BOTH DM senders and groups when CONTROL_PLANE_URL/AUTH are
+    both set. No cached data = drop (fail-closed, silent like groups today)."""
+
+    @pytest.fixture
+    def cpwl(self, monkeypatch, tmp_path):
+        """Enable the control-plane whitelist with an isolated client (disk
+        cache pointed at a nonexistent tmp path); yields install(users)."""
+        from tools import control_plane_whitelist as cpwl_mod
+        from tools.control_plane_whitelist import WhitelistSnapshot
+
+        monkeypatch.delenv("WEWORK_ALLOW_FROM", raising=False)
+        monkeypatch.delenv("WEWORK_GROUP_ALLOW_FROM", raising=False)
+        monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example.com")
+        monkeypatch.setenv("CONTROL_PLANE_AUTH", "Bearer test-jwt")
+        cpwl_mod._reset_for_tests()
+        client = cpwl_mod.get_platform_whitelist()
+        assert client is not None
+        # construction read the REAL /opt/data cache — neutralize it
+        client._cache_path = tmp_path / "cpwl-nonexistent.json"
+        client._snapshot = None
+
+        def install(users=None):
+            # install() with no args = enabled but never fetched (no
+            # snapshot) → fail-closed; users=[] is a REAL empty list →
+            # allow all. These are different states in WhitelistClient.
+            if users is None:
+                client._snapshot = None
+            else:
+                client._snapshot = WhitelistSnapshot(
+                    commands=(), users=tuple(users),
+                    updated_at=None, fetched_at=1.0,
+                )
+
+        yield install
+        cpwl_mod._reset_for_tests()
+
+    @staticmethod
+    def _adapter(extra=None):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.wework.adapter import WeWorkAdapter
+
+        return WeWorkAdapter(PlatformConfig(enabled=True, extra={"keyid": "k", **(extra or {})}))
+
+    @staticmethod
+    def _dm_payload(user="zhangsan", name="张三", t="cp1"):
+        return {
+            "cmd": "hi", "user": user, "userFullName": name,
+            "wechatId": "S:1688857642682584_8444250708322274;S:1688851343262740_1688857642682584",
+            "fromGroup": "", "sendTime": t, "storeKey": "sk-" + t,
+        }
+
+    @staticmethod
+    def _group_payload(from_group="运维群", t="cp1", is_at=True):
+        return {
+            "cmd": "hi", "user": "zhangsan", "userFullName": "张三",
+            "wechatId": "S:1688858099504500_8444250708322274;R:3284275877",
+            "fromGroup": from_group, "sendTime": t, "storeKey": "sk-" + t,
+            "isAt": is_at,
+        }
+
+    def test_dm_allowed_by_platform_users(self, cpwl):
+        """A DM sender listed in the platform users list passes the gate."""
+        cpwl(users=["zhangsan"])
+        assert self._adapter()._parse_inbound(self._dm_payload()) is not None
+
+    def test_dm_dropped_when_not_listed(self, cpwl):
+        """A DM sender absent from the platform users list is silently dropped."""
+        cpwl(users=["zhangsan"])
+        assert self._adapter()._parse_inbound(self._dm_payload(user="lisi")) is None
+
+    def test_group_allowed_by_group_name(self, cpwl):
+        """requireMention defaults True; payload isAt=True satisfies it."""
+        cpwl(users=["运维群"])
+        assert self._adapter()._parse_inbound(self._group_payload()) is not None
+
+    def test_group_dropped_when_group_not_listed(self, cpwl):
+        """A group whose name (and chat id) is not in the users list is dropped."""
+        cpwl(users=["运维群"])
+        assert self._adapter()._parse_inbound(self._group_payload(from_group="其他群")) is None
+
+    def test_group_allowed_by_full_chat_id(self, cpwl):
+        """Groups can also be whitelisted by their FULL wechatId chat id."""
+        chat_id = "S:1688858099504500_8444250708322274;R:3284275877"
+        cpwl(users=[chat_id])
+        assert self._adapter()._parse_inbound(self._group_payload()) is not None
+
+    def test_empty_users_allows_all(self, cpwl):
+        """An empty platform users list means unrestricted: DM and group pass."""
+        cpwl(users=[])
+        assert self._adapter()._parse_inbound(self._dm_payload()) is not None
+        assert self._adapter()._parse_inbound(self._group_payload()) is not None
+
+    def test_no_data_drops_everything(self, cpwl):
+        """Enabled but never fetched and no cache: fail-closed drops all."""
+        cpwl()  # enabled, never fetched, no cache
+        assert self._adapter()._parse_inbound(self._dm_payload()) is None
+        assert self._adapter()._parse_inbound(self._group_payload()) is None
+
+    def test_require_mention_still_applies_on_platform_path(self, cpwl):
+        """@-mention logic is orthogonal to the whitelist and keeps running."""
+        cpwl(users=["运维群"])
+        assert self._adapter()._parse_inbound(self._group_payload(is_at=False)) is None
+
+    def test_env_path_unchanged_when_platform_disabled(self, monkeypatch):
+        """No CONTROL_PLANE envs → existing env/config policy path intact:
+        default groupPolicy=allowlist with empty list drops the group."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.wework.adapter import WeWorkAdapter
+        from tools import control_plane_whitelist as cpwl_mod
+
+        cpwl_mod._reset_for_tests()
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_AUTH", raising=False)
+        monkeypatch.delenv("WEWORK_ALLOW_FROM", raising=False)
+        monkeypatch.delenv("WEWORK_GROUP_ALLOW_FROM", raising=False)
+        adapter = WeWorkAdapter(PlatformConfig(enabled=True, extra={"keyid": "k"}))
+        assert adapter._parse_inbound(self._group_payload(t="cp9")) is None
+        cpwl_mod._reset_for_tests()

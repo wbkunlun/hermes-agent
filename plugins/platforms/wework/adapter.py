@@ -372,7 +372,32 @@ class WeWorkAdapter(BasePlatformAdapter):
         )
 
         # Basic allowlist policies.
-        if is_group:
+        #
+        # Control-plane dynamic whitelist (fork): when enabled it REPLACES
+        # the env/config policies below for BOTH DM senders and groups (one
+        # shared platform users list). No cached data = drop (fail-closed,
+        # silent — same as the env group path). The env/config path below is
+        # untouched when the control plane is disabled.
+        try:
+            from tools.control_plane_whitelist import get_platform_whitelist
+
+            _cpwl = get_platform_whitelist()
+        except Exception:
+            logger.warning(
+                "control-plane whitelist unavailable (module error); "
+                "falling back to env policies",
+                exc_info=True,
+            )
+            _cpwl = None
+        if _cpwl is not None:
+            if is_group:
+                if not _cpwl.group_allowed(chat_id=chat_id, chat_name=chat_name):
+                    return None
+                if self._require_mention and not mentioned_bot:
+                    return None
+            elif not _cpwl.user_allowed(sender_user, sender_full_name):
+                return None
+        elif is_group:
             if self._group_policy == "disabled":
                 return None
             if self._group_policy == "allowlist":
