@@ -783,6 +783,8 @@ def _match_user_allow_rule(command: str):
 
         _cpwl = get_platform_whitelist()
     except Exception:
+        logger.warning("control-plane whitelist unavailable (module error); "
+                       "falling back to env allowlist path", exc_info=True)
         _cpwl = None
     if _cpwl is not None:
         _cp_gate = _cpwl.command_gate(command)
@@ -820,6 +822,8 @@ def _user_allow_block_result() -> dict:
 
         _cpwl = get_platform_whitelist()
     except Exception:
+        logger.warning("control-plane whitelist unavailable (module error); "
+                       "block message falls back to env wording", exc_info=True)
         _cpwl = None
     if _cpwl is not None and _cpwl.snapshot is not None and _cpwl.snapshot.commands:
         message = (
