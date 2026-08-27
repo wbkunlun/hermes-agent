@@ -609,6 +609,32 @@ class GatewayAuthorizationMixin:
         if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
             return True
 
+        # Control-plane dynamic whitelist (fork): when enabled it REPLACES
+        # the env allowlists below for WeWork. DM senders and groups share
+        # the platform users list; a group message is authorized when either
+        # the chat or the sender is on it. Pairing (checked above) stays a
+        # UNION; no cached data fails closed.
+        try:
+            if source.platform is not None and source.platform.value == "wework":
+                from tools.control_plane_whitelist import get_platform_whitelist
+
+                _cpwl = get_platform_whitelist()
+                if _cpwl is not None:
+                    if source.chat_type in {"group", "forum", "channel"}:
+                        return _cpwl.group_allowed(
+                            chat_id=getattr(source, "chat_id", "") or "",
+                            chat_name=getattr(source, "chat_name", "") or "",
+                        ) or _cpwl.user_allowed(user_id, "")
+                    return _cpwl.user_allowed(
+                        user_id, getattr(source, "user_name", "") or ""
+                    )
+        except Exception:
+            logger.warning(
+                "control-plane whitelist unavailable (module error); "
+                "falling back to env allowlists",
+                exc_info=True,
+            )
+
         # Check platform-specific and global allowlists
         platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
         group_user_allowlist = ""
