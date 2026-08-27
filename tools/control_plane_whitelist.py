@@ -75,6 +75,7 @@ class WhitelistClient:
         self._cache_path = Path(cache_path)
         self._snapshot: Optional[WhitelistSnapshot] = None
         self._last_auth_alert = 0.0
+        self._load_disk_cache()
 
     @property
     def snapshot(self) -> Optional[WhitelistSnapshot]:
@@ -139,6 +140,54 @@ class WhitelistClient:
             ):
                 return "bypass"
         return "deny"
+
+    # ---- cache persistence ----------------------------------------------
+
+    def _persist(self) -> None:
+        """Write the snapshot atomically (tmp + rename). Non-fatal."""
+        snap = self._snapshot
+        if snap is None:
+            return
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "commands": list(snap.commands),
+                "users": list(snap.users),
+                "updated_at": snap.updated_at,
+                "fetched_at": snap.fetched_at,
+            }
+            tmp = self._cache_path.with_name(self._cache_path.name + ".tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._cache_path)
+        except OSError as exc:
+            logger.warning("control-plane whitelist cache write failed: %s", exc)
+
+    def _load_disk_cache(self) -> None:
+        """Best-effort boot fallback when the platform is unreachable.
+        Any anomaly (missing/corrupt/invalid shape) is ignored silently —
+        no snapshot means fail-closed, which is the safe default."""
+        try:
+            raw = json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        commands = _clean_list(raw.get("commands"))
+        users = _clean_list(raw.get("users"))
+        fetched_at = raw.get("fetched_at")
+        if commands is None or users is None or not isinstance(fetched_at, (int, float)):
+            return
+        updated_at = raw.get("updated_at")
+        self._snapshot = WhitelistSnapshot(
+            commands=commands,
+            users=users,
+            updated_at=updated_at if isinstance(updated_at, str) else None,
+            fetched_at=float(fetched_at),
+        )
+        logger.info(
+            "control-plane whitelist: loaded disk cache (%d commands, %d users)",
+            len(commands), len(users),
+        )
 
 
 def _platform_segment_allowed(segment: str, commands: Tuple[str, ...], tokenizer) -> bool:
