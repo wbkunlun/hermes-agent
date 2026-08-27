@@ -269,3 +269,86 @@ class TestCompoundCommandGuardsIntegration:
         monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "git")
         assert check_all_command_guards(
             "git status && git diff", "local")["approved"] is True
+
+
+class TestControlPlaneWhitelistGate:
+    """Platform (control-plane) whitelist REPLACES the env allowlist when
+    CONTROL_PLANE_URL/AUTH are both set. No cached data = deny everything."""
+
+    @pytest.fixture
+    def cpwl(self, monkeypatch, tmp_path):
+        from tools import control_plane_whitelist as cpwl_mod
+        from tools.control_plane_whitelist import WhitelistSnapshot
+
+        monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example.com")
+        monkeypatch.setenv("CONTROL_PLANE_AUTH", "Bearer test-jwt")
+        cpwl_mod._reset_for_tests()
+        client = cpwl_mod.get_platform_whitelist()
+        assert client is not None
+        client._cache_path = tmp_path / "wl.json"
+        client._snapshot = None  # guard against a real /opt/data cache
+
+        def install(commands=(), users=()):
+            client._snapshot = WhitelistSnapshot(
+                commands=tuple(commands), users=tuple(users),
+                updated_at=None, fetched_at=1.0,
+            )
+
+        yield install
+        cpwl_mod._reset_for_tests()
+
+    def test_disabled_falls_back_to_env_path(self, monkeypatch, allow_config):
+        """No CONTROL_PLANE envs → env allowlist behavior unchanged."""
+        from tools import control_plane_whitelist as _c
+
+        _c._reset_for_tests()
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_AUTH", raising=False)
+        allow_config(["git status"])
+        assert mod._match_user_allow_rule("git status") is True
+        assert mod._match_user_allow_rule("rm -rf /tmp/x") is False
+
+    def test_no_data_denies_even_with_env_configured(self, cpwl, monkeypatch):
+        """Platform on + never fetched + no cache = deny; env list ignored."""
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "git status")
+        # no cpwl() call: fixture leaves _snapshot None = never fetched
+        assert mod._match_user_allow_rule("git status") is False
+
+    def test_empty_platform_list_disables_env_too(self, cpwl, monkeypatch):
+        """Platform empty list = normal pipeline; env list must NOT apply."""
+        monkeypatch.setenv("HERMES_COMMAND_ALLOWLIST", "git status")
+        cpwl(commands=[])
+        assert mod._match_user_allow_rule("rm -rf /tmp/x") is None
+
+    def test_platform_glob_hit_and_miss(self, cpwl):
+        cpwl(commands=["git log*", "ls"])
+        assert mod._match_user_allow_rule("git log --oneline") is True
+        assert mod._match_user_allow_rule("ls -l") is False  # bare name = exact only
+
+    def test_platform_block_survives_yolo(self, cpwl, clean_env, monkeypatch):
+        """Platform deny is a hard block — yolo cannot bypass (parity with
+        the env allowlist hard block)."""
+        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        cpwl(commands=["ls*"])
+        result = check_all_command_guards("rm -rf /tmp/x", "local")
+        assert result["approved"] is False
+        assert result.get("user_allow") is True  # platform gate, not hardline
+
+    def test_block_message_names_platform_when_active(self, cpwl):
+        cpwl(commands=["ls*"])
+        message = mod._user_allow_block_result()["message"]
+        assert "platform command whitelist" in message
+
+    def test_block_message_names_unavailable_without_data(self, cpwl):
+        # no cpwl() call: enabled, never fetched (snapshot stays None)
+        message = mod._user_allow_block_result()["message"]
+        assert "unavailable" in message
+
+    def test_env_message_when_platform_disabled(self, monkeypatch):
+        from tools import control_plane_whitelist as _c
+
+        _c._reset_for_tests()
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_AUTH", raising=False)
+        message = mod._user_allow_block_result()["message"]
+        assert "HERMES_COMMAND_ALLOWLIST" in message

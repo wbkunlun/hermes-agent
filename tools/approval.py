@@ -772,6 +772,26 @@ def _match_user_allow_rule(command: str):
     falls through to the normal dangerous-command pipeline. The hardline
     floor and ``approvals.deny`` still run BEFORE this check either way.
     """
+    # Control-plane dynamic whitelist (fork): when enabled it REPLACES the
+    # env/config allowlist below. Gate states: "deny" -> False (hard block,
+    # including the no-cached-data fail-closed state), "bypass" -> True, and
+    # "normal" (platform list empty = unrestricted) -> None WITHOUT falling
+    # through to the env path. A disabled control plane falls through to the
+    # env/config path unchanged.
+    try:
+        from tools.control_plane_whitelist import get_platform_whitelist
+
+        _cpwl = get_platform_whitelist()
+    except Exception:
+        _cpwl = None
+    if _cpwl is not None:
+        _cp_gate = _cpwl.command_gate(command)
+        if _cp_gate == "deny":
+            return False
+        if _cp_gate == "bypass":
+            return True
+        return None
+
     globs = _load_command_allowlist_globs()
     if globs is None:
         return None
@@ -795,18 +815,38 @@ def _match_user_allow_rule(command: str):
 
 def _user_allow_block_result() -> dict:
     """Build the standard block result for a non-whitelisted command."""
-    return {
-        "approved": False,
-        "user_allow": True,
-        "message": (
+    try:
+        from tools.control_plane_whitelist import get_platform_whitelist
+
+        _cpwl = get_platform_whitelist()
+    except Exception:
+        _cpwl = None
+    if _cpwl is not None and _cpwl.snapshot is not None and _cpwl.snapshot.commands:
+        message = (
+            "BLOCKED: this command is not in the platform command whitelist "
+            "(control plane /api/v1/agent/whitelist). Only explicitly "
+            "whitelisted commands may run in this deployment — not even "
+            "--yolo, /yolo, or approvals.mode=off can bypass this. Do NOT "
+            "retry or rephrase this command; ask the operator to add it to "
+            "the platform whitelist if it is legitimately needed."
+        )
+    elif _cpwl is not None:
+        message = (
+            "BLOCKED: the platform command whitelist is unavailable (no "
+            "cached whitelist). All commands are denied until the control "
+            "plane is reachable. Do NOT retry; ask the operator to check "
+            "control-plane connectivity."
+        )
+    else:
+        message = (
             "BLOCKED: this command is not in the operator command allowlist "
             "(HERMES_COMMAND_ALLOWLIST / approvals.allow). Only explicitly "
             "whitelisted commands may run in this deployment — not even "
             "--yolo, /yolo, or approvals.mode=off can bypass this. Do NOT "
             "retry or rephrase this command; ask the operator to add it to "
             "the allowlist if it is legitimately needed."
-        ),
-    }
+        )
+    return {"approved": False, "user_allow": True, "message": message}
 
 
 def _save_blocked_payload(command: str) -> Optional[str]:
