@@ -12410,6 +12410,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Legacy session recovery on startup failed: %s", exc)
         return exact, fallback
 
+    def _start_control_plane_whitelist_poll(self) -> None:
+        """Start the control-plane whitelist poll task (fork). Idempotent
+        and best-effort — a whitelist fetch problem must never be able to
+        abort startup. The task joins the background-task set so stop()
+        cancels it with everything else."""
+        try:
+            from tools.control_plane_whitelist import start_poll_task
+
+            task = start_poll_task()
+        except Exception:
+            logger.debug("control-plane whitelist poll not started", exc_info=True)
+            return
+        if task is None:
+            return
+        # PERMANENT for the process lifetime, same as the heartbeat task —
+        # tag it so _scale_to_zero_has_live_background_work() doesn't count
+        # it and block dormancy forever.
+        task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
+        _bg = getattr(self, "_background_tasks", None)
+        if _bg is not None:
+            _bg.add(task)
+            task.add_done_callback(_bg.discard)
+
     def _start_loop_heartbeat_task(self) -> None:
         """Start the loop-liveness heartbeat task (#66892), idempotent.
 
@@ -13210,6 +13233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._update_runtime_status("running")
 
         self._start_loop_heartbeat_task()
+        self._start_control_plane_whitelist_poll()
 
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)

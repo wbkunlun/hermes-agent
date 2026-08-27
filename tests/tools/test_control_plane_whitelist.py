@@ -483,3 +483,10 @@ class TestStartPollTask:
             cpwl_mod.stop_poll_task()
 
         asyncio.run(run())
+
+
+def test_gateway_runner_has_poll_starter():
+    """run.py wires the poll starter (method exists on GatewayRunner)."""
+    from gateway.run import GatewayRunner
+
+    assert hasattr(GatewayRunner, "_start_control_plane_whitelist_poll")
