@@ -329,6 +329,7 @@ class TestControlPlaneWhitelistGate:
         """Platform deny is a hard block — yolo cannot bypass (parity with
         the env allowlist hard block)."""
         monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
         cpwl(commands=["ls*"])
         result = check_all_command_guards("rm -rf /tmp/x", "local")
         assert result["approved"] is False
