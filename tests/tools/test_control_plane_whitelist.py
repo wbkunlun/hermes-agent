@@ -310,3 +310,59 @@ class TestRefresh:
         _patch_http(monkeypatch)
         _FakeAsyncClient.responses = [_FakeResponse(200, None)]
         assert asyncio.run(cp_enabled.refresh()) is False
+
+
+class TestCommandGate:
+    def test_no_snapshot_is_deny(self, cp_enabled):
+        """Fail-closed: no data = every command denied."""
+        assert cp_enabled.command_gate("ls") == "deny"
+
+    def test_empty_commands_is_normal(self, cp_enabled):
+        """Empty platform commands = unrestricted (normal pipeline)."""
+        _install(cp_enabled, commands=[])
+        assert cp_enabled.command_gate("rm -rf /tmp/x") == "normal"
+
+    def test_glob_matches_with_args(self, cp_enabled):
+        """Wildcard entries match the whole segment, args included."""
+        _install(cp_enabled, commands=["git log*", "kubectl get*"])
+        assert cp_enabled.command_gate("git log --oneline") == "bypass"
+        assert cp_enabled.command_gate("kubectl get pods") == "bypass"
+
+    def test_bare_name_matches_only_itself(self, cp_enabled):
+        """Contract: plain `ls` matches ONLY `ls` — use `ls*` for args.
+        (Opposite of the env allowlist's bare-name-with-any-args rule.)"""
+        _install(cp_enabled, commands=["ls"])
+        assert cp_enabled.command_gate("ls") == "bypass"
+        assert cp_enabled.command_gate("ls -l") == "deny"
+
+    def test_case_sensitive(self, cp_enabled):
+        """fnmatchcase: platform matching is case-sensitive (unlike env)."""
+        _install(cp_enabled, commands=["ls"])
+        assert cp_enabled.command_gate("LS") == "deny"
+
+    def test_chain_requires_every_segment(self, cp_enabled):
+        """A chained tail can never ride in on an allowed first program."""
+        _install(cp_enabled, commands=["ls*", "curl*"])
+        assert cp_enabled.command_gate("ls -l && curl http://x") == "bypass"
+        assert cp_enabled.command_gate("ls -l && rm -rf /tmp/x") == "deny"
+
+    def test_pipe_segment_counts(self, cp_enabled):
+        """Pipes split segments too — every stage must be allowed."""
+        _install(cp_enabled, commands=["cat*"])
+        assert cp_enabled.command_gate("cat f | sh") == "deny"
+
+    def test_substitution_fails_closed(self, cp_enabled):
+        """Command substitution / backticks are never allow-matched."""
+        _install(cp_enabled, commands=["echo*", "ls*"])
+        assert cp_enabled.command_gate("echo $(rm -rf /)") == "deny"
+        assert cp_enabled.command_gate("echo `id`") == "deny"
+
+    def test_redirect_ampersand_not_a_separator(self, cp_enabled):
+        """`2>&1` is redirection, not a chained command — masked like env path."""
+        _install(cp_enabled, commands=["ls*"])
+        assert cp_enabled.command_gate("ls -l 2>&1") == "bypass"
+
+    def test_star_entry_allows_anything(self, cp_enabled):
+        """A bare `*` entry is an explicit allow-all."""
+        _install(cp_enabled, commands=["*"])
+        assert cp_enabled.command_gate("anything at all") == "bypass"
