@@ -65,6 +65,12 @@ DEFAULT_REQUIRE_MENTION = True
 DEDUP_TTL_SECONDS = 300
 DEDUP_MAX_SIZE = 20000
 
+# Rate limit for control-plane whitelist drop warnings: per-message logging
+# would be noise under a flood; one line per interval is enough for an
+# operator to grep "why is the bot silent" (spec §6.2).
+_CPWL_DROP_LOG_INTERVAL_S = 300.0
+_cpwl_last_drop_log = 0.0
+
 
 def check_wework_requirements() -> bool:
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
@@ -375,9 +381,10 @@ class WeWorkAdapter(BasePlatformAdapter):
         #
         # Control-plane dynamic whitelist (fork): when enabled it REPLACES
         # the env/config policies below for BOTH DM senders and groups (one
-        # shared platform users list). No cached data = drop (fail-closed,
-        # silent — same as the env group path). The env/config path below is
-        # untouched when the control plane is disabled.
+        # shared platform users list). No cached data = drop (fail-closed;
+        # drops emit a rate-limited warning via _log_cpwl_drop). The
+        # env/config path below is untouched when the control plane is
+        # disabled.
         try:
             from tools.control_plane_whitelist import get_platform_whitelist
 
@@ -392,10 +399,14 @@ class WeWorkAdapter(BasePlatformAdapter):
         if _cpwl is not None:
             if is_group:
                 if not _cpwl.group_allowed(chat_id=chat_id, chat_name=chat_name):
+                    self._log_cpwl_drop(is_group=is_group, sender=sender_user,
+                                        chat_id=chat_id, chat_name=chat_name)
                     return None
                 if self._require_mention and not mentioned_bot:
                     return None
             elif not _cpwl.user_allowed(sender_user, sender_full_name):
+                self._log_cpwl_drop(is_group=is_group, sender=sender_user,
+                                    chat_id=chat_id, chat_name=chat_name)
                 return None
         elif is_group:
             if self._group_policy == "disabled":
@@ -435,6 +446,23 @@ class WeWorkAdapter(BasePlatformAdapter):
             text=cmd,
             message_id=message_id,
             mentioned_bot=mentioned_bot,
+        )
+
+    def _log_cpwl_drop(self, *, is_group: bool, sender: str, chat_id: str, chat_name: str) -> None:
+        """Rate-limited visibility for control-plane whitelist drops (fork).
+
+        Per-message logging would be noise under a flood; one line per 5 min
+        is enough for an operator to grep 'why is the bot silent'."""
+        global _cpwl_last_drop_log
+        now = time.time()
+        if now - _cpwl_last_drop_log < _CPWL_DROP_LOG_INTERVAL_S:
+            return
+        _cpwl_last_drop_log = time.time()
+        target = (chat_name or chat_id) if is_group else (sender or "unknown")
+        logger.warning(
+            "[%s] control-plane whitelist dropped inbound (%s): %s — "
+            "platform list miss or no cached data",
+            self.name, "group" if is_group else "dm", str(target)[:80],
         )
 
     def _is_group_allowed(self, *, chat_id: str, chat_name: str) -> bool:

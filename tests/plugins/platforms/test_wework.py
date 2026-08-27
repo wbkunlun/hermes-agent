@@ -230,3 +230,18 @@ class TestControlPlaneWhitelistGate:
         adapter = WeWorkAdapter(PlatformConfig(enabled=True, extra={"keyid": "k"}))
         assert adapter._parse_inbound(self._group_payload(t="cp9")) is None
         cpwl_mod._reset_for_tests()
+
+    def test_drop_logs_rate_limited(self, cpwl, monkeypatch, caplog):
+        """No-data drops emit a rate-limited warning (operator visibility)."""
+        import logging as _logging
+
+        from plugins.platforms.wework import adapter as adapter_mod
+
+        cpwl()  # enabled, never fetched, no cache → fail-closed drops
+        monkeypatch.setattr(adapter_mod, "_cpwl_last_drop_log", 0.0)
+        with caplog.at_level(_logging.WARNING, logger="plugins.platforms.wework.adapter"):
+            adapter = self._adapter()
+            adapter._parse_inbound(self._dm_payload(t="lg1"))
+            adapter._parse_inbound(self._dm_payload(t="lg2"))
+        warnings = [r for r in caplog.records if "control-plane whitelist dropped" in r.getMessage()]
+        assert len(warnings) == 1  # second drop within 5 min is suppressed
