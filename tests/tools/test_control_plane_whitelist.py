@@ -5,9 +5,12 @@ failure falls back to cached lists; no data at all = deny everything
 (fail-closed); empty list = that class unrestricted.
 """
 
+import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from tools import control_plane_whitelist as cpwl_mod
@@ -127,6 +130,7 @@ class TestDiskCache:
 
         monkeypatch.setattr(Path, "write_text", _raise)
         cp_enabled._persist()  # must not raise
+        assert cp_enabled.snapshot is not None  # memory state still serves
 
     def test_startup_loads_disk_cache(self, monkeypatch, tmp_path):
         """Fresh process + platform unreachable at boot → disk cache decides."""
@@ -150,11 +154,159 @@ class TestDiskCache:
     def test_corrupt_cache_is_ignored_fail_closed(self, monkeypatch, tmp_path):
         """Corrupt/invalid cache files are silently ignored → no snapshot."""
         cpwl_mod._reset_for_tests()
-        for bad in ("{not json", '{"commands": "x", "users": []}', '{"commands": []}', "[]"):
+        for bad in ("{not json", '{"commands": "x", "users": []}', '{"commands": []}', "[]",
+                    b"\xff\xfe"):
             cache = tmp_path / "whitelist-cache.json"
-            cache.write_text(bad, encoding="utf-8")
+            if isinstance(bad, bytes):
+                cache.write_bytes(bad)  # non-UTF-8 bytes cannot go through write_text
+            else:
+                cache.write_text(bad, encoding="utf-8")
             client = cpwl_mod.WhitelistClient(
                 url="https://x/api", auth="Bearer t", cache_path=cache,
             )
             assert client.snapshot is None, f"corrupt cache {bad!r} must not load"
         cpwl_mod._reset_for_tests()
+
+
+class _FakeResponse:
+    """Minimal response stand-in: .status_code plus a raising/working .json()."""
+
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class _FakeAsyncClient:
+    """Queue-backed httpx.AsyncClient stand-in; class attrs are the queue."""
+
+    responses = []
+    requests = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, headers=None, timeout=None):
+        type(self).requests.append({"url": url, "headers": dict(headers or {})})
+        item = type(self).responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _patch_http(monkeypatch):
+    """Point cpwl_mod.httpx at the fake client; reset both queues."""
+    _FakeAsyncClient.responses = []
+    _FakeAsyncClient.requests = []
+    monkeypatch.setattr(
+        cpwl_mod, "httpx",
+        SimpleNamespace(AsyncClient=_FakeAsyncClient, HTTPError=httpx.HTTPError),
+    )
+
+
+def _payload(commands=(), users=(), success=True):
+    """Build a platform response envelope (audit-API style wrapper)."""
+    return {
+        "success": success, "code": 200, "message": "Success",
+        "data": {
+            "agent_id": "oc-x",
+            "commands": list(commands),
+            "users": list(users),
+            "updated_at": "2026-08-27T08:00:00Z",
+        },
+        "traceId": "t-1",
+    }
+
+
+class TestRefresh:
+    """refresh(): retry ladder, error classification, envelope validation."""
+
+    def test_success_updates_snapshot_and_persists(self, cp_enabled, monkeypatch):
+        """200 + valid envelope → snapshot swapped and cache file written."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [_FakeResponse(200, _payload(["ls*"], ["zhangsan"]))]
+        assert asyncio.run(cp_enabled.refresh()) is True
+        assert cp_enabled.snapshot.commands == ("ls*",)
+        assert cp_enabled.snapshot.users == ("zhangsan",)
+        raw = json.loads(cp_enabled._cache_path.read_text(encoding="utf-8"))
+        assert raw["users"] == ["zhangsan"]
+
+    def test_auth_header_passthrough_no_extra_bearer(self, cp_enabled, monkeypatch):
+        """CONTROL_PLANE_AUTH already has the Bearer prefix — verbatim."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [_FakeResponse(200, _payload())]
+        asyncio.run(cp_enabled.refresh())
+        req = _FakeAsyncClient.requests[0]
+        assert req["url"].endswith("/api/v1/agent/whitelist")
+        assert req["headers"] == {"Authorization": "Bearer test-jwt"}
+
+    def test_401_keeps_cache(self, cp_enabled, monkeypatch):
+        """Auth rejection must not retry and must not clear the snapshot."""
+        _patch_http(monkeypatch)
+        _install(cp_enabled, users=["zhangsan"])
+        before = cp_enabled.snapshot
+        _FakeAsyncClient.responses = [_FakeResponse(401, {"success": False})]
+        assert asyncio.run(cp_enabled.refresh()) is False
+        assert len(_FakeAsyncClient.requests) == 1  # auth errors do not retry
+        assert cp_enabled.snapshot is before
+
+    def test_5xx_retries_then_succeeds(self, cp_enabled, monkeypatch):
+        """Transient server errors retry (3 attempts) and a late 200 wins."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [
+            _FakeResponse(503), _FakeResponse(500),
+            _FakeResponse(200, _payload(["ls*"])),
+        ]
+        assert asyncio.run(cp_enabled.refresh()) is True
+        assert len(_FakeAsyncClient.requests) == 3
+
+    def test_network_error_retries_then_succeeds(self, cp_enabled, monkeypatch):
+        """Network exceptions are transient: retry, then succeed."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [
+            httpx.ConnectError("boom"),
+            _FakeResponse(200, _payload(users=["zhangsan"])),
+        ]
+        assert asyncio.run(cp_enabled.refresh()) is True
+        assert cp_enabled.snapshot.users == ("zhangsan",)
+
+    def test_exhausted_retries_keep_cache(self, cp_enabled, monkeypatch):
+        """All 3 attempts failing keeps the previous snapshot intact."""
+        _patch_http(monkeypatch)
+        _install(cp_enabled, users=["zhangsan"])
+        _FakeAsyncClient.responses = [_FakeResponse(503)] * 3
+        assert asyncio.run(cp_enabled.refresh()) is False
+        assert len(_FakeAsyncClient.requests) == 3
+        assert cp_enabled.snapshot.users == ("zhangsan",)
+
+    def test_envelope_success_false_rejected(self, cp_enabled, monkeypatch):
+        """200 with success=false is an invalid envelope — keep cache."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [_FakeResponse(200, _payload(success=False))]
+        assert asyncio.run(cp_enabled.refresh()) is False
+        assert cp_enabled.snapshot is None
+
+    def test_non_list_field_rejected(self, cp_enabled, monkeypatch):
+        """commands/users must be lists; anything else is invalid."""
+        _patch_http(monkeypatch)
+        bad = _payload()
+        bad["data"]["commands"] = "ls*"
+        _FakeAsyncClient.responses = [_FakeResponse(200, bad)]
+        assert asyncio.run(cp_enabled.refresh()) is False
+        assert cp_enabled.snapshot is None
+
+    def test_non_json_body_rejected(self, cp_enabled, monkeypatch):
+        """A non-JSON 200 body is invalid — keep cache."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [_FakeResponse(200, None)]
+        assert asyncio.run(cp_enabled.refresh()) is False

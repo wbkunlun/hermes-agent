@@ -141,6 +141,97 @@ class WhitelistClient:
                 return "bypass"
         return "deny"
 
+    # ---- fetch -----------------------------------------------------------
+
+    async def refresh(self) -> bool:
+        """Fetch once (3 attempts on transient errors). Never raises.
+
+        True = snapshot updated. Any failure keeps the previous snapshot.
+        """
+        delays = (0.5, 1.0)
+        last_error = ""
+        for attempt in range(3):
+            transient = False
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        self._url,
+                        headers={"Authorization": self._auth},
+                        timeout=_FETCH_TIMEOUT_S,
+                    )
+            except httpx.HTTPError as exc:
+                last_error = f"network error: {type(exc).__name__}"
+                transient = True
+            else:
+                if response.status_code == 200:
+                    return self._install_from_payload(response)
+                if response.status_code in (401, 403):
+                    self._alert_auth_problem(response.status_code)
+                    return False  # credential problem: retrying cannot help
+                if 500 <= response.status_code < 600:
+                    last_error = f"HTTP {response.status_code}"
+                    transient = True
+                else:
+                    logger.warning(
+                        "control-plane whitelist fetch unexpected HTTP %s; keeping cache",
+                        response.status_code,
+                    )
+                    return False
+            if transient and attempt < 2:
+                await asyncio.sleep(delays[attempt])
+        logger.warning(
+            "control-plane whitelist fetch failed after retries (%s); keeping cache",
+            last_error,
+        )
+        return False
+
+    def _install_from_payload(self, response) -> bool:
+        """Validate the envelope, then swap in the new snapshot + persist.
+
+        Any invalid shape keeps the previous snapshot (fail-safe).
+        """
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning("control-plane whitelist: non-JSON body; keeping cache")
+            return False
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            logger.warning("control-plane whitelist: invalid envelope; keeping cache")
+            return False
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            logger.warning("control-plane whitelist: invalid data field; keeping cache")
+            return False
+        commands = _clean_list(data.get("commands"))
+        users = _clean_list(data.get("users"))
+        if commands is None or users is None:
+            logger.warning("control-plane whitelist: invalid list fields; keeping cache")
+            return False
+        updated_at = data.get("updated_at")
+        self._snapshot = WhitelistSnapshot(
+            commands=commands,
+            users=users,
+            updated_at=updated_at if isinstance(updated_at, str) else None,
+            fetched_at=time.time(),
+        )
+        self._persist()
+        return True
+
+    def _alert_auth_problem(self, status_code: int) -> None:
+        """401/403: rate-limited operator alert. 401 means the sandbox JWT
+        expired — it is signed once at deploy time, so only a redeploy
+        fixes it; meanwhile the cached whitelist keeps serving."""
+        now = time.time()
+        if now - self._last_auth_alert < _AUTH_ALERT_INTERVAL_S:
+            return
+        self._last_auth_alert = now
+        logger.warning(
+            "control-plane whitelist auth rejected (HTTP %d) — keeping cached "
+            "whitelist. A 401 here usually means the sandbox JWT expired; it "
+            "is only refreshed by redeploying the sandbox.",
+            status_code,
+        )
+
     # ---- cache persistence ----------------------------------------------
 
     def _persist(self) -> None:
