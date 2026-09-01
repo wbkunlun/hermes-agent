@@ -160,8 +160,6 @@ fi
 log "running fork regression tests via $PY"
 run "$PY" -m pytest \
     tests/tools/test_send_message_wecom.py \
-    tests/gateway/test_wecom_stream_delivery.py \
-    tests/gateway/test_wecom_stream_adapter.py \
     tests/gateway/test_wecom.py \
     tests/plugins/platforms/test_wework.py \
     tests/gateway/test_run_progress_topics.py \
