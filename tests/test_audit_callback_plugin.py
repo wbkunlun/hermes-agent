@@ -56,12 +56,52 @@ class _FakeClient:
 class TestActivation:
     def test_noop_when_url_unset(self, plugin, monkeypatch):
         monkeypatch.delenv("HERMES_AUDIT_CALLBACK_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
         monkeypatch.setattr(plugin, "_classify_terminal", lambda c: ("dangerous", "x", ["r"]))
         assert plugin._on_post_tool_call(
             tool_name="terminal", args={"command": "rm -rf /"}, result="{}", status="ok"
         ) is None
         assert plugin._WORKER_STARTED is False
         assert plugin._QUEUE.empty()
+
+
+# ---------------------------------------------------------------------------
+# Intake URL resolution (explicit vs CONTROL_PLANE_URL-derived)
+# ---------------------------------------------------------------------------
+
+class TestIntakeUrl:
+    def test_explicit_callback_url_wins(self, plugin, monkeypatch):
+        monkeypatch.setenv("HERMES_AUDIT_CALLBACK_URL", "http://audit/api/v1/agent/audit")
+        monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example.com")
+        assert plugin._intake_url() == "http://audit/api/v1/agent/audit"
+
+    def test_derives_from_control_plane_url_when_explicit_absent(self, plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_AUDIT_CALLBACK_URL", raising=False)
+        monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example.com")
+        assert plugin._intake_url() == "https://control.example.com/api/v1/agent/audit"
+
+    def test_control_plane_url_trailing_slash_no_double_slash(self, plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_AUDIT_CALLBACK_URL", raising=False)
+        monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example.com/")
+        assert plugin._intake_url() == "https://control.example.com/api/v1/agent/audit"
+
+    def test_empty_when_neither_set(self, plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_AUDIT_CALLBACK_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+        assert plugin._intake_url() == ""
+
+    def test_derived_url_enables_reporting(self, plugin, monkeypatch):
+        """With only CONTROL_PLANE_URL set, a dangerous command still gets
+        reported to the derived endpoint."""
+        monkeypatch.delenv("HERMES_AUDIT_CALLBACK_URL", raising=False)
+        monkeypatch.setenv("CONTROL_PLANE_URL", "https://control.example.com")
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("dangerous", "recursive delete", ["destructive:rm_rf"]))
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "rm -rf /"}, result="{}", status="ok"
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "command"
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,9 @@ Reportable events
 * Optionally EVERY ``terminal`` command at ``info`` when
   ``HERMES_AUDIT_REPORT_ALL_COMMANDS=1``.
 
-Env knobs: ``HERMES_AUDIT_CALLBACK_URL`` (intake URL; empty = off),
+Env knobs: ``HERMES_AUDIT_CALLBACK_URL`` (explicit intake URL; if empty,
+derives ``<CONTROL_PLANE_URL>/api/v1/agent/audit`` — the same control-plane
+base address the whitelist fetch uses; neither set = off),
 ``CONTROL_PLANE_AUTH`` / ``HERMES_AUDIT_TOKEN``, ``HERMES_AUDIT_TIMEOUT``
 (default 3s), ``HERMES_AUDIT_REPORT_ALL_COMMANDS``, optional ``SANDBOX_ID``.
 """
@@ -91,7 +93,19 @@ _HTTP_WARNED = False  # plain-http intake URL warned once per process
 
 
 def _intake_url() -> str:
-    return os.environ.get("HERMES_AUDIT_CALLBACK_URL", "").strip()
+    """Audit intake endpoint.
+
+    Explicit ``HERMES_AUDIT_CALLBACK_URL`` wins; otherwise derive
+    ``<CONTROL_PLANE_URL>/api/v1/agent/audit`` from the control-plane base
+    address (same origin as the whitelist fetch). Empty = feature off.
+    """
+    explicit = os.environ.get("HERMES_AUDIT_CALLBACK_URL", "").strip()
+    if explicit:
+        return explicit
+    base = (os.environ.get("CONTROL_PLANE_URL") or "").strip().rstrip("/")
+    if base:
+        return f"{base}/api/v1/agent/audit"
+    return ""
 
 
 def _auth_header() -> str:
@@ -533,7 +547,7 @@ def _on_post_tool_call(
         if not _HTTP_WARNED and url.lower().startswith("http://"):
             _HTTP_WARNED = True
             logger.warning(
-                "audit-callback: HERMES_AUDIT_CALLBACK_URL is plain http:// — "
+                "audit-callback: audit intake URL is plain http:// — "
                 "audit payloads and the auth header travel unencrypted"
             )
 
