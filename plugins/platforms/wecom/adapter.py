@@ -1502,7 +1502,10 @@ class WeComAdapter(BasePlatformAdapter):
         from gateway.session import build_session_key
         return build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            group_sessions_per_user=str(
+                self.config.extra.get("group_sessions_per_user")
+                or os.getenv("WECOM_GROUP_SESSIONS_PER_USER", "false")
+            ).strip().lower() in {"true", "1", "yes", "on"},
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
@@ -1752,6 +1755,10 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _decode_base64(data: str) -> bytes:
         payload = data.split(",", 1)[-1].strip()
+        # WeCom strips trailing base64 padding in some callback fields
+        # (e.g. image.base64 is often 43 chars). b64decode requires the
+        # length to be a multiple of 4, so re-pad before decoding.
+        payload = payload + "=" * ((4 - len(payload) % 4) % 4)
         return base64.b64decode(payload)
 
     @staticmethod
@@ -2266,8 +2273,17 @@ class WeComAdapter(BasePlatformAdapter):
     ) -> Tuple[bytes, Dict[str, str]]:
         from gateway.platforms.base import _ssrf_redirect_guard
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
-
-        if not is_safe_url(url):
+        # Per-deployment SSRF opt-out: in Tencent Cloud VPCs, WeCom media
+        # hosts (*.cos.<region>.myqcloud.com) resolve to the 169.254.0.0/16
+        # link-local range for in-VPC free egress, which url_safety blocks
+        # unconditionally. These URLs come from the WeCom-signed webhook
+        # payload (not LLM-chosen), so operators may disable the check via
+        # platforms.wecom.extra.disable_url_safety or WECOM_DISABLE_URL_SAFETY.
+        _disable_url_safety = str(
+            self.config.extra.get("disable_url_safety")
+            or os.getenv("WECOM_DISABLE_URL_SAFETY", "")
+        ).strip().lower() in {"true", "1", "yes", "on"}
+        if not _disable_url_safety and not is_safe_url(url):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
 
         if not HTTPX_AVAILABLE:
