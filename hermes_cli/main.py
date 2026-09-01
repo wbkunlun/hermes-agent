@@ -102,6 +102,34 @@ try:
 except Exception:
     pass
 
+# Startup-liveness watchdog (OOF-298): for gateway runs, arm BEFORE the heavy
+# module-level import graph below — an import-time deadlock (native-extension
+# init, contended import lock) is exactly the "wedged before the event loop,
+# no logs, live PID" class this watchdog exists for. ``hermes_startup_watchdog``
+# is stdlib-only, so importing it here cannot itself wedge on application
+# code. The match requires the ADJACENT token pair ``gateway run`` (the
+# subcommand shape, wherever global flags like ``-p <profile>`` put it) so
+# unrelated commands that merely mention both words in different arguments
+# never arm a 300s hard-exit timer, while flag-carrying invocations still
+# do — under-arming recreates OOF-298. Foreground `hermes gateway run`
+# still arms — a pre-loop wedge is just as dead without a supervisor, and
+# the stack dump plus exit beats a silent hang; GatewayRunner disarms once
+# the event loop is confirmed live.
+def _argv_is_gateway_run(argv: list) -> bool:
+    return any(
+        a == "gateway" and b == "run" for a, b in zip(argv, argv[1:])
+    )
+
+
+if _argv_is_gateway_run(sys.argv[1:]):
+    try:
+        from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
+
+        _arm_sw()
+        del _arm_sw
+    except Exception:
+        pass
+
 
 def _exit_after_oneshot(rc: object) -> None:
     """Exit one-shot mode without letting late native finalizers change rc.
@@ -11448,14 +11476,14 @@ def cmd_profile(args):
             sys.exit(1)
 
     elif action == "export":
-        from hermes_cli.profiles import export_profile
+        from hermes_cli.profiles import export_profile, get_profile_export_path
 
         name = args.profile_name
-        output = args.output or f"{name}.tar.gz"
         try:
+            output = args.output or str(get_profile_export_path(name))
             result_path = export_profile(name, output)
             print(f"✓ Exported '{name}' to {result_path}")
-        except (ValueError, FileNotFoundError) as e:
+        except (ValueError, FileNotFoundError, OSError) as e:
             print(f"Error: {e}")
             sys.exit(1)
 

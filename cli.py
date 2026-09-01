@@ -5833,6 +5833,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 session_id=self.session_id,
                 surface=surface,
                 config=self.config,
+                # Writer identity for re-entrancy (#94595): a re-claim by this
+                # same process for this same session replaces its own entry
+                # instead of fencing itself out.
+                metadata={"live_session_id": str(self.session_id)},
             )
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
@@ -21700,6 +21704,13 @@ def main(
     # Handle gateway mode (messaging + cron)
     if gateway:
         import asyncio
+        # Startup-liveness watchdog (OOF-298): this legacy entry point must
+        # be covered too — arm before importing the gateway graph.
+        try:
+            from hermes_startup_watchdog import arm_startup_watchdog
+            arm_startup_watchdog()
+        except Exception:
+            pass
         from gateway.run import start_gateway
         print("Starting Hermes Gateway (messaging platforms)...")
         asyncio.run(start_gateway())
