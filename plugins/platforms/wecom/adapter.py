@@ -2289,12 +2289,27 @@ class WeComAdapter(BasePlatformAdapter):
         if not HTTPX_AVAILABLE:
             raise RuntimeError("httpx is required for WeCom media download")
 
-        client = self._http_client or create_ssrf_safe_async_client(
-            timeout=30.0,
-            follow_redirects=True,
-            event_hooks={"response": [_ssrf_redirect_guard]},
-        )
-        created_client = client is not self._http_client
+        # create_ssrf_safe_async_client installs a connect-time SSRF guard that
+        # _disable_url_safety cannot turn off: it validates the resolved IP at
+        # TCP connect, before any allow-list, so it blocks COS media hosts
+        # (169.254.x.x / 198.18.x.x in Tencent VPCs) regardless of the opt-out.
+        # When the operator has disabled URL safety, use a plain httpx client
+        # (fork9 behavior) while keeping the redirect-only guard as defense in
+        # depth — COS downloads do not redirect, so it never fires for them.
+        if _disable_url_safety:
+            client = httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                event_hooks={"response": [_ssrf_redirect_guard]},
+            )
+            created_client = True
+        else:
+            client = self._http_client or create_ssrf_safe_async_client(
+                timeout=30.0,
+                follow_redirects=True,
+                event_hooks={"response": [_ssrf_redirect_guard]},
+            )
+            created_client = client is not self._http_client
         try:
             async with client.stream(
                 "GET",
