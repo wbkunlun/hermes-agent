@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextlib
 import contextvars
 import fnmatch
@@ -5640,6 +5641,277 @@ def check_all_command_guards(command: str, env_type: str,
             "user_approved": True, "description": combined_desc}
 
 
+# ---------------------------------------------------------------------------
+# Fork (2026-09-02): execute_code ↔ command-whitelist parity
+#
+# execute_code runs arbitrary local Python, so file/process APIs
+# (os.remove, subprocess.run, …) bypass the terminal command whitelist
+# entirely — an agent blocked on ``rm`` could just call ``os.remove()``.
+# When a whitelist is active (control-plane dynamic whitelist or
+# HERMES_COMMAND_ALLOWLIST / approvals.allow), map the script's dangerous
+# operations to the shell commands they bypass and run those through the
+# SAME gates as terminal() — before the yolo bypass, matching the terminal
+# allowlist contract ("a pinned allowlist outranks yolo").
+#
+# Documented limitation: the scan is static (AST). Direct calls with
+# import-alias awareness are caught; deliberately obfuscated dispatch
+# (getattr strings, exec of built strings) is not — the audit plugin's
+# process-spawn indicators and the whole-script approval remain the
+# backstops there. The threat model is an agent switching channels, not a
+# hostile adversary.
+# ---------------------------------------------------------------------------
+
+class _ECUnresolved:
+    """Sentinel for a dangerous call whose target cannot be resolved statically."""
+
+    def __init__(self, description: str):
+        self.description = description
+
+
+_EC_UNRESOLVED_ARGS = "dynamic arguments"
+
+
+def _ec_literal(node) -> object:
+    """Best-effort static evaluation of an AST expression."""
+    try:
+        return ast.literal_eval(node)
+    except Exception:
+        return None
+
+
+def _ec_cmdline_from_value(value: object) -> "Optional[str]":
+    """Render a subprocess/os.system first-argument value as a shell string."""
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, (list, tuple)) and value:
+        parts = []
+        for item in value:
+            if not isinstance(item, str) or not item:
+                return None
+            parts.append(shlex.quote(item))
+        return " ".join(parts)
+    return None
+
+
+class _DangerousOpCollector(ast.NodeVisitor):
+    """Collect file/process operations in a script, mapped to shell commands."""
+
+    # os.<attr> → shell argv builder (first positional arg as the operand)
+    _OS_FILE_OPS = {
+        "remove": "rm",
+        "unlink": "rm",
+        "rmdir": "rmdir",
+        "removedirs": "rmdir",
+    }
+    _OS_SHELL_OPS = {"system", "popen", "popen2", "popen3", "popen4"}
+    _OS_EXEC_OPS_PREFIX = ("exec", "spawn", "posix_spawn")
+    _SUBPROCESS_FNS = {
+        "run", "call", "check_call", "check_output", "Popen",
+        "getoutput", "getstatusoutput",
+    }
+    # method names that delete files on any receiver (pathlib & friends)
+    _METHOD_FILE_OPS = {"unlink": "rm", "rmdir": "rmdir"}
+
+    def __init__(self) -> None:
+        self.commands: list = []
+        self.unresolved: list = []
+        self._os_aliases = {"os"}
+        self._subprocess_aliases = {"subprocess"}
+        self._shutil_aliases = {"shutil"}
+        self._from_os: set = set()
+        self._from_subprocess: set = set()
+        self._wildcard_modules: set = set()
+
+    # -- import bookkeeping -------------------------------------------------
+    def visit_Import(self, node) -> None:
+        for alias in node.names:
+            name = alias.asname or alias.name
+            if alias.name == "os":
+                self._os_aliases.add(name)
+            elif alias.name == "subprocess":
+                self._subprocess_aliases.add(name)
+            elif alias.name == "shutil":
+                self._shutil_aliases.add(name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node) -> None:
+        module = node.module or ""
+        if module == "os":
+            for alias in node.names:
+                if alias.name == "*":
+                    self._wildcard_modules.add("os")
+                else:
+                    self._from_os.add(alias.asname or alias.name)
+        elif module == "subprocess":
+            for alias in node.names:
+                if alias.name == "*":
+                    self._wildcard_modules.add("subprocess")
+                else:
+                    self._from_subprocess.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    # -- call matching -------------------------------------------------------
+    def visit_Call(self, node) -> None:
+        func = node.func
+
+        if isinstance(func, ast.Attribute):
+            receiver = func.value
+            attr = func.attr
+            receiver_name = receiver.id if isinstance(receiver, ast.Name) else None
+
+            # os.remove(...) / shutil.rmtree(...) / subprocess.run(...)
+            if receiver_name in self._os_aliases or (
+                "os" in self._wildcard_modules and receiver_name
+            ):
+                self._handle_os_call(node, attr)
+            elif receiver_name in self._shutil_aliases:
+                if attr == "rmtree":
+                    self._map_file_op(node, "rm", "-r")
+            elif receiver_name in self._subprocess_aliases or (
+                "subprocess" in self._wildcard_modules and receiver_name
+            ):
+                if attr in self._SUBPROCESS_FNS:
+                    self._handle_process_call(node, f"subprocess.{attr}")
+            # pathlib-style method calls: any receiver .unlink()/.rmdir()
+            elif attr in self._METHOD_FILE_OPS:
+                shell = self._METHOD_FILE_OPS[attr]
+                self._map_file_op(node, shell)
+        elif isinstance(func, ast.Name):
+            name = func.id
+            # from os import remove / system / …
+            if name in self._from_os:
+                self._handle_os_call(node, name)
+            elif name in self._from_subprocess:
+                if name in self._SUBPROCESS_FNS:
+                    self._handle_process_call(node, f"subprocess.{name}")
+
+        self.generic_visit(node)
+
+    # -- mapping helpers -----------------------------------------------------
+    def _map_file_op(self, node, *argv_prefix: str) -> None:
+        """Map a file-deletion call to ``<shell> [operand]``."""
+        operand = None
+        if node.args:
+            value = _ec_literal(node.args[0])
+            if isinstance(value, str) and value:
+                operand = value
+        if operand is not None:
+            self.commands.append(" ".join([*argv_prefix, shlex.quote(operand)]))
+        else:
+            self.commands.append(" ".join(argv_prefix))
+
+    def _handle_os_call(self, node, attr: str) -> None:
+        if attr in self._OS_FILE_OPS:
+            self._map_file_op(node, self._OS_FILE_OPS[attr])
+        elif attr in self._OS_SHELL_OPS:
+            self._handle_process_call(node, f"os.{attr}")
+        elif attr.startswith(self._OS_EXEC_OPS_PREFIX):
+            self._handle_process_call(node, f"os.{attr}")
+
+    def _handle_process_call(self, node, description: str) -> None:
+        """Map a process-spawning call to the shell command it would run."""
+        for arg in node.args:
+            value = _ec_literal(arg)
+            if isinstance(value, str):
+                cmdline = _ec_cmdline_from_value(value)
+                if cmdline:
+                    self.commands.append(cmdline)
+                    return
+                break
+            if isinstance(value, (list, tuple)):
+                cmdline = _ec_cmdline_from_value(value)
+                if cmdline:
+                    self.commands.append(cmdline)
+                    return
+                break
+            break
+        # Could not resolve the command statically — report it so the gate
+        # can fail closed while a whitelist is active.
+        self.unresolved.append(f"{description}({len(node.args)} arg(s), dynamic)")
+
+
+def _execute_code_mapped_commands(code: str) -> tuple:
+    """AST-scan *code* for file/process operations that bypass terminal().
+
+    Returns ``(commands, unresolved)``: *commands* are best-effort shell
+    equivalents (static constants only), *unresolved* are descriptions of
+    dangerous calls whose target could not be resolved statically.
+    """
+    try:
+        tree = ast.parse(code or "")
+    except Exception:
+        return [], []
+    collector = _DangerousOpCollector()
+    collector.visit(tree)
+    return collector.commands, collector.unresolved
+
+
+def _command_whitelist_active() -> bool:
+    """True when either whitelist (control-plane dynamic or static) is on."""
+    try:
+        from tools.control_plane_whitelist import get_platform_whitelist
+
+        if get_platform_whitelist() is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        return _load_command_allowlist_globs() is not None
+    except Exception:
+        return False
+
+
+def _execute_code_whitelist_parity(code: str) -> Optional[dict]:
+    """Gate execute_code scripts against the terminal command whitelist.
+
+    Returns ``None`` when nothing applies (no whitelist active, or the script
+    has no mappable dangerous operations); otherwise a block-result dict in
+    the ``check_execute_code_guard`` contract.
+    """
+    commands, unresolved = _execute_code_mapped_commands(code)
+    if not commands and not unresolved:
+        return None
+    if not _command_whitelist_active():
+        return None
+
+    denied = [cmd for cmd in commands if _match_user_allow_rule(cmd) is False]
+
+    if not denied and not unresolved:
+        return None
+
+    parts = []
+    if denied:
+        parts.append(
+            "mapped shell command(s) not whitelisted: "
+            + "; ".join(repr(c) for c in denied)
+        )
+    if unresolved:
+        parts.append(
+            "process-spawning call(s) with dynamic targets that cannot be "
+            "checked against the whitelist: "
+            + "; ".join(unresolved)
+        )
+    message = (
+        "BLOCKED: execute_code runs local Python whose file/process operations "
+        "bypass the terminal command whitelist, so they are held to the same "
+        "allowlist as terminal commands (" + "; ".join(parts) + "). "
+        "Rewrite the script to avoid the blocked operation(s), or ask the "
+        "operator to allowlist the mapped command(s)."
+    )
+    return {
+        "approved": False,
+        "message": message,
+        "pattern_key": "execute_code_whitelist_parity",
+        "description": (
+            "execute_code script performs file/process operations that "
+            "bypass terminal command approval; mapped shell equivalents are "
+            "checked against the active command whitelist."
+        ),
+        "outcome": "blocked",
+        "user_consent": False,
+    }
+
+
 def check_execute_code_guard(code: str, env_type: str,
                              has_host_access: bool = False) -> dict:
     """Approve an execute_code script before its child process is spawned.
@@ -5674,6 +5946,20 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    # Fork (2026-09-02): command-whitelist parity — map the script's
+    # file/process operations (os.remove, subprocess.run, …) to the shell
+    # commands they bypass and run them through the same whitelist gates as
+    # terminal(), BEFORE the yolo bypass, matching the terminal allowlist
+    # contract ("a pinned allowlist outranks yolo"). No-op when no whitelist
+    # is active or the script has no mappable operations.
+    _parity = _execute_code_whitelist_parity(code)
+    if _parity is not None:
+        logger.warning(
+            "User allowlist blocked execute_code script (mapped operations "
+            "not whitelisted): %s", (code or "")[:200],
+        )
+        return _parity
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
