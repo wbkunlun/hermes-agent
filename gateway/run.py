@@ -5880,6 +5880,14 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # WeCom streams by default (native stream frames via
+        # send_stream_frame) even when global streaming is off — wehermes
+        # deployments initialize config.yaml from cli-config.yaml.example,
+        # which ships streaming.enabled=false, and streaming is WeCom's
+        # primary reply UX. An explicit display.platforms.wecom.streaming
+        # override still wins.
+        if _plat_streaming is None and not _streaming_enabled and ctx.source.platform == Platform.WECOM:
+            _streaming_enabled = True
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -29820,6 +29828,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # WeCom streams by default (native stream frames) even when global
+        # streaming is off — same rationale as the matching gate in the
+        # in-process agent path above. Explicit display.platforms.wecom.streaming
+        # override still wins.
+        if _plat_streaming is None and not _streaming_enabled and source.platform == Platform.WECOM:
+            _streaming_enabled = True
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
