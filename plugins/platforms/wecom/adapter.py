@@ -61,6 +61,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from plugins.platforms.wecom.stream_delivery import WeComStreamDelivery
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -310,6 +311,11 @@ class WeComAdapter(BasePlatformAdapter):
     # the gateway streaming consumer treats as a transport that bypasses the
     # edit-based path. See ``send_stream_frame`` and ``supports_native_streaming``.
     SUPPORTS_NATIVE_STREAMING = True
+    # Fork: clawrelay-style single-bubble delivery (see stream_delivery.py).
+    # gateway/run.py branches on this class attribute to route WeCom
+    # streaming through WeComStreamDelivery (think-block UX, 300ms throttle,
+    # running indicator) instead of the generic GatewayStreamConsumer.
+    WECOM_STREAM_DELIVERY = WeComStreamDelivery
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
     # Threshold for detecting WeCom client-side message splits.
     # When a chunk is near the 4000-char limit, a continuation is almost certain.

@@ -5896,12 +5896,45 @@ class TurnRunner:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._runner._adapter_for_source(ctx.source)
                 if _adapter:
-                    _consumer_cfg, _pause_typing_before_finalize = (
-                        self._runner._build_stream_consumer_config(
-                            ctx.source, _scfg, _adapter,
-                            on_missing_cursor="raise",
+                    # Fork: WeCom routes streaming through the clawrelay-style
+                    # single-bubble delivery (think-block UX, 300ms throttle,
+                    # running indicator — see
+                    # plugins/platforms/wecom/stream_delivery.py) instead of
+                    # GatewayStreamConsumer. Other platforms take the upstream
+                    # consumer construction below.
+                    _wecom_delivery_cls = getattr(_adapter, "WECOM_STREAM_DELIVERY", None)
+                    if _wecom_delivery_cls is not None:
+                        _cr_base = os.getenv("WECOM_CHAT_RECORD_BASE_URL", "").strip()
+                        _stream_consumer = _wecom_delivery_cls(
+                            adapter=_adapter,
+                            chat_id=ctx.source.chat_id,
+                            chat_record_url=(
+                                f"{_cr_base.rstrip('/')}/{ctx.session_id}"
+                                if _cr_base and ctx.session_id
+                                else ""
+                            ),
                         )
-                    )
+                    else:
+                        _consumer_cfg, _pause_typing_before_finalize = (
+                            self._runner._build_stream_consumer_config(
+                                ctx.source, _scfg, _adapter,
+                                on_missing_cursor="raise",
+                            )
+                        )
+                        _stream_consumer = GatewayStreamConsumer(
+                            adapter=_adapter,
+                            chat_id=ctx.source.chat_id,
+                            config=_consumer_cfg,
+                            metadata=ctx._status_thread_metadata,
+                            on_new_message=(
+                                (lambda: ctx.progress_queue.put(("__reset__",)))
+                                if ctx.progress_queue is not None
+                                else None
+                            ),
+                            on_before_finalize=_pause_typing_before_finalize,
+                            initial_reply_to_id=ctx.event_message_id,
+                            run_still_current=ctx._run_still_current,
+                        )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
                             if ctx._run_still_current():
@@ -29842,12 +29875,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._adapter_for_source(source)
                 if _adapter:
-                    _consumer_cfg, _pause_typing_before_finalize = (
-                        self._build_stream_consumer_config(
-                            source, _scfg, _adapter,
-                            on_missing_cursor="fallback",
+                    # Fork: WeCom routes streaming through the clawrelay-style
+                    # single-bubble delivery (see
+                    # plugins/platforms/wecom/stream_delivery.py); other
+                    # platforms take the upstream consumer construction.
+                    _wecom_delivery_cls = getattr(_adapter, "WECOM_STREAM_DELIVERY", None)
+                    if _wecom_delivery_cls is not None:
+                        _cr_base = os.getenv("WECOM_CHAT_RECORD_BASE_URL", "").strip()
+                        _stream_consumer = _wecom_delivery_cls(
+                            adapter=_adapter,
+                            chat_id=source.chat_id,
+                            chat_record_url=(
+                                f"{_cr_base.rstrip('/')}/{session_id}"
+                                if _cr_base and session_id
+                                else ""
+                            ),
                         )
-                    )
+                    else:
+                        _consumer_cfg, _pause_typing_before_finalize = (
+                            self._build_stream_consumer_config(
+                                source, _scfg, _adapter,
+                                on_missing_cursor="fallback",
+                            )
+                        )
+                        _stream_consumer = GatewayStreamConsumer(
+                            adapter=_adapter,
+                            chat_id=source.chat_id,
+                            config=_consumer_cfg,
+                            metadata=_thread_metadata,
+                            on_before_finalize=_pause_typing_before_finalize,
+                            initial_reply_to_id=event_message_id,
+                            run_still_current=_run_still_current,
+                        )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
 
