@@ -500,6 +500,63 @@ class TestSkillViewReporting:
         assert plugin._QUEUE.empty()
 
 
+class TestFileWriteReporting:
+    def test_write_file_regular_reported_at_info(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": "/opt/data/app/main.py", "content": "print('hi')\n"},
+            result=json.dumps({"success": True}),
+            status="ok", duration_ms=15, tool_call_id="tc-w1",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "command"
+        assert body["action"] == "file.write"
+        assert body["risk_level"] == "info"
+        assert body["payload"]["path"] == "/opt/data/app/main.py"
+        assert body["payload"]["written_bytes"] == len("print('hi')\n")
+        assert body["payload"]["content_sha256"]
+        assert body["payload"]["empty_write"] is False
+
+    def test_write_file_empty_content_escalates_to_medium(self, plugin):
+        """Blanking a file via write_file('') is the truncation channel an
+        agent reaches for when rm is whitelisted out — highlight it."""
+        plugin._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": "/opt/data/credentials.env", "content": ""},
+            result=json.dumps({"success": True}),
+            status="ok",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["risk_level"] == "medium"
+        assert body["risk_reason"] == "empty write to file (potential truncation)"
+        assert body["payload"]["empty_write"] is True
+        assert body["payload"]["written_bytes"] == 0
+
+    def test_write_file_whitespace_only_is_medium(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": "/tmp/x", "content": "   \n\t"},
+            result="{}", status="ok",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["risk_level"] == "medium"
+        assert body["payload"]["empty_write"] is True
+
+    def test_patch_reported_at_info_not_flagged_empty(self, plugin):
+        """patch args carry a diff, not full content — must not be mistaken
+        for a blank write."""
+        plugin._on_post_tool_call(
+            tool_name="patch",
+            args={"path": "/opt/data/app/main.py", "diff": "@@ -1 +1 @@\n-x\n+y"},
+            result="{}", status="ok",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["action"] == "file.write"
+        assert body["risk_level"] == "info"
+        assert body["payload"]["empty_write"] is False
+        assert body["payload"]["tool"] == "patch"
+
+
 class TestBlockedAttemptReporting:
     def test_blocked_low_severity_command_forced_report(self, plugin, monkeypatch):
         """A non-dangerous command blocked by the whitelist is an

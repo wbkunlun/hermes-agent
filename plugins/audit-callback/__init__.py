@@ -498,6 +498,65 @@ def _build_skill_view_body(
     return body
 
 
+def _build_file_write_body(
+    tool_name: str,
+    args: Any,
+    result: Any,
+    status: str,
+    duration_ms: int,
+    tool_call_id: str,
+    trace_id: str,
+) -> Dict[str, Any]:
+    """write_file/patch mutate file content — the only remaining data-
+    destructive channel when deletion is whitelisted out (an agent blocked
+    on ``rm`` can still blank/overwrite files). Reported on every call
+    (fork, 2026-09-03): empty/whitespace-only writes escalate to medium
+    (truncation candidates); regular writes report at info."""
+    summary_args = args if isinstance(args, dict) else {}
+    path = str(summary_args.get("path") or "")
+    content = summary_args.get("content")
+    content_str = content if isinstance(content, str) else ""
+    # Only write_file carries the full new content — a blank write there is a
+    # truncation candidate. patch args are a diff (no "content" field); flag
+    # it empty only when the content field is genuinely present-but-blank.
+    is_empty = (
+        tool_name == "write_file" and not content_str.strip()
+    ) or (
+        tool_name != "write_file" and isinstance(content, str) and not content_str.strip()
+    )
+    content_sha, _preview = _sha_and_preview(content_str, limit=0)
+    size = len(content_str.encode("utf-8", errors="ignore"))
+    exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
+    decision, result_enum = _decide(status, result, exit_code, blocked)
+
+    payload: Dict[str, Any] = {
+        "summary": f"{tool_name} {path}".strip(),
+        "path": path,
+        "tool": tool_name,
+        "written_bytes": size,
+        "content_sha256": content_sha,
+        "empty_write": is_empty,
+        "caller_type": "agent",
+    }
+
+    body = _common_fields(tool_call_id, trace_id)
+    body.update({
+        "event_type": "command",
+        "action": "file.write",
+        "risk_level": "medium" if is_empty else "info",
+        "risk_reason": (
+            "empty write to file (potential truncation)" if is_empty
+            else "file content mutation (write/edit)"
+        ),
+        "decision": decision,
+        "result": result_enum,
+        "exit_code": exit_code,
+        "duration_ms": int(duration_ms or 0),
+        "payload": payload,
+    })
+    return body
+
+
 def _build_code_body(
     code: str,
     result: Any,
@@ -633,6 +692,11 @@ def _on_post_tool_call(
         elif tool_name == "skill_view":
             body = _build_skill_view_body(
                 args, result, status, duration_ms, tool_call_id, trace_id,
+            )
+        elif tool_name in ("write_file", "patch"):
+            body = _build_file_write_body(
+                tool_name, args, result, status, duration_ms,
+                tool_call_id, trace_id,
             )
         elif tool_name == "execute_code" and isinstance(args, dict):
             body = _build_code_body(
