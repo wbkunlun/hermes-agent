@@ -312,3 +312,224 @@ def _flush_at_exit() -> None:
     if w is not None and w.is_alive():
         w.join(timeout=2.0)
     _drain_now()
+
+
+# ---------------------------------------------------------------------------
+# Hook handlers — observer only, never raise into the agent loop
+# ---------------------------------------------------------------------------
+
+def _guard(fn):
+    """Wrap a handler: disabled -> no-op; any exception -> debug log."""
+
+    def wrapped(**kw: Any) -> None:
+        try:
+            if not _enabled():
+                return
+            fn(**kw)
+        except Exception as exc:  # noqa: BLE001 — never break the agent loop
+            logger.debug("usage-trace: %s handler error (%s)", fn.__name__, exc)
+
+    return wrapped
+
+
+def _base(
+    event: str,
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+) -> Dict[str, Any]:
+    ev: Dict[str, Any] = {
+        "ts": round(time.time(), 3),
+        "event": event,
+        "schema": _SCHEMA,
+        "session_id": session_id or "",
+    }
+    if task_id:
+        ev["task_id"] = task_id
+    if turn_id:
+        ev["turn_id"] = turn_id
+    if api_request_id:
+        ev["api_request_id"] = api_request_id
+    return ev
+
+
+def _assistant_text(msg: Any) -> str:
+    """Extract printable text from an assistant message object."""
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        return "\n".join(x for x in parts if x)
+    return ""
+
+
+def _on_post_api_request_inner(**kw: Any) -> None:
+    usage = kw.get("usage") if isinstance(kw.get("usage"), dict) else {}
+    model = kw.get("response_model") or kw.get("model") or ""
+    link = dict(
+        session_id=str(kw.get("session_id") or ""),
+        task_id=str(kw.get("task_id") or ""),
+        turn_id=str(kw.get("turn_id") or ""),
+        api_request_id=str(kw.get("api_request_id") or ""),
+    )
+    ev = _base("api_request", **link)
+    ev.update({
+        "model": model,
+        "provider": kw.get("provider") or "",
+        "api_mode": kw.get("api_mode") or "",
+        "api_call_count": kw.get("api_call_count", 0),
+        "duration_ms": round(float(kw.get("api_duration") or 0.0) * 1000, 1),
+        "finish_reason": kw.get("finish_reason") or "",
+        "usage": {k: usage.get(k, 0) for k in _USAGE_KEYS},
+        "assistant_content_chars": kw.get("assistant_content_chars", 0),
+        "assistant_tool_call_count": kw.get("assistant_tool_call_count", 0),
+    })
+    moa = kw.get("moa_references")
+    if isinstance(moa, list) and moa:
+        ev["moa"] = [
+            {
+                "label": r.get("label"),
+                "model": r.get("model"),
+                "output_tokens": (r.get("usage") or {}).get("output_tokens"),
+                "cost_usd": r.get("cost_usd"),
+            }
+            for r in moa
+            if isinstance(r, dict)
+        ]
+    _ensure_worker()
+    _enqueue(ev)
+
+    text = _assistant_text(kw.get("assistant_message"))
+    if text:
+        rev = _base("assistant_response", **link)
+        rev["model"] = model
+        rev.update(_capture_text(text))
+        _enqueue(rev)
+
+
+def _on_api_request_error_inner(**kw: Any) -> None:
+    ev = _base(
+        "api_error",
+        session_id=str(kw.get("session_id") or ""),
+        task_id=str(kw.get("task_id") or ""),
+        turn_id=str(kw.get("turn_id") or ""),
+        api_request_id=str(kw.get("api_request_id") or ""),
+    )
+    ev.update({
+        "model": kw.get("response_model") or kw.get("model") or "",
+        "provider": kw.get("provider") or "",
+        "duration_ms": round(float(kw.get("api_duration") or 0.0) * 1000, 1),
+        "status_code": kw.get("status_code"),
+        "retry_count": kw.get("retry_count"),
+        "retryable": kw.get("retryable"),
+    })
+    if kw.get("error") is not None:
+        ev["error"] = _capture_text(kw.get("error"))
+    _ensure_worker()
+    _enqueue(ev)
+
+
+def _on_pre_llm_call_inner(**kw: Any) -> None:
+    if kw.get("turn_type") != "user":
+        return
+    turn_id = str(kw.get("turn_id") or "")
+    if not turn_id:
+        return  # cannot dedup safely
+    with _seen_lock:
+        if turn_id in _seen_user_turns:
+            return
+        _seen_user_turns.add(turn_id)
+        if len(_seen_user_turns) > _DEDUP_SET_MAX:
+            _seen_user_turns.clear()  # bounded; worst case a duplicate line
+    ev = _base(
+        "user_prompt",
+        session_id=str(kw.get("session_id") or ""),
+        task_id=str(kw.get("task_id") or ""),
+        turn_id=turn_id,
+    )
+    ev["platform"] = kw.get("platform") or ""
+    ev.update(_capture_text(kw.get("user_message")))
+    _ensure_worker()
+    _enqueue(ev)
+
+
+def _on_post_tool_call_inner(**kw: Any) -> None:
+    result = kw.get("result")
+    status = str(kw.get("status") or "")
+    exit_code = None
+    if isinstance(result, dict):
+        exit_code = result.get("exit_code", result.get("returncode"))
+    ev = _base(
+        "tool_call",
+        session_id=str(kw.get("session_id") or ""),
+        task_id=str(kw.get("task_id") or ""),
+        turn_id=str(kw.get("turn_id") or ""),
+        api_request_id=str(kw.get("api_request_id") or ""),
+    )
+    ev.update({
+        "tool_name": kw.get("tool_name") or "",
+        "tool_call_id": kw.get("tool_call_id") or "",
+        "duration_ms": kw.get("duration_ms", 0),
+        "status": status,
+        "exit_code": exit_code,
+        "decision": "blocked" if status == "blocked" else "",
+        "success": status != "blocked" and kw.get("error_type") is None,
+        "args": _capture_obj(kw.get("args")),
+        "result": _capture_obj(result),
+    })
+    _ensure_worker()
+    _enqueue(ev)
+
+
+def _on_post_approval_response_inner(**kw: Any) -> None:
+    # approval hooks carry session_key (not session_id); route on it verbatim —
+    # _session_file sanitizes unsafe chars either way.
+    ev = _base(
+        "approval",
+        session_id=str(kw.get("session_key") or kw.get("session_id") or ""),
+    )
+    ev.update({
+        "surface": kw.get("surface") or "",
+        "choice": kw.get("choice") or "",
+        "pattern_key": kw.get("pattern_key") or "",
+        "coalesced": bool(kw.get("coalesced")),
+    })
+    # text_key="command" so the field reads naturally in the approval event
+    ev.update(_capture_text(kw.get("command"), text_key="command"))
+    _ensure_worker()
+    _enqueue(ev)
+
+
+def _on_session_finalize_inner(**kw: Any) -> None:
+    ev = _base("session_end", session_id=str(kw.get("session_id") or ""))
+    ev["reason"] = kw.get("reason") or ""
+    _ensure_worker()
+    _enqueue(ev)
+
+
+_on_post_api_request = _guard(_on_post_api_request_inner)
+_on_api_request_error = _guard(_on_api_request_error_inner)
+_on_pre_llm_call = _guard(_on_pre_llm_call_inner)
+_on_post_tool_call = _guard(_on_post_tool_call_inner)
+_on_post_approval_response = _guard(_on_post_approval_response_inner)
+_on_session_finalize = _guard(_on_session_finalize_inner)
+
+
+def register(ctx) -> None:
+    if not _enabled():
+        logger.info("usage-trace: disabled via HERMES_USAGE_TRACE")
+        return
+    ctx.register_hook("post_api_request", _on_post_api_request)
+    ctx.register_hook("api_request_error", _on_api_request_error)
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("post_approval_response", _on_post_approval_response)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
+    ctx.register_hook("on_session_end", _on_session_finalize)

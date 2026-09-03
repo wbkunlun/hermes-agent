@@ -199,3 +199,158 @@ class TestWriter:
         plugin._prune_old_files(time.time())
         assert not old.exists()
         assert fresh.exists()
+
+
+# ---------------------------------------------------------------------------
+# Hook handlers (Task 3)
+# ---------------------------------------------------------------------------
+
+class _Msg:
+    """Minimal assistant-message stand-in (str or block-list content)."""
+
+    def __init__(self, content):
+        self.content = content
+
+
+class TestApiRequest:
+    def test_event_shape_and_usage_passthrough(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "metadata")
+        plugin._on_post_api_request(
+            task_id="t1", session_id="s1", turn_id="turn1",
+            api_request_id="req1", model="gpt-x", response_model="glm-5.3",
+            provider="openai", api_mode="chat", api_call_count=2,
+            api_duration=1.5, finish_reason="tool_calls",
+            usage={"input_tokens": 10, "output_tokens": 5,
+                   "cache_read_tokens": 2, "cache_write_tokens": 1,
+                   "reasoning_tokens": 0, "prompt_tokens": 13,
+                   "total_tokens": 18, "request_count": 1},
+            assistant_message=_Msg("thinking..."),
+            assistant_content_chars=12, assistant_tool_call_count=1,
+            moa_references=[{"label": "adv", "model": "m2",
+                             "usage": {"output_tokens": 3}, "cost_usd": 0.01}],
+        )
+        plugin._drain_now()
+        evs = _lines(plugin, tmp_path, "s1")
+        api = [e for e in evs if e["event"] == "api_request"][0]
+        assert api["model"] == "glm-5.3"          # response_model wins
+        assert api["duration_ms"] == 1500.0
+        assert api["usage"]["input_tokens"] == 10
+        assert api["usage"]["total_tokens"] == 18
+        assert api["turn_id"] == "turn1" and api["api_request_id"] == "req1"
+        assert api["moa"] == [{"label": "adv", "model": "m2",
+                               "output_tokens": 3, "cost_usd": 0.01}]
+
+    def test_assistant_response_emitted_with_same_linkage(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "full")
+        plugin._on_post_api_request(
+            session_id="s1", turn_id="turn1", api_request_id="req1",
+            model="gpt-x", api_duration=0.1, usage={},
+            assistant_message=_Msg("final answer"), assistant_content_chars=12,
+        )
+        plugin._drain_now()
+        resp = [e for e in _lines(plugin, tmp_path, "s1")
+                if e["event"] == "assistant_response"][0]
+        assert resp["text"] == "final answer"
+        assert resp["turn_id"] == "turn1" and resp["api_request_id"] == "req1"
+
+
+class TestApiError:
+    def test_event_shape(self, plugin, tmp_path):
+        plugin._on_api_request_error(
+            session_id="s1", turn_id="turn1", api_request_id="req1",
+            provider="openai", model="gpt-x", api_duration=0.2,
+            status_code=429, retry_count=1, retryable=True, error="rate limited",
+        )
+        plugin._drain_now()
+        ev = _lines(plugin, tmp_path, "s1")[0]
+        assert ev["event"] == "api_error"
+        assert ev["status_code"] == 429 and ev["retryable"] is True
+        assert ev["duration_ms"] == 200.0
+
+
+class TestUserPrompt:
+    def test_dedup_per_turn(self, plugin, tmp_path):
+        for _ in range(3):
+            plugin._on_pre_llm_call(
+                session_id="s1", turn_id="turn1", turn_type="user",
+                platform="wecom", user_message="hi",
+            )
+        plugin._on_pre_llm_call(
+            session_id="s1", turn_id="turn2", turn_type="user",
+            platform="wecom", user_message="again",
+        )
+        plugin._drain_now()
+        evs = [e for e in _lines(plugin, tmp_path, "s1")
+               if e["event"] == "user_prompt"]
+        assert [e["turn_id"] for e in evs] == ["turn1", "turn2"]
+
+    def test_non_user_turns_ignored(self, plugin, tmp_path):
+        plugin._on_pre_llm_call(
+            session_id="s1", turn_id="t", turn_type="internal",
+            user_message="x",
+        )
+        plugin._drain_now()
+        assert not (tmp_path / "traces" / "s1.jsonl").exists()
+
+
+class TestToolCall:
+    def test_event_shape_blocked(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "metadata")
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "rm -rf /"},
+            result={"exit_code": 1, "stdout": "", "stderr": "blocked"},
+            task_id="t1", session_id="s1", tool_call_id="tc1",
+            turn_id="turn1", api_request_id="req1",
+            duration_ms=42, status="blocked",
+        )
+        plugin._drain_now()
+        ev = _lines(plugin, tmp_path, "s1")[0]
+        assert ev["event"] == "tool_call"
+        assert ev["tool_name"] == "terminal" and ev["tool_call_id"] == "tc1"
+        assert ev["duration_ms"] == 42 and ev["exit_code"] == 1
+        assert ev["decision"] == "blocked" and ev["success"] is False
+        assert ev["args"]["bytes"] > 0 and "data" not in ev["args"]
+
+
+class TestApproval:
+    def test_event_shape(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "full")
+        plugin._on_post_approval_response(
+            command="kubectl delete ns prod", description="dangerous",
+            pattern_key="kubectl:*", session_key="sess/a?b", surface="gateway",
+            choice="deny",
+        )
+        plugin._drain_now()
+        ev = _lines(plugin, tmp_path, "sess_a_b")[0]   # session_key sanitized
+        assert ev["event"] == "approval"
+        assert ev["choice"] == "deny" and ev["surface"] == "gateway"
+        assert ev["command"] == "kubectl delete ns prod"
+
+
+class TestSessionEnd:
+    def test_event_shape(self, plugin, tmp_path):
+        plugin._on_session_finalize(session_id="s1", reason="complete")
+        plugin._drain_now()
+        ev = _lines(plugin, tmp_path, "s1")[0]
+        assert ev["event"] == "session_end" and ev["reason"] == "complete"
+
+
+class TestRegister:
+    def test_registers_all_hooks(self, plugin):
+        registered = []
+        ctx = type("Ctx", (), {"register_hook": staticmethod(
+            lambda name, fn: registered.append(name))})()
+        plugin.register(ctx)
+        assert sorted(registered) == sorted([
+            "post_api_request", "api_request_error", "pre_llm_call",
+            "post_tool_call", "post_approval_response",
+            "on_session_finalize", "on_session_end",
+        ])
+
+    def test_register_noop_when_disabled(self, plugin, monkeypatch):
+        monkeypatch.setenv("HERMES_USAGE_TRACE", "0")
+        registered = []
+        ctx = type("Ctx", (), {"register_hook": staticmethod(
+            lambda name, fn: registered.append(name))})()
+        plugin.register(ctx)
+        assert registered == []
