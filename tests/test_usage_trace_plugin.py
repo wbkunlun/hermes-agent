@@ -354,3 +354,76 @@ class TestRegister:
             lambda name, fn: registered.append(name))})()
         plugin.register(ctx)
         assert registered == []
+
+
+# ---------------------------------------------------------------------------
+# Integration: one mini turn through the full pipeline (Task 4)
+# ---------------------------------------------------------------------------
+
+class TestIntegrationMiniTurn:
+    def test_turn_lifecycle_ordered_and_linked(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "full")
+        # 1. user prompt fires (pre_llm_call runs several times per turn)
+        for _ in range(2):
+            plugin._on_pre_llm_call(
+                session_id="sess-1", turn_id="turn-1", turn_type="user",
+                platform="wecom", user_message="deploy please",
+            )
+        # 2. API call completes with a tool request
+        plugin._on_post_api_request(
+            session_id="sess-1", turn_id="turn-1", api_request_id="req-1",
+            model="glm-5.3", provider="openai", api_duration=0.8,
+            finish_reason="tool_calls",
+            usage={"input_tokens": 100, "output_tokens": 20},
+            assistant_message=_Msg("running tool"), assistant_content_chars=12,
+            assistant_tool_call_count=1,
+        )
+        # 3. approval decision + tool execution
+        plugin._on_post_approval_response(
+            command="kubectl apply -f x", session_key="sess-1",
+            surface="gateway", choice="approve_once",
+        )
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "kubectl apply -f x"},
+            result={"exit_code": 0}, session_id="sess-1", tool_call_id="tc-1",
+            turn_id="turn-1", api_request_id="req-1", duration_ms=300,
+            status="",
+        )
+        # 4. final API call + session end
+        plugin._on_post_api_request(
+            session_id="sess-1", turn_id="turn-1", api_request_id="req-2",
+            model="glm-5.3", provider="openai", api_duration=0.5,
+            finish_reason="stop", usage={"input_tokens": 150, "output_tokens": 30},
+            assistant_message=_Msg("done"), assistant_content_chars=4,
+        )
+        plugin._on_session_finalize(session_id="sess-1", reason="complete")
+        plugin._drain_now()
+
+        evs = _lines(plugin, tmp_path, "sess-1")
+        assert [e["event"] for e in evs] == [
+            "user_prompt", "api_request", "assistant_response",
+            "approval", "tool_call", "api_request", "assistant_response",
+            "session_end",
+        ]
+        # every turn-scoped event links back to turn-1
+        # (approval and session_end are session-scoped, not turn-scoped)
+        for e in evs:
+            if e["event"] not in ("approval", "session_end"):
+                assert e["turn_id"] == "turn-1"
+        # usage aggregated across both API calls
+        total_input = sum(e["usage"]["input_tokens"]
+                          for e in evs if e["event"] == "api_request")
+        assert total_input == 250
+
+    def test_disabled_master_switch_writes_nothing(self, plugin, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_USAGE_TRACE", "0")
+        plugin._on_post_tool_call(
+            tool_name="terminal", args=None, result={"exit_code": 0},
+            session_id="s1", duration_ms=1,
+        )
+        plugin._on_post_api_request(
+            session_id="s1", model="m", usage={}, assistant_message=None,
+        )
+        plugin._drain_now()
+        assert not (tmp_path / "traces").exists() or \
+            not list((tmp_path / "traces").glob("*.jsonl"))
