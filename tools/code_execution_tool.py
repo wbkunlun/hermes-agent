@@ -1594,8 +1594,12 @@ def execute_code(
         has_host_access=_docker_has_host_access(_env_config),
     )
     if not _guard.get("approved", False):
+        # Fork: "blocked" (not "error") matches the terminal tool's guard
+        # refusal protocol — the audit plugin keys its decision on
+        # status=="blocked", so unauthorized attempts (whitelist parity
+        # denials included) audit as blocked, not failed.
         return json.dumps({
-            "status": "error",
+            "status": "blocked",
             "error": _guard.get("message") or "execute_code blocked by approval guard.",
             "tool_calls_made": 0,
             "duration_seconds": 0,

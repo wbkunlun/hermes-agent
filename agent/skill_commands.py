@@ -250,6 +250,27 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     if not loaded_skill.get("success"):
         return None
 
+    # Fork audit (2026-09-03): skill loads via slash/bundle paths call
+    # skill_view() directly, bypassing the tool dispatcher — no post_tool_call
+    # hook fires, so the audit-callback plugin would never see the skill
+    # invocation. Emit the same event here (tool-dispatched skill_view calls
+    # emit it from model_tools instead; the two paths are disjoint).
+    try:
+        from model_tools import _emit_post_tool_call_hook
+
+        _emit_post_tool_call_hook(
+            function_name="skill_view",
+            function_args={"name": normalized},
+            result=json.dumps({
+                "success": True,
+                "name": loaded_skill.get("name") or normalized,
+            }),
+            task_id=task_id,
+            duration_ms=0,
+        )
+    except Exception:
+        pass  # audit telemetry must never break skill loading
+
     skill_name = str(loaded_skill.get("name") or normalized)
     skill_path = str(loaded_skill.get("path") or "")
     skill_dir = None

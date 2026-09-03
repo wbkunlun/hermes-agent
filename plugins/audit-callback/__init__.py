@@ -77,6 +77,8 @@ _RISK_LEVEL = {
     "hardline": "critical",
     "dangerous": "high",
     "skill": "medium",
+    # blocked low-severity command = unauthorized attempt (fork, 2026-09-03)
+    "medium": "medium",
     "info": "info",
 }
 
@@ -441,6 +443,61 @@ def _build_skill_body(
     return body
 
 
+def _build_skill_view_body(
+    args: Any,
+    result: Any,
+    status: str,
+    duration_ms: int,
+    tool_call_id: str,
+    trace_id: str,
+) -> Dict[str, Any]:
+    """skill_view loads a skill's content into the conversation; the model
+    then executes it. Execution itself is prompt-driven (no separate tool
+    call), so reporting the load is the only auditable signal that a skill
+    ran — reported on every invocation (fork, 2026-09-03)."""
+    summary_args = args if isinstance(args, dict) else {}
+    data: Dict[str, Any] = {}
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            pass
+    elif isinstance(result, dict):
+        data = result
+
+    name = str(
+        summary_args.get("name")
+        or data.get("name")
+        or ""
+    )
+    ok = bool(data.get("success", True)) and status != "error"
+    decision, result_enum = _decide(status, result, None, False)
+
+    payload: Dict[str, Any] = {
+        "summary": f"load {name}".strip(),
+        "skill_name": name,
+        "file_path": str(summary_args.get("file_path") or ""),
+        "caller_type": "agent",
+    }
+
+    body = _common_fields(tool_call_id, trace_id)
+    body.update({
+        "event_type": "skill",
+        "action": "skill.invoke",
+        "risk_level": "medium",
+        "risk_reason": "skill loaded into conversation (content injected into prompt)",
+        "decision": decision if ok else "deny",
+        "result": result_enum,
+        "duration_ms": int(duration_ms or 0),
+        "payload": payload,
+    })
+    if name:
+        body["skill_name"] = name
+    return body
+
+
 def _build_code_body(
     code: str,
     result: Any,
@@ -557,13 +614,24 @@ def _on_post_tool_call(
         if tool_name == "terminal" and isinstance(args, dict):
             command = str(args.get("command") or "")
             severity, reason, matched_rules = _classify_terminal(command)
-            if severity in {"hardline", "dangerous"} or _report_all_commands():
+            # A blocked call is an unauthorized attempt — always reported
+            # (fork, 2026-09-03), even when the command itself is not
+            # classified dangerous and REPORT_ALL_COMMANDS is off.
+            _b_exit, _b_out, _b_err, _b_cwd, blocked = _parse_terminal_result(result)
+            if blocked and severity not in {"hardline", "dangerous"}:
+                severity = "medium"
+                reason = f"command blocked by approval guard/whitelist: {reason}".strip()
+            if severity in {"hardline", "dangerous", "medium"} or _report_all_commands():
                 body = _build_command_body(
                     command, args, result, status, duration_ms,
                     severity, reason, matched_rules, tool_call_id, trace_id,
                 )
         elif tool_name == "skill_manage":
             body = _build_skill_body(
+                args, result, status, duration_ms, tool_call_id, trace_id,
+            )
+        elif tool_name == "skill_view":
+            body = _build_skill_view_body(
                 args, result, status, duration_ms, tool_call_id, trace_id,
             )
         elif tool_name == "execute_code" and isinstance(args, dict):

@@ -459,3 +459,96 @@ class TestCodeRiskClassification:
                 result="{}", status="ok")
         assert plugin._HTTP_WARNED is False
         assert not any("http://" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Fork (2026-09-03): skill execution + blocked-attempt coverage
+# ---------------------------------------------------------------------------
+
+class TestSkillViewReporting:
+    def test_skill_view_reported_as_skill_invoke(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="skill_view",
+            args={"name": "deploy-helper"},
+            result=json.dumps({"success": True, "name": "deploy-helper"}),
+            status="ok", duration_ms=42,
+            tool_call_id="tc-sv1", turn_id="t1",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "skill"
+        assert body["action"] == "skill.invoke"
+        assert body["skill_name"] == "deploy-helper"
+        assert body["risk_level"] == "medium"
+        assert body["decision"] == "allowed"
+        assert body["payload"]["skill_name"] == "deploy-helper"
+
+    def test_skill_view_failed_load_reports_deny(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="skill_view",
+            args={"name": "missing-skill"},
+            result=json.dumps({"success": False, "error": "not found"}),
+            status="error",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["decision"] == "deny"
+
+    def test_other_tools_still_untouched(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="read_file", args={"path": "/tmp/x"},
+            result="{}", status="ok",
+        )
+        assert plugin._QUEUE.empty()
+
+
+class TestBlockedAttemptReporting:
+    def test_blocked_low_severity_command_forced_report(self, plugin, monkeypatch):
+        """A non-dangerous command blocked by the whitelist is an
+        unauthorized attempt — reported even without REPORT_ALL_COMMANDS."""
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("info", "", []))
+        monkeypatch.delenv("HERMES_AUDIT_REPORT_ALL_COMMANDS", raising=False)
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "curl evil.internal"},
+            result=json.dumps({
+                "status": "blocked",
+                "error": "BLOCKED: not whitelisted",
+            }),
+            status="blocked",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "command"
+        assert body["risk_level"] == "medium"  # escalated from info by the block
+        assert "blocked" in body["risk_reason"]
+        assert body["decision"] == "blocked"
+
+    def test_ok_low_severity_command_still_not_reported(self, plugin, monkeypatch):
+        """The forced-report escalation applies only to blocked calls —
+        successful benign commands stay unreported by default."""
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("info", "", []))
+        monkeypatch.delenv("HERMES_AUDIT_REPORT_ALL_COMMANDS", raising=False)
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "ls"},
+            result=json.dumps({"exit_code": 0, "output": "a\nb"}),
+            status="ok",
+        )
+        assert plugin._QUEUE.empty()
+
+    def test_execute_code_whitelist_denial_audits_as_blocked(self, plugin):
+        """code_execution_tool returns status:"blocked" for parity denials;
+        the plugin must classify it as blocked (not failed)."""
+        plugin._on_post_tool_call(
+            tool_name="execute_code",
+            args={"code": "import os\nos.remove('/tmp/f')"},
+            result=json.dumps({
+                "status": "blocked",
+                "error": "BLOCKED: execute_code runs local Python ...",
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }),
+            status="blocked",
+        )
+        body = plugin._QUEUE.get_nowait()
+        assert body["event_type"] == "command"
+        assert body["action"] == "code.exec"
+        assert body["decision"] == "blocked"
