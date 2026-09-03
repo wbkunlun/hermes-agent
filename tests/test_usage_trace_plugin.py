@@ -8,7 +8,9 @@ module-level queue / worker / dedup-set state.
 
 import importlib.util
 import json
+import time
 from pathlib import Path
+from queue import Queue
 
 import pytest
 
@@ -97,6 +99,20 @@ class TestCaptureModes:
         assert out["bytes"] == len('{"command": "ls"}')
         assert json.loads(out["data"]) == {"command": "ls"}
 
+    def test_capture_obj_sanitized_redacts_before_truncation(self, plugin, monkeypatch):
+        # Pipeline: json.dumps the dict first ('{"k": "xxSECRETxx"}'), redact
+        # the FULL json string ('{"k": "xx[REDACTED]xx"}'), then truncate to
+        # 9 chars -> '{"k": "xx'. The prefix can never contain raw secrets.
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "sanitized")
+        monkeypatch.setenv("HERMES_USAGE_TRACE_MAX_CHARS", "9")
+
+        def fake_redact(text, force=False):
+            return text.replace("SECRET", "[REDACTED]")
+
+        monkeypatch.setattr("agent.redact.redact_sensitive_text", fake_redact)
+        out = plugin._capture_obj({"k": "xxSECRETxx"})
+        assert out["data"] == '{"k": "xx'  # redacted first, then truncated
+
     def test_default_mode_is_sanitized(self, plugin):
         assert plugin._capture_mode() == "sanitized"
 
@@ -123,3 +139,63 @@ class TestMasterSwitch:
     def test_enabled_by_default(self, plugin, monkeypatch):
         monkeypatch.delenv("HERMES_USAGE_TRACE", raising=False)
         assert plugin._enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Queue / writer / retention (Task 2)
+# ---------------------------------------------------------------------------
+
+class TestWriter:
+    def test_write_batch_appends_jsonl_lines(self, plugin, tmp_path):
+        plugin._write_batch([
+            {"event": "user_prompt", "session_id": "s1", "x": 1},
+            {"event": "api_request", "session_id": "s1", "x": 2},
+        ])
+        lines = _lines(plugin, tmp_path, "s1")
+        assert [l["event"] for l in lines] == ["user_prompt", "api_request"]
+
+    def test_events_routed_by_session(self, plugin, tmp_path):
+        plugin._write_batch([
+            {"event": "a", "session_id": "s1"},
+            {"event": "b", "session_id": "s2"},
+            {"event": "c", "session_id": ""},
+        ])
+        assert len(_lines(plugin, tmp_path, "s1")) == 1
+        assert len(_lines(plugin, tmp_path, "s2")) == 1
+        assert len(_lines(plugin, tmp_path, "no-session")) == 1
+
+    def test_drain_now_flushes_queue(self, plugin, tmp_path):
+        plugin._enqueue({"event": "a", "session_id": "s1"})
+        plugin._enqueue({"event": "b", "session_id": "s1"})
+        plugin._drain_now()
+        lines = _lines(plugin, tmp_path, "s1")
+        assert [l["event"] for l in lines] == ["a", "b"]
+        assert plugin._queue.empty()
+
+    def test_enqueue_drops_oldest_when_full(self, plugin):
+        plugin._queue = Queue(maxsize=2)
+        for i in range(3):
+            plugin._enqueue({"event": i})
+        assert plugin._queue.qsize() == 2
+        assert plugin._queue.get_nowait()["event"] == 1  # oldest (0) dropped
+
+    def test_write_failure_isolated_and_counted(self, plugin, monkeypatch, tmp_path):
+        def boom(lines, path):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(plugin, "_append_lines", boom)
+        plugin._write_batch([{"event": "a", "session_id": "s1"}])  # must not raise
+        assert plugin._dropped >= 1
+
+    def test_prune_old_files(self, plugin, tmp_path):
+        import os
+        d = tmp_path / "traces"
+        d.mkdir(parents=True)
+        old = d / "old.jsonl"
+        fresh = d / "fresh.jsonl"
+        old.write_text("{}")
+        fresh.write_text("{}")
+        os.utime(old, (time.time() - 40 * 86400, time.time() - 40 * 86400))
+        plugin._prune_old_files(time.time())
+        assert not old.exists()
+        assert fresh.exists()

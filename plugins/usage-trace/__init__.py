@@ -143,7 +143,13 @@ def _capture_text(value: Any, *, text_key: str = "text") -> Dict[str, Any]:
     """
     if value is None:
         return {"chars": 0}
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
     out: Dict[str, Any] = {"chars": len(text)}
     mode = _capture_mode()
     if mode == "metadata":
@@ -165,7 +171,7 @@ def _capture_obj(value: Any) -> Dict[str, Any]:
         text = json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         text = str(value)
-    out: Dict[str, Any] = {"bytes": len(text)}
+    out: Dict[str, Any] = {"bytes": len(text.encode("utf-8", "replace"))}
     mode = _capture_mode()
     if mode == "metadata":
         return out
@@ -184,10 +190,125 @@ def _capture_obj(value: Any) -> Dict[str, Any]:
 
 def _session_file(session_id: str) -> Path:
     """One JSONL per session; unsafe chars flattened, empty -> no-session."""
-    sid = _SANITIZE_RE.sub("_", (session_id or "").strip())
+    sid = _SANITIZE_RE.sub("_", str(session_id or "").strip())
     return _trace_dir() / f"{sid or 'no-session'}.jsonl"
 
 
+# ---------------------------------------------------------------------------
+# Queue + writer
+# ---------------------------------------------------------------------------
+
+def _enqueue(event: Dict[str, Any]) -> None:
+    """Non-blocking enqueue; bounded queue drops the oldest event on full."""
+    global _dropped
+    try:
+        _queue.put_nowait(event)
+        return
+    except Full:
+        pass
+    try:
+        _queue.get_nowait()  # drop oldest to make room
+    except Empty:
+        pass
+    try:
+        _queue.put_nowait(event)
+    except Full:
+        _dropped += 1
+        if _dropped == 1 or _dropped % 100 == 0:
+            logger.warning("usage-trace: queue full; dropped %d events", _dropped)
+
+
+def _append_lines(path: Path, lines: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _write_batch(batch: List[Dict[str, Any]]) -> None:
+    """Group a batch by session file and append. Failures drop + count."""
+    global _dropped
+    by_file: Dict[Path, List[str]] = {}
+    for ev in batch:
+        line = json.dumps(ev, ensure_ascii=False, default=str)
+        by_file.setdefault(_session_file(str(ev.get("session_id") or "")), []).append(line)
+    for path, lines in by_file.items():
+        try:
+            _append_lines(path, lines)
+        except OSError as exc:
+            _dropped += len(lines)
+            if _dropped == 1 or _dropped % 100 == 0:
+                logger.warning(
+                    "usage-trace: write to %s failed (%s); dropped %d events",
+                    path, exc, _dropped,
+                )
+
+
+def _prune_old_files(now: float) -> None:
+    """Delete *.jsonl older than the retention window (writer start only)."""
+    days = _retention_days()
+    if days <= 0:
+        return
+    cutoff = now - days * 86400.0
+    try:
+        for p in _trace_dir().glob("*.jsonl"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _writer_loop() -> None:
+    _prune_old_files(time.time())
+    while not _shutdown_evt.is_set():
+        try:
+            first = _queue.get(timeout=0.5)
+        except Empty:
+            continue
+        batch = [first]
+        while len(batch) < _BATCH_MAX:
+            try:
+                batch.append(_queue.get_nowait())
+            except Empty:
+                break
+        _write_batch(batch)
+
+
 def _ensure_worker() -> None:
-    """Start the writer thread — implemented in a later task; stub for tests."""
-    return None
+    """Start the single daemon writer on first use (idempotent)."""
+    global _worker, _atexit_registered
+    if not _enabled():
+        return
+    if not _atexit_registered:
+        _atexit_registered = True
+        import atexit
+        atexit.register(_flush_at_exit)
+    with _worker_lock:
+        if _worker is None or not _worker.is_alive():
+            _shutdown_evt.clear()
+            _worker = threading.Thread(
+                target=_writer_loop, name="usage-trace-writer", daemon=True
+            )
+            _worker.start()
+
+
+def _drain_now() -> None:
+    """Synchronously flush pending events (tests / admin helper)."""
+    batch: List[Dict[str, Any]] = []
+    while True:
+        try:
+            batch.append(_queue.get_nowait())
+        except Empty:
+            break
+    if batch:
+        _write_batch(batch)
+
+
+def _flush_at_exit() -> None:
+    _shutdown_evt.set()
+    w = _worker
+    if w is not None and w.is_alive():
+        w.join(timeout=2.0)
+    _drain_now()
