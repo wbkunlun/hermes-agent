@@ -136,9 +136,10 @@ def _sanitize(text: str) -> Optional[str]:
 def _capture_text(value: Any, *, text_key: str = "text") -> Dict[str, Any]:
     """Render a text payload under the active capture mode.
 
-    metadata -> {"chars": N}; sanitized/full add ``text_key`` (truncated,
-    redacted when sanitized). Redactor failure degrades to metadata — never
-    write unredacted content in sanitized mode.
+    metadata -> {"chars": N}; sanitized/full add ``text_key`` (when sanitized:
+    redacted FIRST, then truncated — a secret straddling the truncation
+    boundary must still match the redactor pattern). Redactor failure
+    degrades to metadata — never write unredacted content in sanitized mode.
     """
     if value is None:
         return {"chars": 0}
@@ -147,13 +148,12 @@ def _capture_text(value: Any, *, text_key: str = "text") -> Dict[str, Any]:
     mode = _capture_mode()
     if mode == "metadata":
         return out
-    text = text[: _max_chars()]
     if mode == "sanitized":
         safe = _sanitize(text)
         if safe is None:
             return out
         text = safe
-    out[text_key] = text
+    out[text_key] = text[: _max_chars()]
     return out
 
 
@@ -169,13 +169,12 @@ def _capture_obj(value: Any) -> Dict[str, Any]:
     mode = _capture_mode()
     if mode == "metadata":
         return out
-    text = text[: _max_chars()]
     if mode == "sanitized":
         safe = _sanitize(text)
         if safe is None:
             return out
         text = safe
-    out["data"] = text
+    out["data"] = text[: _max_chars()]
     return out
 
 

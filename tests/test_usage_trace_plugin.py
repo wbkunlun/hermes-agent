@@ -78,6 +78,19 @@ class TestCaptureModes:
         assert "text" not in out
         assert out == {"chars": 10}
 
+    def test_sanitized_redacts_before_truncation(self, plugin, monkeypatch):
+        # A secret straddling the truncation boundary must still be redacted
+        # in full before truncation applies.
+        monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "sanitized")
+        monkeypatch.setenv("HERMES_USAGE_TRACE_MAX_CHARS", "9")
+
+        def fake_redact(text, force=False):
+            return text.replace("SECRET", "[REDACTED]")
+
+        monkeypatch.setattr("agent.redact.redact_sensitive_text", fake_redact)
+        out = plugin._capture_text("xxSECRETxx")
+        assert out["text"] == "xx[REDACT"  # redacted first, THEN truncated
+
     def test_capture_obj_json_serializes_dict(self, plugin, monkeypatch):
         monkeypatch.setenv("HERMES_USAGE_TRACE_CAPTURE", "full")
         out = plugin._capture_obj({"command": "ls"})
