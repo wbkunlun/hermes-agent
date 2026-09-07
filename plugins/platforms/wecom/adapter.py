@@ -1691,6 +1691,10 @@ class WeComAdapter(BasePlatformAdapter):
                     refs.append(("file", appmsg["file"]))
                 elif isinstance(appmsg.get("image"), dict):
                     refs.append(("image", appmsg["image"]))
+            # Inbound video (DM-only per WeCom docs) — same download/decrypt
+            # pipeline as files, capped at VIDEO_MAX_BYTES (10MB).
+            if msgtype == "video" and isinstance(body.get("video"), dict):
+                refs.append(("video", body["video"]))
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
@@ -1733,7 +1737,10 @@ class WeComAdapter(BasePlatformAdapter):
             return None
 
         try:
-            raw, headers = await self._download_remote_bytes(url, max_bytes=ABSOLUTE_MAX_BYTES)
+            raw, headers = await self._download_remote_bytes(
+                url,
+                max_bytes=VIDEO_MAX_BYTES if kind == "video" else ABSOLUTE_MAX_BYTES,
+            )
         except Exception as exc:
             logger.debug("[%s] Failed to download %s from %s: %s", self.name, kind, url, exc)
             return None
@@ -1756,6 +1763,8 @@ class WeComAdapter(BasePlatformAdapter):
                 return None
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
+        if kind == "video" and "." not in filename:
+            filename += self._detect_video_ext(raw)
         return cache_document_from_bytes(raw, filename), content_type
 
     @staticmethod
@@ -1778,6 +1787,15 @@ class WeComAdapter(BasePlatformAdapter):
         if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
             return ".webp"
         return ".jpg"
+
+    @staticmethod
+    def _detect_video_ext(data: bytes) -> str:
+        """Sniff mp4 (ftyp box at offset 4) / webm (EBML magic); default mp4."""
+        if data[:4] == b"\x1a\x45\xdf\xa3":
+            return ".webm"
+        if len(data) >= 8 and data[4:8] == b"ftyp":
+            return ".mp4"
+        return ".mp4"
 
     @staticmethod
     def _mime_for_ext(ext: str, fallback: str = "application/octet-stream") -> str:
