@@ -110,3 +110,148 @@ class TestRunCliErrors:
         monkeypatch.setattr(subprocess, "run", fake_run)
         wecom_cli.run_cli(("auth",), "show")
         assert captured["argv"][0] == "/opt/wecom-cli/bin/wecom-cli"
+
+    def test_bare_allows_version_flag(self, monkeypatch):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return FakeCompleted(stdout='"wecom-cli 1.2.0"')
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        out = wecom_cli.run_cli((), extra_argv=["--version"], bare=True)
+        assert captured["argv"] == ["wecom-cli", "--version"]
+        assert out == '"wecom-cli 1.2.0"'
+
+
+class TestCliProbe:
+    def test_probe_false_when_binary_missing(self, monkeypatch):
+        import shutil as _shutil
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        wecom_tools.reset_cli_probe_cache()
+        monkeypatch.setattr(_shutil, "which", lambda name: None)
+        assert wecom_tools.cli_tools_available() is False
+
+    def test_probe_true_when_authorized(self, monkeypatch):
+        import shutil as _shutil
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        wecom_tools.reset_cli_probe_cache()
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/wecom-cli")
+        monkeypatch.setattr(
+            subprocess, "run", lambda argv, **kw: FakeCompleted(stdout="authorized")
+        )
+        assert wecom_tools.cli_tools_available() is True
+
+    def test_probe_false_when_unauthorized(self, monkeypatch):
+        import shutil as _shutil
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        wecom_tools.reset_cli_probe_cache()
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/wecom-cli")
+        monkeypatch.setattr(
+            subprocess, "run", lambda argv, **kw: FakeCompleted(stdout="unauthorized")
+        )
+        assert wecom_tools.cli_tools_available() is False
+
+    def test_probe_cached_within_ttl(self, monkeypatch):
+        import shutil as _shutil
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        wecom_tools.reset_cli_probe_cache()
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return FakeCompleted(stdout="authorized")
+
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/wecom-cli")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert wecom_tools.cli_tools_available() is True
+        assert wecom_tools.cli_tools_available() is True
+        assert len(calls) == 1  # 第二次命中模块级缓存
+
+
+class TestBaseToolHandlers:
+    def test_status_handler_merges_version_and_auth(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        def fake_run_cli(service_path, method=None, args=None, **kw):
+            if list(service_path) == ["auth"]:
+                return "authorized"
+            if kw.get("extra_argv") == ["--version"]:
+                return '"wecom-cli 1.2.0 (npm 2026-05-01 abc123)"'
+            raise AssertionError(f"unexpected {service_path} {kw}")
+
+        monkeypatch.setattr(wecom_tools, "run_cli", fake_run_cli)
+        result = asyncio.run(wecom_tools._handler_status({}))
+        assert "authorized" in result and "1.2.0" in result
+
+    def test_schema_handler_list_vs_get(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        calls = []
+
+        def fake_run_cli(service_path, method=None, args=None, **kw):
+            calls.append((tuple(service_path), method, tuple(kw.get("extra_argv") or ())))
+            return '["message", "doc"]'
+
+        monkeypatch.setattr(wecom_tools, "run_cli", fake_run_cli)
+        asyncio.run(wecom_tools._handler_schema({}))
+        asyncio.run(wecom_tools._handler_schema({"target": "doc.create"}))
+        assert calls == [
+            (("schema",), "list", ()),
+            (("schema",), "get", ("doc.create",)),
+        ]
+
+    def test_generic_handler_forwards_args_json(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        captured = {}
+
+        def fake_run_cli(service_path, method=None, args=None, **kw):
+            captured["path"] = tuple(service_path)
+            captured["method"] = method
+            captured["args"] = args
+            return '{"created": "docid-1"}'
+
+        monkeypatch.setattr(wecom_tools, "run_cli", fake_run_cli)
+        out = asyncio.run(wecom_tools._handler_generic({
+            "service_path": ["doc"], "method": "create", "args": {"title": "x"},
+        }))
+        assert captured == {"path": ("doc",), "method": "create", "args": {"title": "x"}}
+        assert "docid-1" in out
+
+    def test_generic_handler_rejects_bad_segment(self):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        out = asyncio.run(wecom_tools._handler_generic({
+            "service_path": ["doc;rm"], "method": "create", "args": {},
+        }))
+        assert "error" in out
+
+    def test_generic_handler_error_json_passes_through(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+        from plugins.platforms.wecom.cli import WecomCliError
+
+        def fake_run_cli(service_path, method=None, args=None, **kw):
+            raise WecomCliError(
+                'wecom-cli exited 1: {"error": {"code": 893201, "message": "unauthorized"}}'
+            )
+
+        monkeypatch.setattr(wecom_tools, "run_cli", fake_run_cli)
+        out = asyncio.run(wecom_tools._handler_generic({
+            "service_path": ["doc"], "method": "list", "args": None,
+        }))
+        assert "893201" in out
