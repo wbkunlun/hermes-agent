@@ -206,3 +206,103 @@ class TestSendInnerFallbackSeam:
         result = await adapter._send_inner("zhangsan", "hello")
         assert result.success is True
         assert "agent_fallback" not in (result.raw_response or {})
+
+
+class TestStandaloneFallback:
+    @pytest.mark.asyncio
+    async def test_standalone_prefers_agent_fallback_over_ephemeral(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        class FakeClient:
+            async def send_markdown(self, touser, content):
+                return True, None
+
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: FakeClient())
+        # 若走了 ephemeral 路径会触发 check_wecom_requirements → 使其炸掉以证明没走到
+        def boom():
+            raise AssertionError("ephemeral path must not be reached when fallback succeeds")
+
+        monkeypatch.setattr(wecom_adapter, "check_wecom_requirements", boom)
+
+        result = await wecom_adapter._standalone_send(
+            PlatformConfig(enabled=True), "zhangsan", "cron hello",
+        )
+        assert result.get("success") is True
+        assert result.get("via") == "agent_fallback"
+
+    @pytest.mark.asyncio
+    async def test_standalone_falls_through_when_fallback_fails(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        class FakeClient:
+            async def send_markdown(self, touser, content):
+                return False, "server said no"
+
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: FakeClient())
+
+        class FakeAdapter:
+            def __init__(self, cfg):
+                pass
+
+            async def connect(self):
+                return True
+
+            async def send(self, chat_id, message):
+                class R:
+                    success = True
+                    message_id = "eph-1"
+                return R()
+
+            async def disconnect(self):
+                pass
+
+        monkeypatch.setattr(wecom_adapter, "WeComAdapter", FakeAdapter)
+        monkeypatch.setattr(wecom_adapter, "check_wecom_requirements", lambda: True)
+
+        result = await wecom_adapter._standalone_send(
+            PlatformConfig(enabled=True), "zhangsan", "cron hello",
+        )
+        assert result.get("success") is True
+        assert result.get("message_id") == "eph-1"
+
+    @pytest.mark.asyncio
+    async def test_standalone_fallback_raises_still_falls_through(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        class FakeClient:
+            async def send_markdown(self, touser, content):
+                raise RuntimeError("network down")
+
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: FakeClient())
+
+        class FakeAdapter:
+            def __init__(self, cfg):
+                pass
+
+            async def connect(self):
+                return True
+
+            async def send(self, chat_id, message):
+                class R:
+                    success = True
+                    message_id = "eph-2"
+                return R()
+
+            async def disconnect(self):
+                pass
+
+        monkeypatch.setattr(wecom_adapter, "WeComAdapter", FakeAdapter)
+        monkeypatch.setattr(wecom_adapter, "check_wecom_requirements", lambda: True)
+
+        result = await wecom_adapter._standalone_send(
+            PlatformConfig(enabled=True), "zhangsan", "cron hello",
+        )
+        assert result.get("success") is True
+        assert result.get("message_id") == "eph-2"
+
+    def test_dead_block_removed(self):
+        """死代码块删除后，_standalone_send 内 check_wecom_requirements 只出现一次。"""
+        import inspect
+
+        source = inspect.getsource(wecom_adapter._standalone_send)
+        assert source.count("check_wecom_requirements()") == 1

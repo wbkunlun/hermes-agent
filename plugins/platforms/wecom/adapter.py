@@ -3660,27 +3660,29 @@ async def _standalone_send(
                 # original error; the caller may retry.
                 return {"error": _live_error}
 
-    if not check_wecom_requirements():
-        return {"error": "WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET."}
-    try:
-        adapter = WeComAdapter(pconfig)
-        connected = await adapter.connect()
-        if not connected:
-            return {"error": f"WeCom: failed to connect - {getattr(adapter, 'fatal_error_message', None) or 'unknown error'}"}
+    # Agent-channel fallback BEFORE any ephemeral WebSocket: an ephemeral
+    # subscribe displaces the gateway's sole WS session (errcode 846609),
+    # while the self-built-app message/send API has no such constraint.
+    # DM-only in practice — group chat ids are not valid touser values and
+    # fail server-side, falling through to the ephemeral path below.
+    _fb = _agent_fallback_client()
+    if _fb is not None:
         try:
-            result = await adapter.send(chat_id, message)
-            if not result.success:
-                return {"error": f"WeCom send failed: {result.error}"}
+            _fb_ok, _fb_err = await _fb.send_markdown(chat_id, message)
+        except Exception as _fb_exc:  # noqa: BLE001
+            _fb_ok, _fb_err = False, str(_fb_exc)
+        if _fb_ok:
             return {
                 "success": True,
                 "platform": "wecom",
                 "chat_id": chat_id,
-                "message_id": result.message_id,
+                "message_id": None,
+                "via": "agent_fallback",
             }
-        finally:
-            await adapter.disconnect()
-    except Exception as e:
-        return {"error": f"WeCom send failed: {e}"}
+        logger.debug(
+            "[wecom] standalone_send: agent fallback failed (%s), trying ephemeral WS",
+            _fb_err,
+        )
 
     if not check_wecom_requirements():
         return {"error": "WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET."}
