@@ -609,3 +609,135 @@ class TestBlockedAttemptReporting:
         assert body["event_type"] == "command"
         assert body["action"] == "code.exec"
         assert body["decision"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Actor attribution (fork11): the audit envelope carries the identity of the
+# user who triggered the turn, read from the gateway's task-local session
+# context (SessionSource.user_id/user_name — e.g. WeWork sender_user).
+# ---------------------------------------------------------------------------
+
+class _SeqClient:
+    """Returns programmed responses in order; records each POST body."""
+
+    def __init__(self, responses):
+        self.calls = []
+        self._responses = list(responses)
+
+    def post(self, url, content=None, headers=None):
+        self.calls.append(content)
+        return self._responses.pop(0)
+
+
+class TestActorReporting:
+    def _report_dangerous(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("dangerous", "x", ["r"]))
+        plugin._on_post_tool_call(
+            tool_name="terminal",
+            args={"command": "rm -rf build/"},
+            result=json.dumps({"exit_code": 0, "output": ""}),
+            status="ok", tool_call_id="tc-a", turn_id="t-a",
+        )
+        return plugin._QUEUE.get_nowait()
+
+    def test_actor_from_session_context(self, plugin, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        tokens = set_session_vars(
+            platform="wework", chat_id="S:abc;R:room1", chat_type="group",
+            user_id="S:zhangsan;S:wework", user_name="张三",
+        )
+        try:
+            body = self._report_dangerous(plugin, monkeypatch)
+        finally:
+            clear_session_vars(tokens)
+        assert body["actor"] == {
+            "user_id": "S:zhangsan;S:wework", "user_name": "张三",
+            "platform": "wework", "chat_id": "S:abc;R:room1", "chat_type": "group",
+        }
+
+    def test_no_actor_key_when_context_empty(self, plugin, monkeypatch):
+        from gateway.session_context import reset_session_vars
+        reset_session_vars()
+        for key in ("HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_NAME",
+                    "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID",
+                    "HERMES_SESSION_CHAT_TYPE"):
+            monkeypatch.delenv(key, raising=False)
+        body = self._report_dangerous(plugin, monkeypatch)
+        assert "actor" not in body
+
+    def test_actor_values_capped_at_200_chars(self, plugin, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        tokens = set_session_vars(user_id="u" * 500, user_name="n" * 500)
+        try:
+            body = self._report_dangerous(plugin, monkeypatch)
+        finally:
+            clear_session_vars(tokens)
+        assert len(body["actor"]["user_id"]) == 200
+        assert len(body["actor"]["user_name"]) == 200
+
+    def test_partial_context_reports_present_fields_only(self, plugin, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        tokens = set_session_vars(platform="wecom", user_id="zhangsan")
+        try:
+            body = self._report_dangerous(plugin, monkeypatch)
+        finally:
+            clear_session_vars(tokens)
+        assert body["actor"] == {"platform": "wecom", "user_id": "zhangsan"}
+
+
+class TestActorSchemaFallback:
+    """422 from an intake that doesn't know the actor block must not lose the
+    event: retry once without actor, then stop sending actor until restart."""
+
+    def _body_with_actor(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "_classify_terminal",
+                            lambda c: ("dangerous", "x", ["r"]))
+        from gateway.session_context import clear_session_vars, set_session_vars
+        tokens = set_session_vars(platform="wework", user_id="S:zhang", user_name="张")
+        try:
+            plugin._on_post_tool_call(
+                tool_name="terminal", args={"command": "rm -rf x"},
+                result=json.dumps({"exit_code": 0}), status="ok",
+                tool_call_id="tc-b", turn_id="t-b",
+            )
+        finally:
+            clear_session_vars(tokens)
+        return plugin._QUEUE.get_nowait()
+
+    def test_422_strips_actor_retries_and_latches(self, plugin, monkeypatch):
+        body = self._body_with_actor(plugin, monkeypatch)
+        assert "actor" in body
+        client = _SeqClient([_FakeResp(422), _FakeResp(201)])
+        plugin._post_with_retry(
+            client, "http://audit/x", {"Content-Type": "application/json"}, body,
+        )
+        assert len(client.calls) == 2
+        first = json.loads(client.calls[0])
+        second = json.loads(client.calls[1])
+        assert "actor" in first and "actor" not in second
+        assert first["event_id"] == second["event_id"]
+        assert plugin._ACTOR_REJECTED is True
+
+    def test_rejected_flag_suppresses_actor_in_new_events(self, plugin, monkeypatch):
+        plugin._ACTOR_REJECTED = True
+        body = self._body_with_actor(plugin, monkeypatch)
+        assert "actor" not in body
+
+    def test_422_then_422_does_not_latch(self, plugin, monkeypatch):
+        body = self._body_with_actor(plugin, monkeypatch)
+        client = _SeqClient([_FakeResp(422), _FakeResp(422)])
+        plugin._post_with_retry(
+            client, "http://audit/x", {"Content-Type": "application/json"}, body,
+        )
+        assert len(client.calls) == 2
+        assert plugin._ACTOR_REJECTED is False
+
+    def test_200_without_actor_untouched(self, plugin, monkeypatch):
+        body = self._body_with_actor(plugin, monkeypatch)
+        body.pop("actor")
+        client = _SeqClient([_FakeResp(422)])
+        plugin._post_with_retry(
+            client, "http://audit/x", {"Content-Type": "application/json"}, body,
+        )
+        assert len(client.calls) == 1  # 无 actor 的 422 不触发重试

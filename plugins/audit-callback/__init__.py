@@ -149,6 +149,10 @@ _QUEUE: "queue.Queue[Any]" = queue.Queue(maxsize=1000)
 _WORKER_LOCK = threading.Lock()
 _WORKER_STARTED = False
 _DROPPED = 0  # best-effort overflow counter
+# Latched when the platform intake accepts an event only after the actor
+# block is stripped (422 → stripped retry → 2xx): stop attaching actor until
+# process restart so every event still lands. Cleared only by restart.
+_ACTOR_REJECTED = False
 
 
 def _dropped_count() -> int:
@@ -207,7 +211,35 @@ def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, 
             return
         code = resp.status_code
         if code < 500:
-            if code >= 400:
+            if code in (400, 422) and "actor" in body:
+                # Schema defense (fork11): the intake's IngestSingleRequest may
+                # predate the actor block. Retry once WITHOUT it so the event
+                # is not lost; if the stripped copy lands, latch
+                # _ACTOR_REJECTED and say so loudly — the operator should
+                # upgrade the platform schema to keep user attribution.
+                stripped = {k: v for k, v in body.items() if k != "actor"}
+                try:
+                    resp2 = _post_one(client, url, headers, stripped)
+                except Exception as exc:  # noqa: BLE001 — never break the loop
+                    logger.debug(
+                        "audit-callback: actor-stripped retry error for %s: %s", event_id, exc,
+                    )
+                    return
+                if resp2.status_code < 400:
+                    _set_actor_rejected()
+                    logger.warning(
+                        "audit-callback: intake returned %d for the actor block but "
+                        "accepted the event without it — actor attribution disabled "
+                        "until restart. Upgrade the platform schema "
+                        "(/api/v1/agent/audit IngestSingleRequest) to carry actor.",
+                        code,
+                    )
+                else:
+                    logger.debug(
+                        "audit-callback: actor-stripped retry still %d for %s",
+                        resp2.status_code, event_id,
+                    )
+            elif code >= 400:
                 logger.debug("audit-callback: server returned %d for %s", code, event_id)
             return
         if attempt < 2:  # 5xx → retry
@@ -339,6 +371,38 @@ def _summarize_skill_args(args: Any) -> Dict[str, Any]:
     return out
 
 
+def _set_actor_rejected() -> None:
+    global _ACTOR_REJECTED
+    _ACTOR_REJECTED = True
+
+
+def _current_actor() -> Dict[str, Any]:
+    """Identity of the user who triggered this turn (fork11).
+
+    Read from the gateway's task-local session context — the same
+    ``SessionSource`` the dispatch bound from the platform adapter (e.g.
+    WeWork ``sender_user`` at plugins/platforms/wework/adapter.py, WeCom
+    ``userid``). Empty dict for CLI / cron / local sessions and any context
+    where no channel identity was bound.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # noqa: BLE001 — plugin must stay loadable standalone
+        return {}
+    actor: Dict[str, Any] = {}
+    for env_key, field in (
+        ("HERMES_SESSION_USER_ID", "user_id"),
+        ("HERMES_SESSION_USER_NAME", "user_name"),
+        ("HERMES_SESSION_PLATFORM", "platform"),
+        ("HERMES_SESSION_CHAT_ID", "chat_id"),
+        ("HERMES_SESSION_CHAT_TYPE", "chat_type"),
+    ):
+        value = str(get_session_env(env_key, "") or "").strip()
+        if value:
+            actor[field] = value[:200]
+    return actor
+
+
 def _common_fields(tool_call_id: str, trace_id: str) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "event_id": uuid.uuid4().hex,
@@ -350,6 +414,10 @@ def _common_fields(tool_call_id: str, trace_id: str) -> Dict[str, Any]:
     if sb:
         body["resource_type"] = "sandbox"
         body["resource_id"] = sb
+    if not _ACTOR_REJECTED:
+        actor = _current_actor()
+        if actor:
+            body["actor"] = actor
     return body
 
 
