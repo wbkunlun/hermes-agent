@@ -2824,6 +2824,9 @@ class WeComAdapter(BasePlatformAdapter):
                     },
                 )
         except asyncio.TimeoutError:
+            fb = await self._try_agent_fallback(chat_id, content, "bot send timeout")
+            if fb is not None:
+                return fb
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
             logger.error("[%s] Send failed: %s", self.name, exc)
@@ -2835,6 +2838,9 @@ class WeComAdapter(BasePlatformAdapter):
                 asyncio.ensure_future(
                     self._force_reconnect_on_stale_subscription(STREAM_NOT_SUBSCRIBED_ERRCODE)
                 )
+            fb = await self._try_agent_fallback(chat_id, content, f"bot send error: {exc_str}")
+            if fb is not None:
+                return fb
             return SendResult(success=False, error=str(exc))
 
         error = self._response_error(response)
@@ -2845,6 +2851,9 @@ class WeComAdapter(BasePlatformAdapter):
                 asyncio.ensure_future(
                     self._force_reconnect_on_stale_subscription(errcode)
                 )
+            fb = await self._try_agent_fallback(chat_id, content, f"bot send rejected: {error}")
+            if fb is not None:
+                return fb
             return SendResult(success=False, error=error)
 
         # Mark delivered so _keep_typing cannot open an orphan stream after
@@ -2853,6 +2862,40 @@ class WeComAdapter(BasePlatformAdapter):
             success=True,
             message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
             raw_response=response,
+        )
+
+    async def _try_agent_fallback(
+        self, chat_id: str, content: str, reason: str,
+    ) -> Optional[SendResult]:
+        """Bot delivery failed → try the self-built-app channel (DM only).
+
+        Enabled iff WECOM_CALLBACK_{CORP_ID,CORP_SECRET,AGENT_ID} are set and
+        WECOM_AGENT_FALLBACK is not an explicit off value (see
+        ``_agent_fallback_client``).  Group chats never fall back — the aibot
+        group chat_id is not a valid self-built-app touser, so there is no
+        usable mapping (documented limitation; groups keep the passive
+        req_id path).
+        """
+        if chat_id in self._group_chat_ids:
+            return None
+        client = _agent_fallback_client()
+        if client is None:
+            return None
+        try:
+            ok, err = await client.send_markdown(chat_id, content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] agent fallback raised after bot failure (%s): %s",
+                           self.name, reason, exc)
+            return None
+        if not ok:
+            logger.warning("[%s] agent fallback failed after bot failure (%s): %s",
+                           self.name, reason, err)
+            return None
+        logger.info("[%s] delivered via agent fallback (bot failure: %s)", self.name, reason)
+        return SendResult(
+            success=True,
+            message_id=f"agent-fallback:{uuid.uuid4().hex[:8]}",
+            raw_response={"agent_fallback": True, "reason": reason},
         )
 
     async def send_image(
@@ -3477,6 +3520,37 @@ def qr_scan_for_bot_info(
 # _send_wecom dispatch in tools/send_message_tool.py. Env→PlatformConfig
 # seeding stays in core, same as prior migrations.
 # ──────────────────────────────────────────────────────────────────────────
+
+
+_AGENT_FALLBACK_OFF_VALUES = {"0", "false", "off", "no"}
+_agent_fallback_client_cache: Dict[str, Any] = {"env": None, "client": None}
+
+
+def _agent_fallback_client() -> Optional[Any]:
+    """Build (and memoise per env tuple) the Bot→Agent fallback client.
+
+    Enabled iff WECOM_CALLBACK_{CORP_ID,CORP_SECRET,AGENT_ID} are all set and
+    WECOM_AGENT_FALLBACK is not an explicit off value.  Mirrors the official
+    wecom-openclaw-plugin's Bot-first / Agent-fallback delivery: when the
+    Smart-Robot channel cannot deliver, route markdown through the
+    self-built-app message/send API instead.
+    """
+    import os as _os
+
+    if _os.getenv("WECOM_AGENT_FALLBACK", "").strip().lower() in _AGENT_FALLBACK_OFF_VALUES:
+        return None
+    env = (
+        _os.getenv("WECOM_CALLBACK_CORP_ID", "").strip(),
+        _os.getenv("WECOM_CALLBACK_CORP_SECRET", "").strip(),
+        _os.getenv("WECOM_CALLBACK_AGENT_ID", "").strip(),
+    )
+    if not all(env):
+        return None
+    if _agent_fallback_client_cache["env"] != env:
+        from plugins.platforms.wecom.callback_adapter import WecomAgentFallbackClient
+        _agent_fallback_client_cache["env"] = env
+        _agent_fallback_client_cache["client"] = WecomAgentFallbackClient(*env)
+    return _agent_fallback_client_cache["client"]
 
 
 async def _standalone_send(

@@ -621,3 +621,54 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             expires_in,
         )
         return token
+
+
+class WecomAgentFallbackClient:
+    """Env-only WeCom self-built-app markdown sender for Bot→Agent fallback.
+
+    Deliberately does NOT start the callback HTTP server — a thin proactive
+    sender over gettoken + message/send used by the Smart-Robot adapter when
+    the bot channel cannot deliver (expired req_id, standalone cron with no
+    reachable gateway loop).  DM-only by construction: an aibot DM chat_id is
+    the corp userid, which is exactly a valid self-built-app ``touser``;
+    group chat ids are NOT valid ``touser`` values, so a mistaken group
+    attempt fails cleanly server-side.
+    """
+
+    def __init__(self, corp_id: str, corp_secret: str, agent_id: str):
+        self.corp_id = corp_id
+        self.corp_secret = corp_secret
+        self.agent_id = agent_id
+
+    async def send_markdown(self, touser: str, content: str) -> tuple:
+        """Send markdown segments; returns (ok, error_message)."""
+        segments = _split_markdown_bytes(content)
+        if not segments:
+            return False, "empty content"
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                token_resp = await client.get(
+                    "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                    params={"corpid": self.corp_id, "corpsecret": self.corp_secret},
+                )
+                token_body = token_resp.json()
+                if token_body.get("errcode") != 0:
+                    return False, f"token refresh failed: {token_body}"
+                token = token_body["access_token"]
+                for segment in segments:
+                    payload = {
+                        "touser": touser,
+                        "msgtype": "markdown",
+                        "agentid": int(self.agent_id),
+                        "markdown": {"content": segment},
+                    }
+                    resp = await client.post(
+                        f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
+                        json=payload,
+                    )
+                    body = resp.json()
+                    if body.get("errcode") != 0:
+                        return False, f"message/send failed: {body}"
+            return True, None
+        except Exception as exc:  # noqa: BLE001 — fallback must never raise
+            return False, str(exc)
