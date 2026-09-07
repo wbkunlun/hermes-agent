@@ -145,11 +145,27 @@ All callback payloads are encrypted with AES-CBC using the EncodingAESKey. The a
 
 The crypto implementation is compatible with Tencent's official WXBizMsgCrypt SDK.
 
+## Outbound Capabilities
+
+Replies are delivered proactively via the `message/send` API:
+
+| Type | Behavior |
+|------|----------|
+| **Text** | `msgtype: text`, capped at 2048 chars |
+| **Markdown** | `msgtype: markdown`, 4096-byte (UTF-8) segments — longer content is split into consecutive messages |
+| **Media** | `image` / `voice` / `video` / `file` via temporary material upload (`media/upload`, 3-day validity), with the same size caps as the bot channel (10 / 2 / 10 / 20 MB); optional caption follows as a markdown message |
+
+Access tokens are cached per app with a 7200s TTL; a rejected token (errcode 40001/42001) is evicted and retried once with a fresh token.
+
+:::info Delivery fallback for the WeCom Bot channel
+When the callback platform's env credentials (`WECOM_CALLBACK_CORP_ID` / `CORP_SECRET` / `AGENT_ID`) are present, the [WeCom Bot](./wecom.md) channel uses this app's `message/send` API as a delivery fallback when the bot WebSocket path cannot deliver (expired req_id, standalone cron sends). Set `WECOM_AGENT_FALLBACK=0` to disable. DM only.
+:::
+
 ## Limitations
 
 - **No streaming** — replies arrive as complete messages after the agent finishes
 - **No typing indicators** — the callback model doesn't support typing status
-- **Text only** — currently supports text messages for input; image/file/voice input not yet implemented. The agent is aware of outbound media capabilities via the WeCom platform hint (images, documents, video, voice).
+- **Text only (inbound)** — text messages for input; image/file/voice input not yet implemented. Outbound markdown and media are supported (see above). The agent is aware of outbound media capabilities via the WeCom platform hint (images, documents, video, voice).
 - **Response latency** — agent sessions take 3–30 minutes; users see the reply when processing completes
 
 ## Troubleshooting

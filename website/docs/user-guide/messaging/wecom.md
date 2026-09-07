@@ -113,8 +113,8 @@ Set these in `config.yaml` under `platforms.wecom.extra`:
 | `bot_id` | — | WeCom AI Bot ID (required) |
 | `secret` | — | WeCom AI Bot Secret (required) |
 | `websocket_url` | `wss://openws.work.weixin.qq.com` | WebSocket gateway URL |
-| `dm_policy` | `open` | DM access: `open`, `allowlist`, `disabled`, `pairing` |
-| `group_policy` | `open` | Group access: `open`, `allowlist`, `disabled` |
+| `dm_policy` | `pairing` | DM access: `open`, `allowlist`, `disabled`, `pairing` |
+| `group_policy` | `pairing` | Group access: `open`, `allowlist`, `disabled`, `pairing` |
 | `allow_from` | `[]` | User IDs allowed for DMs (when dm_policy=allowlist) |
 | `group_allow_from` | `[]` | Group IDs allowed (when group_policy=allowlist) |
 | `groups` | `{}` | Per-group configuration (see below) |
@@ -130,10 +130,10 @@ Controls who can send direct messages to the bot:
 
 | Value | Behavior |
 |-------|----------|
-| `open` | Anyone can DM the bot (default) |
+| `open` | Anyone can DM the bot |
 | `allowlist` | Only user IDs in `allow_from` can DM |
 | `disabled` | All DMs are ignored |
-| `pairing` | Pairing mode (for initial setup) |
+| `pairing` | Pairing mode (for initial setup) — **default** |
 
 ```bash
 WECOM_DM_POLICY=allowlist
@@ -145,9 +145,16 @@ Controls which groups the bot responds in:
 
 | Value | Behavior |
 |-------|----------|
-| `open` | Bot responds in all groups (default) |
+| `open` | Bot responds in all groups |
 | `allowlist` | Bot only responds in group IDs listed in `group_allow_from` |
 | `disabled` | All group messages are ignored |
+| `pairing` | Blocks all groups — **default** |
+
+:::warning Default group policy blocks groups
+With the default `pairing` group policy, all group chats are blocked until you
+either list the groups in `group_allow_from` / `WECOM_GROUP_ALLOWED_USERS` or
+explicitly set `WECOM_GROUP_POLICY=allowlist` / `open`.
+:::
 
 ```bash
 WECOM_GROUP_POLICY=allowlist
@@ -202,6 +209,7 @@ The adapter receives media attachments from users and caches them locally for ag
 | **Images** | Downloaded and cached locally. Supports both URL-based and base64-encoded images. |
 | **Files** | Downloaded and cached. Filename is preserved from the original message. |
 | **Voice** | Voice message text transcription is extracted if available. |
+| **Video** | Downloaded and cached (DM only, ≤ 10 MB). mp4/webm detected by magic bytes when the URL lacks an extension. |
 | **Mixed messages** | WeCom mixed-type messages (text + images) are parsed and all components extracted. |
 
 **Quoted messages:** Media from quoted (replied-to) messages is also extracted, so the agent has context about what the user is replying to.
@@ -237,6 +245,34 @@ No configuration is needed — decryption happens transparently when encrypted m
 - Non-AMR audio → sent as file (WeCom only supports AMR for native voice)
 
 Files exceeding the absolute 20 MB limit are rejected with an informational message sent to the chat.
+
+## WeCom business tools (wecom-cli)
+
+When the official [`wecom-cli`](https://github.com/WecomTeam/wecom-cli) is installed and authorized, the agent gains 16 tools for WeCom business data: docs, sheets, smartsheets, calendar, todos, mail, contacts, WeDrive and messaging (`wecom_doc_create`, `wecom_calendar_create`, `wecom_mail_send`, `wecom_contact_search`, … plus the generic `wecom_cli` passthrough and `wecom_cli_schema` discovery).
+
+The tools appear **only** when the CLI probe passes (binary on PATH + authorized); otherwise they are hidden and everything else works unchanged.
+
+### One-time authorization (operator runbook)
+
+Credentials are member-scoped and land encrypted under `$HERMES_HOME/wecom-cli/` (`WECOM_CLI_CONFIG_DIR`, AES-256-GCM, 0600), so they survive restarts on the data volume:
+
+```bash
+# 1. Authorize (QR code is exported as a PNG inside the container; fetch & scan):
+docker exec -it <gateway> wecom-cli auth init --output-qrcode /tmp/wecom-qr.png
+docker cp <gateway>:/tmp/wecom-qr.png .   # open and scan with WeCom mobile
+
+# 2. Verify:
+docker exec -it <gateway> wecom-cli auth show
+# → Status: authorized
+
+# 3. Ask the bot "查一下你的 wecom_cli_status" — the tool should now answer.
+```
+
+`--manual` (Bot ID + Secret) is also supported but only unlocks bot-messaging capability, not docs/calendar/mail — prefer the QR member authorization.
+
+### Bot → self-built-app delivery fallback
+
+When `WECOM_CALLBACK_CORP_ID` / `WECOM_CALLBACK_CORP_SECRET` / `WECOM_CALLBACK_AGENT_ID` are set (i.e. the `wecom_callback` platform is configured) and `WECOM_AGENT_FALLBACK` is not `0`, delivery failures on the Smart-Robot channel — expired req_id, rate limits, standalone cron with no reachable gateway loop — fall back to the self-built-app `message/send` API (markdown). DM only; group replies still require the passive req_id path. This also removes the ephemeral-WebSocket kick risk (errcode 846609) for out-of-process cron sends.
 
 ## Reply-Mode Responses
 
@@ -283,8 +319,11 @@ Inbound messages are deduplicated using message IDs with a 5-minute window and a
 | `WECOM_ALLOWED_USERS` | — | _(empty)_ | Comma-separated user IDs for the gateway-level allowlist |
 | `WECOM_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
 | `WECOM_WEBSOCKET_URL` | — | `wss://openws.work.weixin.qq.com` | WebSocket gateway URL |
-| `WECOM_DM_POLICY` | — | `open` | DM access policy |
-| `WECOM_GROUP_POLICY` | — | `open` | Group access policy |
+| `WECOM_DM_POLICY` | — | `pairing` | DM access policy |
+| `WECOM_GROUP_POLICY` | — | `pairing` | Group access policy |
+| `WECOM_CLI_BIN` | — | `wecom-cli` | Path to the wecom-cli binary (business tools) |
+| `HERMES_WECOM_CLI_TIMEOUT` | — | `60` | Per-call wecom-cli subprocess timeout (seconds) |
+| `WECOM_AGENT_FALLBACK` | — | _(enabled)_ | Set `0`/`false`/`off` to disable Bot→self-built-app delivery fallback |
 
 ## Troubleshooting
 
