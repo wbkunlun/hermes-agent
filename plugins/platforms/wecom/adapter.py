@@ -3774,6 +3774,15 @@ def _build_callback_adapter(config):
 
 def register(ctx) -> None:
     """Plugin entry point — registers both WeCom platforms."""
+    # wecom-cli business tools (docs/sheets/calendar/todo/mail/contact/…).
+    # Registered first so they exist even when the WS platform never
+    # materialises; discovery also pre-registers them via provides_tools.
+    try:
+        from plugins.platforms.wecom.tools import register_tools
+        register_tools(ctx)
+    except Exception:
+        logger.warning("[wecom] failed to register wecom-cli business tools", exc_info=True)
+
     ctx.register_platform(
         name="wecom",
         label="WeCom (Enterprise WeChat)",

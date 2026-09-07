@@ -1,13 +1,34 @@
 name: wecom-platform
 label: WeCom (Enterprise WeChat)
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   WeCom / Enterprise WeChat gateway adapter for Hermes Agent. Registers two
   platforms: ``wecom`` (Smart Robot over WebSocket) and ``wecom_callback``
   (self-built apps over an HTTP callback endpoint with AES message crypto).
-  Relays messages between WeCom chats and the Hermes agent.
+  Relays messages between WeCom chats and the Hermes agent. Also registers 16
+  wecom-cli business tools (docs / sheets / calendar / todo / mail / contacts /
+  WeDrive / messaging) when the official wecom-cli is installed and authorized.
 author: NousResearch
+# The wecom-cli business client tools. Declaring them here asks discovery to
+# import `tools.py` in CLI/TUI processes (same contract as the a2a plugin).
+provides_tools:
+  - wecom_cli_status
+  - wecom_cli_schema
+  - wecom_cli
+  - wecom_doc_create
+  - wecom_doc_read
+  - wecom_doc_append
+  - wecom_sheet_read
+  - wecom_sheet_append
+  - wecom_calendar_create
+  - wecom_calendar_list
+  - wecom_todo_create
+  - wecom_todo_complete
+  - wecom_mail_send
+  - wecom_mail_search
+  - wecom_contact_search
+  - wecom_message_push
 requires_env:
   - name: WECOM_BOT_ID
     description: "WeCom Smart Robot bot ID"
@@ -50,3 +71,15 @@ optional_env:
     description: "WeCom callback EncodingAESKey for message crypto"
     prompt: "WeCom callback EncodingAESKey"
     password: true
+  - name: WECOM_CLI_BIN
+    description: "Path to the wecom-cli binary (default: wecom-cli on PATH)"
+    prompt: "wecom-cli binary path"
+    password: false
+  - name: HERMES_WECOM_CLI_TIMEOUT
+    description: "Per-call wecom-cli subprocess timeout in seconds (default 60)"
+    prompt: "wecom-cli timeout seconds"
+    password: false
+  - name: WECOM_AGENT_FALLBACK
+    description: "Set 0/false/off to disable Bot→self-built-app delivery fallback"
+    prompt: "Disable agent fallback? (default enabled when callback env set)"
+    password: false
