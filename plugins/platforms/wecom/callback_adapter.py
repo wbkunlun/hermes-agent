@@ -67,6 +67,33 @@ _MAX_BODY = 65_536
 ACCESS_TOKEN_TTL_SECONDS = 7200
 MESSAGE_DEDUP_TTL_SECONDS = 300
 
+# 自建应用 markdown 消息内容上限 4096 字节（UTF-8），超长分段发送。
+MARKDOWN_MAX_BYTES = 4096
+
+
+def _split_markdown_bytes(content: str, max_bytes: int = MARKDOWN_MAX_BYTES) -> List[str]:
+    """Split markdown into ≤max_bytes UTF-8 segments, preferring line breaks."""
+    if not content:
+        return []
+    if len(content.encode("utf-8")) <= max_bytes:
+        return [content]
+    segments: List[str] = []
+    current = ""
+    for line in content.splitlines(keepends=True):
+        while len(line.encode("utf-8")) > max_bytes:  # pathological no-newline line
+            cut = max_bytes
+            while len(line[:cut].encode("utf-8")) > max_bytes:
+                cut -= 1
+            segments.append(line[:cut])
+            line = line[cut:]
+        if current and len((current + line).encode("utf-8")) > max_bytes:
+            segments.append(current)
+            current = ""
+        current += line
+    if current:
+        segments.append(current)
+    return segments
+
 
 def check_wecom_callback_requirements() -> bool:
     """PASSIVE probe: are aiohttp/httpx/defusedxml importable right now?
@@ -240,23 +267,9 @@ class WecomCallbackAdapter(BasePlatformAdapter):
     # Outbound: proactive send via access-token API
     # ------------------------------------------------------------------
 
-    async def send(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        app = self._resolve_app_for_chat(chat_id)
-        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+    async def _post_message(self, app: Dict[str, Any], payload: Dict[str, Any]) -> SendResult:
+        """POST to message/send with one token-eviction retry (errcode 40001/42001)."""
         try:
-            payload = {
-                "touser": touser,
-                "msgtype": "text",
-                "agentid": int(str(app.get("agent_id") or 0)),
-                "text": {"content": content[:2048]},
-                "safe": 0,
-            }
             for _attempt in range(2):
                 token = await self._get_access_token(app)
                 resp = await self._http_client.post(
@@ -284,6 +297,50 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="send failed after token refresh")
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        app = self._resolve_app_for_chat(chat_id)
+        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+        payload = {
+            "touser": touser,
+            "msgtype": "text",
+            "agentid": int(str(app.get("agent_id") or 0)),
+            "text": {"content": content[:2048]},
+            "safe": 0,
+        }
+        return await self._post_message(app, payload)
+
+    async def send_markdown(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send markdown via message/send; segments content over 4096 UTF-8 bytes."""
+        del metadata
+        app = self._resolve_app_for_chat(chat_id)
+        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+        segments = _split_markdown_bytes(content)
+        if not segments:
+            return SendResult(success=False, error="empty markdown content")
+        last = SendResult(success=False, error="no segments")
+        for segment in segments:
+            payload = {
+                "touser": touser,
+                "msgtype": "markdown",
+                "agentid": int(str(app.get("agent_id") or 0)),
+                "markdown": {"content": segment},
+            }
+            last = await self._post_message(app, payload)
+            if not last.success:
+                return last
+        return last
 
     def _resolve_app_for_chat(self, chat_id: str) -> Dict[str, Any]:
         """Pick the app associated with *chat_id*, falling back sensibly."""
