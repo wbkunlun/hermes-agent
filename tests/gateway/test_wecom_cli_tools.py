@@ -255,3 +255,63 @@ class TestBaseToolHandlers:
             "service_path": ["doc"], "method": "list", "args": None,
         }))
         assert "893201" in out
+
+
+class TestCuratedTools:
+    def test_curated_table_maps_to_expected_cli_calls(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        captured = []
+
+        def fake_run_cli(service_path, method=None, args=None, **kw):
+            captured.append((tuple(service_path), method))
+            return '{"ok": true}'
+
+        monkeypatch.setattr(wecom_tools, "run_cli", fake_run_cli)
+        for spec in wecom_tools.CURATED_TOOLS:
+            handler = wecom_tools._curated_handler(spec["cli"], spec["method"])
+            asyncio.run(handler({"args": {"any": "payload"}}))
+
+        assert captured == [
+            (("doc",), "create"), (("doc",), "get"), (("doc",), "append"),
+            (("sheet",), "get"), (("sheet",), "append"),
+            (("calendar",), "create"), (("calendar",), "list"),
+            (("todo",), "create"), (("todo",), "complete"),
+            (("mail",), "send"), (("mail",), "search"),
+            (("contact",), "search"),
+            (("message",), "send"),
+        ]
+        assert len(wecom_tools.CURATED_TOOLS) == 13
+
+    def test_curated_handler_rejects_non_object_args(self):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        handler = wecom_tools._curated_handler(("doc",), "create")
+        out = asyncio.run(handler({"args": "not-an-object"}))
+        assert "error" in out
+
+    def test_register_tools_registers_all_sixteen(self):
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        registered = []
+
+        class FakeCtx:
+            def register_tool(self, **kwargs):
+                registered.append(kwargs)
+
+        wecom_tools.register_tools(FakeCtx())
+        names = sorted(r["name"] for r in registered)
+        assert len(names) == 16
+        assert set(names) == {
+            "wecom_cli_status", "wecom_cli_schema", "wecom_cli",
+            *(spec["name"] for spec in wecom_tools.CURATED_TOOLS),
+        }
+        for r in registered:
+            assert r["toolset"] == "wecom"
+            assert r["check_fn"] is wecom_tools.cli_tools_available
+            assert r["is_async"] is True
+            assert r["handler"] is not None
