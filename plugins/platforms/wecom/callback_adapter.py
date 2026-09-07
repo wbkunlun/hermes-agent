@@ -70,6 +70,16 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 # 自建应用 markdown 消息内容上限 4096 字节（UTF-8），超长分段发送。
 MARKDOWN_MAX_BYTES = 4096
 
+# media/upload 临时素材（3 天有效）支持的类型与大小上限，与 Smart-Robot
+# 通道的降级规则保持一致（image/video 10MB、voice 2MB、file 20MB）。
+UPLOAD_MEDIA_TYPES = {"image", "voice", "video", "file"}
+MEDIA_MAX_BYTES = {
+    "image": 10 * 1024 * 1024,
+    "video": 10 * 1024 * 1024,
+    "voice": 2 * 1024 * 1024,
+    "file": 20 * 1024 * 1024,
+}
+
 
 def _split_markdown_bytes(content: str, max_bytes: int = MARKDOWN_MAX_BYTES) -> List[str]:
     """Split markdown into ≤max_bytes UTF-8 segments, preferring line breaks."""
@@ -341,6 +351,78 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             if not last.success:
                 return last
         return last
+
+    async def upload_media(
+        self,
+        app: Dict[str, Any],
+        media_type: str,
+        data: bytes,
+        filename: str,
+    ) -> str:
+        """Upload temporary material (media/upload, 3-day validity) → media_id."""
+        if media_type not in UPLOAD_MEDIA_TYPES:
+            raise ValueError(f"unsupported media type {media_type!r}")
+        try:
+            for _attempt in range(2):
+                token = await self._get_access_token(app)
+                resp = await self._http_client.post(
+                    f"https://qyapi.weixin.qq.com/cgi-bin/media/upload"
+                    f"?access_token={token}&type={media_type}",
+                    files={"media": (filename, data)},
+                )
+                body = resp.json()
+                errcode = body.get("errcode", 0)
+                if errcode in {40001, 42001} and _attempt == 0:
+                    self._access_tokens.pop(app["name"], None)
+                    continue
+                if errcode != 0:
+                    raise RuntimeError(f"WeCom media upload failed: {body}")
+                return str(body.get("media_id") or "")
+            raise RuntimeError("WeCom media upload failed after token refresh")
+        except Exception as exc:
+            if isinstance(exc, (RuntimeError, ValueError)):
+                raise
+            raise RuntimeError(f"WeCom media upload failed: {exc}") from exc
+
+    async def send_media(
+        self,
+        chat_id: str,
+        media_type: str,
+        data: bytes,
+        filename: str,
+        caption: Optional[str] = None,
+    ) -> SendResult:
+        """Upload bytes as temporary material, then send by media_id."""
+        limit = MEDIA_MAX_BYTES.get(media_type)
+        if limit is None:
+            return SendResult(success=False, error=f"unsupported media type {media_type!r}")
+        if len(data) > limit:
+            return SendResult(
+                success=False,
+                error=f"{media_type} exceeds {limit // (1024 * 1024)}MB limit "
+                      f"({len(data)} bytes)",
+            )
+        app = self._resolve_app_for_chat(chat_id)
+        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+        try:
+            media_id = await self.upload_media(app, media_type, data, filename)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+        payload = {
+            "touser": touser,
+            "msgtype": media_type,
+            "agentid": int(str(app.get("agent_id") or 0)),
+            media_type: {"media_id": media_id},
+        }
+        result = await self._post_message(app, payload)
+        if result.success and caption:
+            await self._post_message(app, {
+                "touser": touser,
+                "msgtype": "markdown",
+                "agentid": int(str(app.get("agent_id") or 0)),
+                "markdown": {"content": caption[:MARKDOWN_MAX_BYTES]},
+            })
+        return result
 
     def _resolve_app_for_chat(self, chat_id: str) -> Dict[str, Any]:
         """Pick the app associated with *chat_id*, falling back sensibly."""

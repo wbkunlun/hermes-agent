@@ -98,3 +98,69 @@ class TestSendMarkdown:
         adapter = _adapter()
         result = await adapter.send_markdown("ww1234567890:alice", "")
         assert result.success is False
+
+
+class TestSendMedia:
+    @pytest.mark.asyncio
+    async def test_send_media_uploads_then_sends(self):
+        adapter = _adapter()
+        adapter._access_tokens["test-app"] = {"token": "tok", "expires_at": 9999999999}
+        adapter._user_app_map["ww1234567890:alice"] = "test-app"
+        client = _FakeClient([
+            {"errcode": 0, "media_id": "MEDIA123", "created_at": "123"},  # upload
+            {"errcode": 0, "msgid": "m-ok"},                               # send
+        ])
+        adapter._http_client = client
+
+        result = await adapter.send_media(
+            "ww1234567890:alice", "image", b"\x89PNG\r\n\x1a\nfake", "shot.png",
+        )
+        assert result.success is True
+        upload = client.posts[0]
+        assert "media/upload" in upload["url"] and "type=image" in upload["url"]
+        assert upload["kw"]["files"]["media"][0] == "shot.png"
+        send = client.posts[1]
+        assert send["json"]["msgtype"] == "image"
+        assert send["json"]["image"]["media_id"] == "MEDIA123"
+
+    @pytest.mark.asyncio
+    async def test_send_media_follows_with_caption(self):
+        adapter = _adapter()
+        adapter._access_tokens["test-app"] = {"token": "tok", "expires_at": 9999999999}
+        adapter._user_app_map["ww1234567890:alice"] = "test-app"
+        client = _FakeClient([
+            {"errcode": 0, "media_id": "MEDIA9"},   # upload
+            {"errcode": 0, "msgid": "m1"},          # media send
+            {"errcode": 0, "msgid": "m2"},          # caption markdown
+        ])
+        adapter._http_client = client
+
+        result = await adapter.send_media(
+            "ww1234567890:alice", "file", b"pdf-bytes", "report.pdf", caption="季报",
+        )
+        assert result.success is True
+        assert client.posts[2]["json"]["msgtype"] == "markdown"
+        assert client.posts[2]["json"]["markdown"]["content"] == "季报"
+
+    @pytest.mark.asyncio
+    async def test_send_media_rejects_oversize(self):
+        adapter = _adapter()
+        result = await adapter.send_media(
+            "ww1234567890:alice", "image", b"x" * (10 * 1024 * 1024 + 1), "big.png",
+        )
+        assert result.success is False
+        assert "10" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_media_rejects_unknown_type(self):
+        adapter = _adapter()
+        result = await adapter.send_media("ww1234567890:alice", "sticker", b"x", "s.gif")
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_send_media_voice_capped_at_2mb(self):
+        adapter = _adapter()
+        result = await adapter.send_media(
+            "ww1234567890:alice", "voice", b"x" * (2 * 1024 * 1024 + 1), "v.amr",
+        )
+        assert result.success is False
