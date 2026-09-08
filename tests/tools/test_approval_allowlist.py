@@ -11,6 +11,7 @@ command is blocked.
 import pytest
 
 from tools import approval as mod
+from tools import approval_context as _approval_ctx
 from tools.approval import check_all_command_guards
 
 
@@ -23,16 +24,18 @@ def allow_config(monkeypatch):
     """Install an allow list via config (approvals.allow) and return a setter.
 
     The HERMES_COMMAND_ALLOWLIST env var takes priority over config, so we
-    delete it to expose the config-fallback path.
+    delete it to expose the config-fallback path. The config reader lives in
+    tools.approval_context since the Sep 2026 approval decomposition (the
+    allowlist leaf reads it through that module at call time).
     """
     state = {"config": {"mode": "manual", "allow": []}}
     monkeypatch.delenv("HERMES_COMMAND_ALLOWLIST", raising=False)
 
     def set_allow(patterns, **extra):
         state["config"] = {"mode": "manual", "allow": list(patterns), **extra}
-        monkeypatch.setattr(mod, "_get_approval_config", lambda: state["config"])
+        monkeypatch.setattr(_approval_ctx, "_get_approval_config", lambda: state["config"])
 
-    monkeypatch.setattr(mod, "_get_approval_config", lambda: state["config"])
+    monkeypatch.setattr(_approval_ctx, "_get_approval_config", lambda: state["config"])
     return set_allow
 
 
@@ -63,7 +66,7 @@ class TestMatchUserAllowRule:
 
     def test_missing_allow_key_is_none(self, monkeypatch):
         monkeypatch.delenv("HERMES_COMMAND_ALLOWLIST", raising=False)
-        monkeypatch.setattr(mod, "_get_approval_config", lambda: {"mode": "manual"})
+        monkeypatch.setattr(_approval_ctx, "_get_approval_config", lambda: {"mode": "manual"})
         assert mod._match_user_allow_rule("git status") is None
 
     def test_env_matches(self, monkeypatch):

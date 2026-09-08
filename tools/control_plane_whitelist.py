@@ -115,11 +115,10 @@ class WhitelistClient:
             return "deny"
         if not snap.commands:
             return "normal"
-        # Reuse approval.py's deobfuscation + segmenting so quoting tricks
+        # Reuse the approval allowlist leaf's deobfuscation + segmenting so quoting tricks
         # and chained tails cannot ride in on an allowed first program.
-        from tools.approval import (
-            _REDIRECT_AMP_MASK,
-            _REDIRECT_AMP_RE,
+        from tools.approval_allowlist import _REDIRECT_AMP_MASK, _REDIRECT_AMP_RE
+        from tools.approval_detection import (
             _command_detection_variants,
             _iter_top_level_shell_segments,
             _shell_segment_tokens,

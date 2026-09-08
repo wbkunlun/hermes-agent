@@ -9,10 +9,10 @@ the yolo bypass.
 
 import pytest
 
-from tools.approval import (
+from tools.approval import check_execute_code_guard
+from tools.approval_allowlist import (
     _execute_code_mapped_commands,
     _execute_code_whitelist_parity,
-    check_execute_code_guard,
 )
 
 
