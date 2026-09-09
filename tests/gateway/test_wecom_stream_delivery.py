@@ -22,9 +22,15 @@ class FakeAdapter:
     def __init__(self):
         self.frames = []  # list of (content, finish)
         self.fail = False  # when True, simulate "stream unavailable"
+        self.fail_finalize = False  # Layer 2 decline: False on finalize only
+        self.raise_finalize = False  # finalize transport error
 
     async def send_stream_frame(self, content, *, finalize=False, chat_id=None):
         if self.fail:
+            return False
+        if finalize and self.raise_finalize:
+            raise RuntimeError("ws down")
+        if finalize and self.fail_finalize:
             return False
         self.frames.append((content, finalize))
         return True
@@ -313,3 +319,66 @@ class TestAdapterWiring:
         from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
 
         assert getattr(WecomCallbackAdapter, "WECOM_STREAM_DELIVERY", None) is None
+
+
+class TestFinalizeDeliveryFlag:
+    """The gateway suppresses its normal final send when ``final_response_sent``
+    is True. The adapter's Layer 2 clock fallback (stream age >= 330s, keep-alive
+    off by default) declines the finalize frame and returns False precisely so
+    the gateway's ``send()`` delivers the complete reply once. A declined or
+    failed finalize must therefore leave ``final_response_sent`` False — an
+    unconditional True silently dropped the tail of every long turn."""
+
+    @pytest.mark.asyncio
+    async def test_finalize_success_sets_flag(self, fast_throttle):
+        fake = FakeAdapter()
+        d = WeComStreamDelivery(fake, chat_id="c1")
+
+        async def feeder(deliv):
+            deliv.on_delta("answer")
+
+        await _run_to_completion(d, feeder)
+        assert d.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_finalize_declined_keeps_flag_false(self, fast_throttle):
+        """Layer 2 decline (send_stream_frame -> False on finalize): the bubble
+        showed intermediates, but the complete reply must go out via the
+        gateway's normal send()."""
+        fake = FakeAdapter()
+        fake.fail_finalize = True
+        d = WeComStreamDelivery(fake, chat_id="c1")
+
+        async def feeder(deliv):
+            deliv.on_delta("partial answer")
+
+        await _run_to_completion(d, feeder)
+        assert d.already_sent is True          # bubble rendered intermediates…
+        assert d.final_response_sent is False  # …but the final frame was declined
+
+    @pytest.mark.asyncio
+    async def test_finalize_exception_keeps_flag_false(self, fast_throttle):
+        fake = FakeAdapter()
+        fake.raise_finalize = True
+        d = WeComStreamDelivery(fake, chat_id="c1")
+
+        async def feeder(deliv):
+            deliv.on_delta("partial answer")
+
+        await _run_to_completion(d, feeder)
+        assert d.final_response_sent is False
+
+
+class TestRunningIndicatorProperty:
+    """``shows_running_indicator`` gates the gateway long-running heartbeat
+    (WeCom cannot edit messages, so each heartbeat posts a NEW message; the
+    bubble's own "⏳ 正在运行中…" indicator already covers it)."""
+
+    def test_true_while_stream_live(self):
+        d = WeComStreamDelivery(FakeAdapter(), chat_id="c1")
+        assert d.shows_running_indicator is True
+
+    def test_false_once_disabled(self):
+        d = WeComStreamDelivery(FakeAdapter(), chat_id="c1")
+        d._disabled = True
+        assert d.shows_running_indicator is False

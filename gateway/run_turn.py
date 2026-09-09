@@ -3731,6 +3731,16 @@ class GatewayTurnMixin:
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
 
+    @staticmethod
+    def _stream_consumer_shows_running_indicator(turn_ctx) -> bool:
+        """fork: True while the turn's live stream consumer renders its own
+        running indicator (WeComStreamDelivery.shows_running_indicator — the
+        single WeCom bubble carries "⏳ 正在运行中…"). Other consumers don't
+        implement the property and keep the upstream heartbeat behaviour."""
+        _holder = getattr(turn_ctx, "stream_consumer_holder", None)
+        _sc = _holder[0] if _holder else None
+        return bool(_sc is not None and getattr(_sc, "shows_running_indicator", False))
+
     async def _run_agent_notify_long_running(
         self, disp: "GatewayRunner._RunAgentDisplay", turn_ctx: TurnContext, _executor_task_holder: list,
     ) -> None:
@@ -3758,6 +3768,15 @@ class GatewayTurnMixin:
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
                 break
+            # fork: WeCom's stream bubble already renders its own live running
+            # indicator ("⏳ 正在运行中…"), and WeCom cannot edit messages — the
+            # edit-in-place heartbeat degenerates into a NEW message per
+            # interval, spamming the chat on long turns. Skip the heartbeat
+            # while the turn's stream consumer shows its own indicator (the
+            # delivery drops that property once it gave up, restoring the
+            # heartbeat as the fallback progress signal).
+            if self._stream_consumer_shows_running_indicator(turn_ctx):
+                return
             _elapsed_mins = int((time.time() - _notify_start) // 60)
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
             _status_detail = ""

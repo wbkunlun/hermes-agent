@@ -178,6 +178,19 @@ class WeComStreamDelivery:
         """Tool-progress lines are folded into the think block."""
         return True
 
+    @property
+    def shows_running_indicator(self) -> bool:
+        """True while this delivery renders its own running indicator in the bubble.
+
+        The gateway's long-running heartbeat (``_run_agent_notify_long_running``)
+        checks this before posting a "⏳ Working" message: WeCom cannot edit
+        messages, so on this platform every heartbeat arrives as a NEW message
+        duplicating the bubble's own "⏳ 正在运行中…" indicator — one extra
+        message per interval on long turns. Once the delivery gave up
+        (``_disabled``) the indicator is gone and the heartbeat resumes.
+        """
+        return not self._disabled
+
     # ------------------------------------------------------------------
     # Sync input API — called from the agent worker thread
     # ------------------------------------------------------------------
@@ -330,19 +343,29 @@ class WeComStreamDelivery:
         if not self._error_mode:
             self.thinking_lines.append("✨ 回复完成")
         display = self._display(finished=True)
-        await self._send_frame(display, finish=True)
-        self._final_response_sent = True
+        # Set the flag ONLY when the finalize frame actually went through. The
+        # adapter's Layer 2 clock fallback (stream age >= 330s, keep-alive off
+        # by default) declines finish=True and returns False precisely so the
+        # gateway's normal send() delivers the complete reply once — an
+        # unconditional True here suppressed that fallback and silently dropped
+        # the tail of every long turn (expired-at-finalize turns lost it all).
+        if await self._send_frame(display, finish=True):
+            self._final_response_sent = True
 
     async def _push_intermediate(self, display: str) -> None:
         """Send an intermediate frame (open/updated bubble) with the running indicator."""
         if self._disabled:
             return
         text = display + _build_running_indicator(self.start_time)
-        await self._send_frame(text, finish=False)
-        self.last_pushed_display = display
+        if await self._send_frame(text, finish=False):
+            # Only record on success so a failed frame is retried on the next
+            # tick (the adapter's next cumulative frame overwrites it anyway).
+            self.last_pushed_display = display
         self.last_push_time = time.monotonic()
 
-    async def _send_frame(self, text: str, finish: bool) -> None:
+    async def _send_frame(self, text: str, finish: bool) -> bool:
+        """Send one frame; True when the adapter delivered it (or assumed
+        delivery — the adapter treats a final-frame ack timeout as delivered)."""
         try:
             ok = await self.adapter.send_stream_frame(
                 text,
@@ -356,6 +379,7 @@ class WeComStreamDelivery:
                 raise RuntimeError("send_stream_frame returned False")
             self._consecutive_failures = 0
             self._already_sent = True
+            return True
         except Exception as exc:  # never let a frame failure kill the stream
             self._consecutive_failures += 1
             logger.debug("[wecom-stream] frame send failed: %s", exc)
@@ -372,6 +396,7 @@ class WeComStreamDelivery:
                     "falling back to plain send",
                     self._consecutive_failures,
                 )
+            return False
 
     # ------------------------------------------------------------------
     # Display helper
