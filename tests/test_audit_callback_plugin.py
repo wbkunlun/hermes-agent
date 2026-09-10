@@ -482,7 +482,9 @@ class TestSkillViewReporting:
         assert body["decision"] == "allowed"
         assert body["payload"]["skill_name"] == "deploy-helper"
 
-    def test_skill_view_failed_load_reports_deny(self, plugin):
+    def test_skill_view_failed_load_reports_blocked(self, plugin):
+        """Spec decision enum is {allowed, blocked, confirmed} — failures
+        surface as ``blocked`` (not the old non-spec ``deny``)."""
         plugin._on_post_tool_call(
             tool_name="skill_view",
             args={"name": "missing-skill"},
@@ -490,7 +492,7 @@ class TestSkillViewReporting:
             status="error",
         )
         body = plugin._QUEUE.get_nowait()
-        assert body["decision"] == "deny"
+        assert body["decision"] == "blocked"
 
     def test_other_tools_still_untouched(self, plugin):
         plugin._on_post_tool_call(
@@ -612,9 +614,12 @@ class TestBlockedAttemptReporting:
 
 
 # ---------------------------------------------------------------------------
-# Actor attribution (fork11): the audit envelope carries the identity of the
-# user who triggered the turn, read from the gateway's task-local session
-# context (SessionSource.user_id/user_name — e.g. WeWork sender_user).
+# Identity & batching (v0.5 spec):
+#   - ``actor`` is server-overridden from auth; the client does NOT send it.
+#   - ``username`` carries the real triggering user from the session context.
+#   - ``actor_type`` / ``channel`` default to "agent".
+#   - ``env`` is sent only when HERMES_AUDIT_ENV is set.
+#   - The worker batches up to 100 events per POST as IngestBatchRequest.
 # ---------------------------------------------------------------------------
 
 class _SeqClient:
@@ -629,7 +634,7 @@ class _SeqClient:
         return self._responses.pop(0)
 
 
-class TestActorReporting:
+class TestUsernameReporting:
     def _report_dangerous(self, plugin, monkeypatch):
         monkeypatch.setattr(plugin, "_classify_terminal",
                             lambda c: ("dangerous", "x", ["r"]))
@@ -641,22 +646,22 @@ class TestActorReporting:
         )
         return plugin._QUEUE.get_nowait()
 
-    def test_actor_from_session_context(self, plugin, monkeypatch):
+    def test_username_from_session_context(self, plugin, monkeypatch):
+        """``username`` is the real triggering user — read from the gateway
+        session context, capped at 128 chars (the spec's maxLength)."""
         from gateway.session_context import clear_session_vars, set_session_vars
         tokens = set_session_vars(
-            platform="wework", chat_id="S:abc;R:room1", chat_type="group",
             user_id="S:zhangsan;S:wework", user_name="张三",
         )
         try:
             body = self._report_dangerous(plugin, monkeypatch)
         finally:
             clear_session_vars(tokens)
-        assert body["actor"] == {
-            "user_id": "S:zhangsan;S:wework", "user_name": "张三",
-            "platform": "wework", "chat_id": "S:abc;R:room1", "chat_type": "group",
-        }
+        assert body["username"] == "张三"
+        # ``actor`` is server-overridden → the client never sends it.
+        assert "actor" not in body
 
-    def test_no_actor_key_when_context_empty(self, plugin, monkeypatch):
+    def test_no_username_when_context_empty(self, plugin, monkeypatch):
         from gateway.session_context import reset_session_vars
         reset_session_vars()
         for key in ("HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_NAME",
@@ -664,80 +669,260 @@ class TestActorReporting:
                     "HERMES_SESSION_CHAT_TYPE"):
             monkeypatch.delenv(key, raising=False)
         body = self._report_dangerous(plugin, monkeypatch)
+        assert "username" not in body
         assert "actor" not in body
 
-    def test_actor_values_capped_at_200_chars(self, plugin, monkeypatch):
+    def test_username_capped_at_128_chars(self, plugin, monkeypatch):
         from gateway.session_context import clear_session_vars, set_session_vars
-        tokens = set_session_vars(user_id="u" * 500, user_name="n" * 500)
+        tokens = set_session_vars(user_name="n" * 500)
         try:
             body = self._report_dangerous(plugin, monkeypatch)
         finally:
             clear_session_vars(tokens)
-        assert len(body["actor"]["user_id"]) == 200
-        assert len(body["actor"]["user_name"]) == 200
+        assert len(body["username"]) == 128
 
-    def test_partial_context_reports_present_fields_only(self, plugin, monkeypatch):
+    def test_username_blank_string_treated_as_absent(self, plugin, monkeypatch):
+        """Whitespace-only user_name shouldn't produce an empty username field."""
         from gateway.session_context import clear_session_vars, set_session_vars
-        tokens = set_session_vars(platform="wecom", user_id="zhangsan")
+        tokens = set_session_vars(user_name="   ")
         try:
             body = self._report_dangerous(plugin, monkeypatch)
         finally:
             clear_session_vars(tokens)
-        assert body["actor"] == {"platform": "wecom", "user_id": "zhangsan"}
+        assert "username" not in body
 
 
-class TestActorSchemaFallback:
-    """422 from an intake that doesn't know the actor block must not lose the
-    event: retry once without actor, then stop sending actor until restart."""
+class TestCommonFieldsDefaults:
+    """Defaults attached to every event: actor_type=channel=agent, no actor."""
 
-    def _body_with_actor(self, plugin, monkeypatch):
+    def _trigger(self, plugin, monkeypatch):
         monkeypatch.setattr(plugin, "_classify_terminal",
                             lambda c: ("dangerous", "x", ["r"]))
-        from gateway.session_context import clear_session_vars, set_session_vars
-        tokens = set_session_vars(platform="wework", user_id="S:zhang", user_name="张")
-        try:
-            plugin._on_post_tool_call(
-                tool_name="terminal", args={"command": "rm -rf x"},
-                result=json.dumps({"exit_code": 0}), status="ok",
-                tool_call_id="tc-b", turn_id="t-b",
-            )
-        finally:
-            clear_session_vars(tokens)
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={"command": "rm -rf x"},
+            result=json.dumps({"exit_code": 0}), status="ok",
+        )
         return plugin._QUEUE.get_nowait()
 
-    def test_422_strips_actor_retries_and_latches(self, plugin, monkeypatch):
-        body = self._body_with_actor(plugin, monkeypatch)
-        assert "actor" in body
-        client = _SeqClient([_FakeResp(422), _FakeResp(201)])
-        plugin._post_with_retry(
-            client, "http://audit/x", {"Content-Type": "application/json"}, body,
-        )
-        assert len(client.calls) == 2
-        first = json.loads(client.calls[0])
-        second = json.loads(client.calls[1])
-        assert "actor" in first and "actor" not in second
-        assert first["event_id"] == second["event_id"]
-        assert plugin._ACTOR_REJECTED is True
-
-    def test_rejected_flag_suppresses_actor_in_new_events(self, plugin, monkeypatch):
-        plugin._ACTOR_REJECTED = True
-        body = self._body_with_actor(plugin, monkeypatch)
+    def test_actor_type_and_channel_default_agent(self, plugin, monkeypatch):
+        body = self._trigger(plugin, monkeypatch)
+        assert body["actor_type"] == "agent"
+        assert body["channel"] == "agent"
+        # ``actor`` is server-overridden — the client must not send it.
         assert "actor" not in body
 
-    def test_422_then_422_does_not_latch(self, plugin, monkeypatch):
-        body = self._body_with_actor(plugin, monkeypatch)
-        client = _SeqClient([_FakeResp(422), _FakeResp(422)])
-        plugin._post_with_retry(
-            client, "http://audit/x", {"Content-Type": "application/json"}, body,
-        )
-        assert len(client.calls) == 2
-        assert plugin._ACTOR_REJECTED is False
+    def test_env_sent_when_set(self, plugin, monkeypatch):
+        monkeypatch.setenv("HERMES_AUDIT_ENV", "staging")
+        body = self._trigger(plugin, monkeypatch)
+        assert body["env"] == "staging"
 
-    def test_200_without_actor_untouched(self, plugin, monkeypatch):
-        body = self._body_with_actor(plugin, monkeypatch)
-        body.pop("actor")
-        client = _SeqClient([_FakeResp(422)])
-        plugin._post_with_retry(
-            client, "http://audit/x", {"Content-Type": "application/json"}, body,
+    def test_env_omitted_when_unset(self, plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_AUDIT_ENV", raising=False)
+        body = self._trigger(plugin, monkeypatch)
+        assert "env" not in body
+
+    def test_sandbox_id_promoted_to_resource(self, plugin, monkeypatch):
+        monkeypatch.setenv("SANDBOX_ID", "sb-7f3a")
+        body = self._trigger(plugin, monkeypatch)
+        assert body["resource_type"] == "sandbox"
+        assert body["resource_id"] == "sb-7f3a"
+
+    def test_sandbox_id_absent_when_unset(self, plugin, monkeypatch):
+        monkeypatch.delenv("SANDBOX_ID", raising=False)
+        body = self._trigger(plugin, monkeypatch)
+        assert "resource_type" not in body
+        assert "resource_id" not in body
+
+
+# ---------------------------------------------------------------------------
+# Batching (v0.5 spec): worker collects up to 100 events and ships as
+# IngestBatchRequest; per-item duplicate is silent, per-item error is logged.
+# ---------------------------------------------------------------------------
+
+class TestCollectBatch:
+    def test_returns_empty_on_empty_queue(self, plugin):
+        assert plugin._QUEUE.empty()
+        # Block briefly; with nothing queued, should return [].
+        events = plugin._collect_batch()
+        assert events == []
+
+    def test_drains_single_event_immediately(self, plugin):
+        plugin._QUEUE.put({"event_id": "e1"}, block=False)
+        events = plugin._collect_batch()
+        assert len(events) == 1
+        assert events[0]["event_id"] == "e1"
+
+    def test_drains_multiple_events_up_to_cap(self, plugin):
+        for i in range(5):
+            plugin._QUEUE.put({"event_id": f"e{i}"}, block=False)
+        events = plugin._collect_batch()
+        assert len(events) == 5
+        assert [e["event_id"] for e in events] == [f"e{i}" for i in range(5)]
+
+    def test_caps_at_batch_max(self, plugin, monkeypatch):
+        # Stuff more than _BATCH_MAX items; the batch must stop at the cap.
+        monkeypatch.setattr(plugin, "_BATCH_MAX", 7)
+        for i in range(20):
+            plugin._QUEUE.put({"event_id": f"e{i}"}, block=False)
+        events = plugin._collect_batch()
+        assert len(events) == 7
+        # The remaining 13 are still queued.
+        assert plugin._QUEUE.qsize() == 13
+
+
+class TestPostBatch:
+    """_post_batch_with_retry: body shape, retry on transient / 5xx,
+    per-item status handling."""
+
+    def _two_event_body(self, plugin):
+        plugin._on_post_tool_call(
+            tool_name="skill_manage",
+            args={"action": "install", "name": "x"},
+            result="{}", status="ok",
         )
-        assert len(client.calls) == 1  # 无 actor 的 422 不触发重试
+        plugin._on_post_tool_call(
+            tool_name="skill_manage",
+            args={"action": "install", "name": "y"},
+            result="{}", status="ok",
+        )
+        return [plugin._QUEUE.get_nowait(), plugin._QUEUE.get_nowait()]
+
+    def test_wraps_events_in_items_array(self, plugin):
+        events = self._two_event_body(plugin)
+        client = _SeqClient([_FakeResp(200)])
+        plugin._post_batch_with_retry(
+            client, "http://audit/api/v1/agent/audit",
+            {"Content-Type": "application/json"}, events,
+        )
+        assert len(client.calls) == 1
+        sent = json.loads(client.calls[0])
+        assert "items" in sent
+        assert len(sent["items"]) == 2
+        # Each item kept its own event_id.
+        ids = {item["event_id"] for item in sent["items"]}
+        assert len(ids) == 2
+
+    def test_per_item_duplicate_silent(self, plugin, caplog):
+        events = self._two_event_body(plugin)
+        body = json.dumps({
+            "items": [
+                {"event_id": events[0]["event_id"], "id": 101, "status": "ok"},
+                {"event_id": events[1]["event_id"], "id": 102, "status": "duplicate"},
+            ],
+        })
+        client = type("C", (), {
+            "calls": [],
+            "post": lambda self, url, content=None, headers=None: (
+                self.calls.append(content),
+                type("R", (), {"status_code": 200, "json": staticmethod(lambda: json.loads(body))})(),
+            )[1],
+        })()
+        with caplog.at_level("DEBUG", logger="audit_callback_under_test"):
+            plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        # 200 → one POST; no per-item error logs.
+        assert len(client.calls) == 1
+        assert not any("per-item error" in r.message for r in caplog.records)
+
+    def test_per_item_error_logged(self, plugin, caplog):
+        events = self._two_event_body(plugin)
+        body = json.dumps({
+            "items": [
+                {"event_id": events[0]["event_id"], "status": "ok"},
+                {"event_id": events[1]["event_id"], "status": "error",
+                 "message": "schema mismatch"},
+            ],
+        })
+        client = type("C", (), {
+            "calls": [],
+            "post": lambda self, url, content=None, headers=None: (
+                self.calls.append(content),
+                type("R", (), {"status_code": 200, "json": staticmethod(lambda: json.loads(body))})(),
+            )[1],
+        })()
+        with caplog.at_level("DEBUG", logger="audit_callback_under_test"):
+            plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert len(client.calls) == 1
+        msgs = [r.message for r in caplog.records if "per-item error" in r.message]
+        assert len(msgs) == 1
+        assert events[1]["event_id"] in msgs[0]
+        assert "schema mismatch" in msgs[0]
+
+    def test_4xx_logged_no_retry(self, plugin, caplog):
+        events = self._two_event_body(plugin)
+        client = _SeqClient([_FakeResp(400)])
+        with caplog.at_level("DEBUG", logger="audit_callback_under_test"):
+            plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert len(client.calls) == 1
+        assert any("400" in r.message for r in caplog.records)
+
+    def test_5xx_retries_then_gives_up(self, plugin, monkeypatch):
+        import httpx
+        monkeypatch.setattr(plugin.time, "sleep", lambda *_: None)
+        client = _SeqClient([_FakeResp(500), _FakeResp(500), _FakeResp(500)])
+        events = self._two_event_body(plugin)
+        plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        # 3 attempts (2 retries) before giving up.
+        assert len(client.calls) == 3
+
+    def test_5xx_then_200_succeeds(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin.time, "sleep", lambda *_: None)
+        client = _SeqClient([_FakeResp(500), _FakeResp(200)])
+        events = self._two_event_body(plugin)
+        plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert len(client.calls) == 2  # one retry, then success
+
+    def test_transient_error_retries(self, plugin, monkeypatch):
+        import httpx
+        monkeypatch.setattr(plugin.time, "sleep", lambda *_: None)
+        client = _SeqClient([
+            _FakeResp(200),  # not used — first call raises
+            _FakeResp(200),
+        ])
+        # Make the first call raise ConnectError, the next 2 attempts succeed.
+        original_post = client.post
+        calls = {"n": 0}
+        def flaky_post(self, url, content=None, headers=None):
+            calls["n"] += 1
+            self.calls.append(content)
+            if calls["n"] == 1:
+                raise httpx.ConnectError("down")
+            return _FakeResp(200)
+        import types
+        client.post = types.MethodType(flaky_post, client)
+        events = self._two_event_body(plugin)
+        plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert calls["n"] == 2  # 1 transient → 1 retry → success
+
+
+# ---------------------------------------------------------------------------
+# Sanity: the v0.4 actor-strip-and-retry path is gone.
+# ---------------------------------------------------------------------------
+
+class TestNoActorStripping:
+    """The fork11 actor-stripping retry is obsolete: the new spec supports
+    ``actor`` officially (server-overridden). A 4xx must NOT trigger a second
+    POST — failures stay terminal."""
+
+    def test_4xx_does_not_retry(self, plugin):
+        body = {
+            "event_id": "e1", "event_type": "command", "event_time": "t",
+            "actor_type": "agent", "channel": "agent",
+        }
+        client = _SeqClient([_FakeResp(422), _FakeResp(201)])
+        plugin._post_with_retry(client, "http://audit/x", {}, body)
+        # Single attempt — no actor-strip retry path.
+        assert len(client.calls) == 1
+
+    def test_no_actor_rejected_state(self, plugin):
+        """The _ACTOR_REJECTED latch is gone — there's nothing to disable."""
+        assert not hasattr(plugin, "_ACTOR_REJECTED") or True
+        # Sending a body with no actor must not look for a stripping state.
+        body = {
+            "event_id": "e1", "event_type": "command", "event_time": "t",
+            "actor_type": "agent", "channel": "agent",
+        }
+        client = _SeqClient([_FakeResp(422)])
+        plugin._post_with_retry(client, "http://audit/x", {}, body)
+        assert len(client.calls) == 1
+        # And there's no flag we could have latched.
+        assert not hasattr(plugin, "_ACTOR_REJECTED")

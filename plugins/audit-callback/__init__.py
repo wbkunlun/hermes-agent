@@ -2,11 +2,26 @@
 Execution Audit API.
 
 Conforms to the platform intake contract ``POST /api/v1/agent/audit`` with an
-``IngestSingleRequest`` body (see the platform OpenAPI "Agent Execution Audit
-API"). The platform is an append-only ledger: it receives, persists
-(``t_audit_log``), fans out to structured logs + SIEM, and dedups by
-``event_id``. Authorization / allow decisions are NOT made here — this plugin
-only *reports* what the agent did.
+``IngestBatchRequest`` body (top-level ``items``, ≤100 events; the endpoint
+also accepts a bare ``IngestSingleRequest``). See the platform OpenAPI
+"Agent Execution Audit API" for the full schema. The platform is an append-
+only ledger: it receives, persists (``t_audit_log``), fans out to structured
+logs + SIEM, and dedups by ``event_id``. Authorization / allow decisions are
+NOT made here — this plugin only *reports* what the agent did.
+
+Schema notes (v0.5)
+-------------------
+
+* ``actor`` is **server-overridden** from the auth principal (sandbox id for
+  machine reports). The client may send a value but the platform ignores it;
+  we therefore do not send it and let the server fill it from the JWT.
+* ``username`` carries the **real triggering user** — the human who initiated
+  the turn (WeWork sender_user / WeCom userid). For machine reports the
+  server keeps the agent's claimed value. Empty for CLI / cron / autonomous
+  flows.
+* ``actor_type`` and ``channel`` are sent as ``"agent"`` (this plugin runs in
+  the agent runtime).
+* ``env`` is optional — populated from ``HERMES_AUDIT_ENV`` when set.
 
 Design choices
 --------------
@@ -16,17 +31,20 @@ Design choices
   ``stdout_sha256`` …), so the record is most useful once the tool has run (or
   been blocked). Risk classification (hardline / dangerous) is recomputed from
   the command at this point — ``args`` is still available on the post hook.
-* **Async fire-and-forget.** A single daemon worker drains a bounded queue;
-  the hook only does a non-blocking ``Queue.put``. HTTP I/O, retries and
-  response handling happen off the agent thread, wrapped so any failure is
-  logged at debug and discarded — audit reporting can never block or break the
-  agent loop.
+* **Batched async fire-and-forget.** Events are queued; the daemon worker
+  collects up to 100 per POST and ships as ``{"items": [...]}`` so the wire
+  stays cheap. The hook only does a non-blocking ``Queue.put``. HTTP I/O,
+  retries and per-item response handling happen off the agent thread, wrapped
+  so any failure is logged at debug and discarded — audit reporting can never
+  block or break the agent loop.
 * **Idempotent.** Each event gets a client-generated ``event_id`` (UUID). The
   worker retries transient failures (connect / timeout / 5xx) a couple of times
   with short backoff; the platform dedups by ``event_id``, so retries are safe.
-* **Auth.``Authorization: <CONTROL_PLANE_AUTH>`` — the per-sandbox JWT injected
-  at deploy time (value already includes the ``Bearer `` prefix, per the
-  platform's sandbox-injection flow). Falls back to ``HERMES_AUDIT_TOKEN``
+  Per-item ``status:"duplicate"`` in the BatchResult is not an error — it means
+  the platform already had the event.
+* **Auth.** ``Authorization: <CONTROL_PLANE_AUTH>`` — the per-sandbox JWT
+  injected at deploy time (value already includes the ``Bearer `` prefix, per
+  the platform's sandbox-injection flow). Falls back to ``HERMES_AUDIT_TOKEN``
   (used as ``Bearer <token>``) for non-sandbox setups. When neither is set the
   plugin still POSTs (the platform will 401); set the URL empty to disable.
 
@@ -36,6 +54,8 @@ Reportable events
 * ``terminal`` commands classified as ``hardline`` (→ ``risk_level=critical``)
   or ``dangerous`` (→ ``high``) by the SAME detectors the command guard uses.
 * ``skill_manage`` calls (install / update / delete) → ``risk_level=medium``.
+* ``skill_view`` calls (skill content loaded into prompt) → ``risk_level=medium``.
+* ``write_file``/``patch`` calls → ``info`` (empty writes escalate to ``medium``).
 * ``execute_code`` calls (arbitrary local Python — can spawn subprocesses
   that bypass the terminal guard) → ``high`` when the code matches process-
   spawn / dynamic-exec indicators, else ``medium``.
@@ -47,7 +67,8 @@ Env knobs: ``HERMES_AUDIT_CALLBACK_URL`` (explicit intake URL; if empty,
 derives ``<CONTROL_PLANE_URL>/api/v1/agent/audit`` — the same control-plane
 base address the whitelist fetch uses; neither set = off),
 ``CONTROL_PLANE_AUTH`` / ``HERMES_AUDIT_TOKEN``, ``HERMES_AUDIT_TIMEOUT``
-(default 3s), ``HERMES_AUDIT_REPORT_ALL_COMMANDS``, optional ``SANDBOX_ID``.
+(default 3s), ``HERMES_AUDIT_REPORT_ALL_COMMANDS``, ``HERMES_AUDIT_ENV``
+(optional ``env`` field on every event), optional ``SANDBOX_ID``.
 """
 
 from __future__ import annotations
@@ -141,6 +162,11 @@ def _sandbox_id() -> str:
     return os.environ.get("SANDBOX_ID", "").strip()
 
 
+def _audit_env() -> str:
+    """Optional ``env`` field on every event (e.g. ``dev`` / ``staging`` / ``prod``)."""
+    return os.environ.get("HERMES_AUDIT_ENV", "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Bounded queue + single daemon worker
 # ---------------------------------------------------------------------------
@@ -149,10 +175,13 @@ _QUEUE: "queue.Queue[Any]" = queue.Queue(maxsize=1000)
 _WORKER_LOCK = threading.Lock()
 _WORKER_STARTED = False
 _DROPPED = 0  # best-effort overflow counter
-# Latched when the platform intake accepts an event only after the actor
-# block is stripped (422 → stripped retry → 2xx): stop attaching actor until
-# process restart so every event still lands. Cleared only by restart.
-_ACTOR_REJECTED = False
+
+# Drain: collect up to N events per POST, then ship as ``{"items": [...]}``.
+# The first event blocks for up to _BATCH_WAIT to allow other producers to
+# enqueue into the same batch; subsequent drains are non-blocking. 100 is the
+# spec's per-batch cap (IngestBatchRequest.maxItems).
+_BATCH_MAX = 100
+_BATCH_WAIT = 0.05  # seconds
 
 
 def _dropped_count() -> int:
@@ -187,10 +216,10 @@ def _post_one(client, url: str, headers: Dict[str, str], body: Dict[str, Any]):
 
 
 def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, Any]) -> None:
-    """POST with a couple of transient-error retries. Never raises.
+    """POST a single event with a couple of transient-error retries. Never raises.
 
-    Retries only on connect/timeout/5xx. 2xx and 4xx (incl. 409 duplicate) are
-    terminal — the platform dedups by ``event_id``, so a duplicate is success.
+    Retries only on connect/timeout/5xx. 2xx and 4xx are terminal — the
+    platform dedups by ``event_id``, so a 409 duplicate is success.
     """
     import httpx
 
@@ -211,35 +240,7 @@ def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, 
             return
         code = resp.status_code
         if code < 500:
-            if code in (400, 422) and "actor" in body:
-                # Schema defense (fork11): the intake's IngestSingleRequest may
-                # predate the actor block. Retry once WITHOUT it so the event
-                # is not lost; if the stripped copy lands, latch
-                # _ACTOR_REJECTED and say so loudly — the operator should
-                # upgrade the platform schema to keep user attribution.
-                stripped = {k: v for k, v in body.items() if k != "actor"}
-                try:
-                    resp2 = _post_one(client, url, headers, stripped)
-                except Exception as exc:  # noqa: BLE001 — never break the loop
-                    logger.debug(
-                        "audit-callback: actor-stripped retry error for %s: %s", event_id, exc,
-                    )
-                    return
-                if resp2.status_code < 400:
-                    _set_actor_rejected()
-                    logger.warning(
-                        "audit-callback: intake returned %d for the actor block but "
-                        "accepted the event without it — actor attribution disabled "
-                        "until restart. Upgrade the platform schema "
-                        "(/api/v1/agent/audit IngestSingleRequest) to carry actor.",
-                        code,
-                    )
-                else:
-                    logger.debug(
-                        "audit-callback: actor-stripped retry still %d for %s",
-                        resp2.status_code, event_id,
-                    )
-            elif code >= 400:
+            if code >= 400:
                 logger.debug("audit-callback: server returned %d for %s", code, event_id)
             return
         if attempt < 2:  # 5xx → retry
@@ -249,13 +250,113 @@ def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, 
         return
 
 
+def _post_batch_with_retry(
+    client, url: str, headers: Dict[str, str], events: list,
+) -> None:
+    """POST a batch of events (or one wrapped in items) with retries. Never raises.
+
+    The body is always ``{"items": [...]}`` so the worker has a single code
+    path; the platform accepts IngestBatchRequest on the same endpoint that
+    accepts IngestSingleRequest. Retries on transient errors / 5xx; on 2xx
+    per-item statuses are processed (duplicate is fine, error logged).
+    """
+    import httpx
+
+    body = {"items": events}
+    transient = (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError)
+    backoff = (0.5, 1.0)
+    for attempt in range(3):
+        try:
+            resp = _post_one(client, url, headers, body)
+        except transient as exc:
+            if attempt < 2:
+                time.sleep(backoff[attempt])
+                continue
+            logger.debug(
+                "audit-callback: giving up on batch of %d after transient errors: %s",
+                len(events), exc,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — non-transient; don't retry
+            logger.debug("audit-callback: batch POST error (no retry): %s", exc)
+            return
+        code = resp.status_code
+        if code < 500:
+            if code >= 400:
+                snippet = getattr(resp, "text", "") or ""
+                logger.debug(
+                    "audit-callback: server returned %d for batch of %d: %s",
+                    code, len(events), snippet[:200],
+                )
+            else:
+                _log_batch_results(resp, events)
+            return
+        if attempt < 2:  # 5xx → retry the whole batch
+            time.sleep(backoff[attempt])
+            continue
+        logger.debug(
+            "audit-callback: server returned %d for batch of %d after retries",
+            code, len(events),
+        )
+        return
+
+
+def _log_batch_results(resp, events: list) -> None:
+    """Process per-item statuses from a BatchResult (HTTP 200).
+
+    ``status:"duplicate"`` is expected and silent (platform dedup);
+    ``status:"error"`` is logged at debug so a misbehaving intake is visible
+    in logs without flooding them.
+    """
+    try:
+        data = resp.json()
+    except Exception:
+        return
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if status == "error":
+            event_id = item.get("event_id", "?")
+            message = item.get("message", "")
+            logger.debug("audit-callback: per-item error for %s: %s", event_id, message)
+        # 'ok' and 'duplicate' are both fine — silent.
+
+
+def _collect_batch() -> list:
+    """Collect up to ``_BATCH_MAX`` events from the queue.
+
+    Waits briefly for the first event (to allow batching under load); once
+    the first event arrives, drains whatever else is queued without further
+    waiting. Returns an empty list when no event arrives within
+    ``_BATCH_WAIT``.
+    """
+    events: list = []
+    try:
+        first = _QUEUE.get(timeout=_BATCH_WAIT)
+    except queue.Empty:
+        return events
+    events.append(first)
+    while len(events) < _BATCH_MAX:
+        try:
+            events.append(_QUEUE.get_nowait())
+        except queue.Empty:
+            break
+    return events
+
+
 def _drain() -> None:
-    """Pop events off the queue and POST them. Never raises."""
+    """Pull batches off the queue and POST them. Never raises."""
     import httpx
 
     client = httpx.Client(timeout=_timeout())
     while True:
-        body = _QUEUE.get()  # blocks until an event arrives
+        events = _collect_batch()
+        if not events:
+            continue
         url = _intake_url()
         if not url:
             # URL was unset between enqueue and drain — nothing to do.
@@ -264,11 +365,18 @@ def _drain() -> None:
         auth = _auth_header()
         if auth:
             headers["Authorization"] = auth
-        trace_id = body.get("trace_id") or ""
+        # Forward the trace id of the first event in the batch as the
+        # batch-level X-Trace-ID — individual events keep their own trace_id
+        # in the body. Falls back to the first event's trace_id.
+        trace_id = ""
+        for ev in events:
+            trace_id = str(ev.get("trace_id") or "")
+            if trace_id:
+                break
         if trace_id:
             headers["X-Trace-ID"] = trace_id
         try:
-            _post_with_retry(client, url, headers, body)
+            _post_batch_with_retry(client, url, headers, events)
         except Exception as exc:  # noqa: BLE001 — never break the loop
             logger.debug("audit-callback: drain error: %s", exc)
 
@@ -371,53 +479,48 @@ def _summarize_skill_args(args: Any) -> Dict[str, Any]:
     return out
 
 
-def _set_actor_rejected() -> None:
-    global _ACTOR_REJECTED
-    _ACTOR_REJECTED = True
-
-
-def _current_actor() -> Dict[str, Any]:
-    """Identity of the user who triggered this turn (fork11).
+def _current_username() -> str:
+    """The real terminal user who triggered this turn (spec ``username``).
 
     Read from the gateway's task-local session context — the same
     ``SessionSource`` the dispatch bound from the platform adapter (e.g.
     WeWork ``sender_user`` at plugins/platforms/wework/adapter.py, WeCom
-    ``userid``). Empty dict for CLI / cron / local sessions and any context
-    where no channel identity was bound.
+    ``userid``). Empty for CLI / cron / local sessions and any context where
+    no channel identity was bound. Capped at 128 chars per the spec.
     """
     try:
         from gateway.session_context import get_session_env
     except Exception:  # noqa: BLE001 — plugin must stay loadable standalone
-        return {}
-    actor: Dict[str, Any] = {}
-    for env_key, field in (
-        ("HERMES_SESSION_USER_ID", "user_id"),
-        ("HERMES_SESSION_USER_NAME", "user_name"),
-        ("HERMES_SESSION_PLATFORM", "platform"),
-        ("HERMES_SESSION_CHAT_ID", "chat_id"),
-        ("HERMES_SESSION_CHAT_TYPE", "chat_type"),
-    ):
-        value = str(get_session_env(env_key, "") or "").strip()
-        if value:
-            actor[field] = value[:200]
-    return actor
+        return ""
+    return str(get_session_env("HERMES_SESSION_USER_NAME", "") or "").strip()[:128]
 
 
 def _common_fields(tool_call_id: str, trace_id: str) -> Dict[str, Any]:
+    """Fields attached to every event: identity, timing, sandbox.
+
+    Note: ``actor`` is intentionally NOT sent. The spec marks it as
+    server-overridden from the auth principal (sandbox id for machine
+    reports); client self-report is ignored. ``username`` is the real
+    triggering user and is the only client-attested identity.
+    """
     body: Dict[str, Any] = {
         "event_id": uuid.uuid4().hex,
         "event_time": datetime.now(timezone.utc).isoformat(),
         "execution_id": tool_call_id or "",
         "trace_id": trace_id,
+        "actor_type": "agent",
+        "channel": "agent",
     }
     sb = _sandbox_id()
     if sb:
         body["resource_type"] = "sandbox"
         body["resource_id"] = sb
-    if not _ACTOR_REJECTED:
-        actor = _current_actor()
-        if actor:
-            body["actor"] = actor
+    env = _audit_env()
+    if env:
+        body["env"] = env
+    username = _current_username()
+    if username:
+        body["username"] = username
     return body
 
 
@@ -556,7 +659,7 @@ def _build_skill_view_body(
         "action": "skill.invoke",
         "risk_level": "medium",
         "risk_reason": "skill loaded into conversation (content injected into prompt)",
-        "decision": decision if ok else "deny",
+        "decision": decision if ok else "blocked",
         "result": result_enum,
         "duration_ms": int(duration_ms or 0),
         "payload": payload,
