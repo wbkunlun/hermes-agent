@@ -73,6 +73,10 @@ class WeComMediaMixin:
             _ref("image", body)
             if msgtype == "file":
                 _ref("file", body)
+            # fork: inbound video (DM-only per WeCom docs) — same download/decrypt
+            # pipeline as files, capped at VIDEO_MAX_BYTES (10MB).
+            if msgtype == "video" and isinstance(body.get("video"), dict):
+                _ref("video", body)
             if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):  # AI Bot attachments (PDF/Word/Excel)
                 _ref("file", body["appmsg"]) or _ref("image", body["appmsg"])
         quote = _dict_at(body, "quote")

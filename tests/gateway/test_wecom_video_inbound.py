@@ -62,10 +62,12 @@ class TestCacheVideo:
         monkeypatch.setattr(
             adapter, "_guess_filename", lambda url, cd, ct: "video_no_ext",
         )
-        from plugins.platforms.wecom import adapter as wa
-        monkeypatch.setattr(
-            wa, "cache_document_from_bytes", lambda raw, filename: str(tmp_path / filename),
-        )
+        from plugins.platforms.wecom import media as wecom_media
+
+        async def fake_cache_doc(raw, filename):
+            return str(tmp_path / filename)
+
+        monkeypatch.setattr(wecom_media, "cache_document_from_bytes_async", fake_cache_doc)
         path, _content_type = await adapter._cache_media("video", {"url": "https://x/v"})
         assert path.endswith(".mp4")
 
@@ -81,10 +83,12 @@ class TestCacheVideo:
         monkeypatch.setattr(
             adapter, "_guess_filename", lambda url, cd, ct: "video_no_ext",
         )
-        from plugins.platforms.wecom import adapter as wa
-        monkeypatch.setattr(
-            wa, "cache_document_from_bytes", lambda raw, filename: str(tmp_path / filename),
-        )
+        from plugins.platforms.wecom import media as wecom_media
+
+        async def fake_cache_doc(raw, filename):
+            return str(tmp_path / filename)
+
+        monkeypatch.setattr(wecom_media, "cache_document_from_bytes_async", fake_cache_doc)
         path, _ = await adapter._cache_media("video", {"url": "https://x/v"})
         assert path.endswith(".webm")
 
@@ -100,10 +104,12 @@ class TestCacheVideo:
         monkeypatch.setattr(
             adapter, "_guess_filename", lambda url, cd, ct: "clip.mp4",
         )
-        from plugins.platforms.wecom import adapter as wa
-        monkeypatch.setattr(
-            wa, "cache_document_from_bytes", lambda raw, filename: str(tmp_path / filename),
-        )
+        from plugins.platforms.wecom import media as wecom_media
+
+        async def fake_cache_doc(raw, filename):
+            return str(tmp_path / filename)
+
+        monkeypatch.setattr(wecom_media, "cache_document_from_bytes_async", fake_cache_doc)
         path, _ = await adapter._cache_media("video", {"url": "https://x/clip.mp4"})
         # 已有扩展名不再追加魔数后缀
         assert path.endswith("clip.mp4")

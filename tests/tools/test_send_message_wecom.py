@@ -36,17 +36,19 @@ def _stub_gateway_run(live_adapter=None, runner=None):
 class TestSendToPlatformWecom:
     def test_wecom_send_routes_through_live_adapter(self):
         """A live in-process WeCom adapter must receive the send directly.
-        The standalone ephemeral path (which opens a second WS and displaces
-        the gateway session → 846609) must NOT be used when a live adapter
-        is available."""
+        Upstream v2026.9.14 routes wecom text through _registry_standalone_send
+        → adapter._standalone_send, whose live-first path reuses the gateway's
+        adapter (profile-aware via _live_adapter). The ephemeral path (a second
+        WS that displaces the gateway session → 846609) must NOT be used while
+        a live adapter is reachable."""
         live_send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
         fake_run, _ = _stub_gateway_run(live_adapter=SimpleNamespace(send=live_send))
 
         with patch.dict(sys.modules, {"gateway.run": fake_run}), \
              patch(
-                 "tools.send_message_tool._registry_standalone_send",
+                 "plugins.platforms.wecom.adapter.WeComAdapter.connect",
                  new_callable=AsyncMock,
-             ) as standalone:
+             ) as ephemeral_connect:
             result = asyncio.run(
                 _send_to_platform(Platform.WECOM, SimpleNamespace(extra={}), "brycehuang", "hello")
             )
@@ -54,10 +56,10 @@ class TestSendToPlatformWecom:
         assert result["success"] is True
         assert result["message_id"] == "m1"
         live_send.assert_awaited_once()
-        assert live_send.call_args.kwargs.get("chat_id") == "brycehuang"
-        # CRITICAL regression guard: standalone ephemeral send (the
-        # displacement fingerprint: fresh adapter + connect) was NOT used.
-        standalone.assert_not_awaited()
+        assert live_send.call_args.args[0] == "brycehuang"
+        # CRITICAL regression guard: the ephemeral connect (the displacement
+        # fingerprint: fresh adapter + connect) was NOT used.
+        ephemeral_connect.assert_not_awaited()
 
     def test_wecom_send_falls_back_to_standalone_when_no_runner(self):
         """When no live runner is available (true out-of-process caller),

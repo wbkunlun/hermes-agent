@@ -142,7 +142,7 @@ class TestSendInnerFallbackSeam:
 
         result = await adapter._send_inner("zhangsan", "hello bot")
         assert result.success is True
-        assert result.raw_response == {"agent_fallback": True, "reason": "bot send error: proactive send exploded"}
+        assert result.raw_response == {"agent_fallback": True, "reason": "bot send failed: proactive send exploded"}
         assert sent == [("zhangsan", "hello bot")]
 
     @pytest.mark.asyncio
