@@ -138,3 +138,87 @@ class TestHealthCounters:
         for t in threads:
             t.join()
         assert c.snapshot(now=600.0)["calls"] == 2000
+
+
+# ---------------------------------------------------------------------------
+# model_check / stuck_check (Task 2)
+# ---------------------------------------------------------------------------
+
+def _snap(lib, *, calls=0, errors=0, consecutive=0, last_success=None, last_error=None,
+          last_inbound=None, last_tool=None, in_flight=False, in_flight_age=None,
+          last_error_info=None, window_s=900):
+    return {
+        "calls": calls, "errors": errors, "consecutive_errors": consecutive,
+        "last_success_ts": last_success, "last_success_at": lib.utc_now_iso(last_success),
+        "last_error_ts": last_error, "last_error_at": lib.utc_now_iso(last_error),
+        "last_inbound_ts": last_inbound, "last_inbound_at": lib.utc_now_iso(last_inbound),
+        "last_tool_ts": last_tool, "last_tool_at": lib.utc_now_iso(last_tool),
+        "in_flight": in_flight, "in_flight_age_s": in_flight_age,
+        "last_error": last_error_info, "window_s": window_s,
+    }
+
+
+class TestModelCheck:
+    def test_no_data_when_idle(self, lib):
+        out = lib.model_check(_snap(lib), now_epoch=1000.0)
+        assert out["status"] == "no_data"
+
+    def test_ok_after_success(self, lib):
+        out = lib.model_check(_snap(lib, calls=2, last_success=990.0), now_epoch=1000.0)
+        assert out["status"] == "ok"
+
+    def test_down_on_consecutive_failures(self, lib):
+        snap = _snap(lib, consecutive=3, errors=3, last_error=995.0,
+                     last_error_info={"reason": "auth", "status_code": 401})
+        out = lib.model_check(snap, now_epoch=1000.0, consecutive_down=3)
+        assert out["status"] == "down"
+        assert "API key" in out["remediation"]
+
+    def test_down_rate_limit_hint(self, lib):
+        snap = _snap(lib, consecutive=5, errors=5,
+                     last_error_info={"reason": "rate_limit", "status_code": 429})
+        out = lib.model_check(snap, now_epoch=1000.0)
+        assert out["status"] == "down" and "限流" in out["remediation"]
+
+    def test_degraded_on_error_success_mix(self, lib):
+        snap = _snap(lib, calls=2, errors=1, consecutive=0, last_success=998.0,
+                     last_error=995.0, last_error_info={"reason": "timeout"})
+        out = lib.model_check(snap, now_epoch=1000.0)
+        assert out["status"] == "degraded" and "fallback" in out["remediation"]
+
+    def test_degraded_on_stale_in_flight(self, lib):
+        snap = _snap(lib, in_flight=True, in_flight_age=700.0, calls=1, last_success=800.0)
+        out = lib.model_check(snap, now_epoch=1000.0, inflight_stale_s=600.0)
+        assert out["status"] == "degraded" and "/stop" in out["remediation"]
+
+    def test_fresh_in_flight_is_ok(self, lib):
+        snap = _snap(lib, in_flight=True, in_flight_age=30.0, calls=1, last_success=990.0)
+        assert lib.model_check(snap, now_epoch=1000.0)["status"] == "ok"
+
+
+class TestStuckCheck:
+    def test_ok_when_no_inbound(self, lib):
+        assert lib.stuck_check(_snap(lib), now_epoch=1000.0)["status"] == "ok"
+
+    def test_ok_when_progress_after_inbound(self, lib):
+        snap = _snap(lib, last_inbound=900.0, last_success=950.0)
+        assert lib.stuck_check(snap, now_epoch=1000.0)["status"] == "ok"
+
+    def test_ok_when_tool_progress_after_inbound(self, lib):
+        snap = _snap(lib, last_inbound=900.0, last_tool=920.0)
+        assert lib.stuck_check(snap, now_epoch=1000.0)["status"] == "ok"
+
+    def test_ok_while_in_flight(self, lib):
+        snap = _snap(lib, last_inbound=900.0, in_flight=True)
+        assert lib.stuck_check(snap, now_epoch=1000.0, stuck_minutes=10.0)["status"] == "ok"
+
+    def test_degraded_when_unanswered_beyond_threshold(self, lib):
+        snap = _snap(lib, last_inbound=900.0)  # 100s unanswered, threshold 60s
+        out = lib.stuck_check(snap, now_epoch=1000.0, stuck_minutes=1.0)
+        assert out["status"] == "degraded"
+        assert out["unanswered_min"] == 1.7  # 100s in minutes
+        assert "/new" in out["remediation"]
+
+    def test_ok_within_grace_window(self, lib):
+        snap = _snap(lib, last_inbound=950.0)
+        assert lib.stuck_check(snap, now_epoch=1000.0, stuck_minutes=10.0)["status"] == "ok"
