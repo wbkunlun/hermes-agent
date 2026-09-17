@@ -7,8 +7,9 @@ description: >
   a wedged loop still answers. Checks: process/state-file ownership, loop
   heartbeat freshness (30s writer, 150s TTL), passive model health (window
   counters from pre/post_api_request + api_request_error hooks; consecutive
-  failures, fallback inference, in-flight staleness), WeCom platform connection
-  state (gateway_state.json), system readiness (state.db/config/disk/queues +
+  failures, fallback inference, in-flight staleness), chat-platform connection
+  states (gateway_state.json platforms.*: wecom + wework, worst wins), system
+  readiness (state.db/config/disk/queues +
   memory pressure), and silent-stall detection (inbound with no progress).
   Zero active LLM probes. Env: HEALTH_CHECK_ENABLED (default on),
   HEALTH_CHECK_HOST (127.0.0.1), HEALTH_CHECK_PORT (7860), plus threshold

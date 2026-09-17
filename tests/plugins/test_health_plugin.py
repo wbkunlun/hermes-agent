@@ -306,6 +306,40 @@ class TestPlatformProbe:
         assert lib.probe_platform(home)["status"] == "down"
 
 
+class TestPlatformsProbe:
+    def test_missing_state_falls_back_to_wecom_unknown(self, lib, home):
+        out = lib.probe_platforms(home)
+        assert out["status"] == "unknown"
+        assert out["platform"] == "wecom"  # single-probe fallback shape
+
+    def test_both_connected_ok(self, lib, home):
+        _write_gateway_state(home, {"pid": 1, "platforms": {
+            "wecom": {"state": "connected"}, "wework": {"state": "connected"}}})
+        out = lib.probe_platforms(home)
+        assert out["status"] == "ok"
+        assert set(out["platforms"]) == {"wecom", "wework"}
+        assert all(b["status"] == "ok" for b in out["platforms"].values())
+        assert "remediation" not in out
+
+    def test_wework_down_worst_wins_with_label(self, lib, home):
+        _write_gateway_state(home, {"pid": 1, "platforms": {
+            "wecom": {"state": "connected"},
+            "wework": {"state": "disconnected", "retrying_since": _iso_ago(1200)}}})
+        out = lib.probe_platforms(home, platform_down_minutes=10.0)
+        assert out["status"] == "down"
+        assert out["platforms"]["wework"]["status"] == "down"
+        assert out["platforms"]["wecom"]["status"] == "ok"
+        assert "[wework]" in out["remediation"] and "WeWork" in out["remediation"]
+
+    def test_wecom_degraded_only(self, lib, home):
+        _write_gateway_state(home, {"pid": 1, "platforms": {
+            "wecom": {"state": "disconnected", "retrying_since": _iso_ago(30)},
+            "wework": {"state": "connected"}}})
+        out = lib.probe_platforms(home)
+        assert out["status"] == "degraded"
+        assert "WeCom" in out["remediation"]
+
+
 class TestSystemProbe:
     def test_all_ok_with_model_config(self, lib, home):
         (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")

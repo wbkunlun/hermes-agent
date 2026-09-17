@@ -27,6 +27,8 @@ from typing import Any, Dict, Optional
 LOOP_HEARTBEAT_TTL_S = 150.0
 _CONNECTED_STATES = {"connected", "running", "ok"}
 _TRUTHY = {"1", "true", "yes", "y", "on"}
+# Remediation wording per platform key (anything unknown is labeled by its key).
+_PLATFORM_LABELS = {"wecom": "WeCom 智能机器人", "wework": "WeWork"}
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -342,7 +344,9 @@ def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: s
     platforms = record.get("platforms") if isinstance(record, dict) else None
     entry = platforms.get(platform) if isinstance(platforms, dict) else None
     if not isinstance(entry, dict):
-        return {"status": "unknown", "detail": f"platform {platform} not started"}
+        return {"status": "unknown", "platform": platform,
+                "detail": f"platform {platform} not started"}
+    label = _PLATFORM_LABELS.get(platform, platform)
     state = str(entry.get("state") or "unknown").lower()
     needs_attention = bool(entry.get("needs_attention"))
     out: Dict[str, Any] = {"status": "ok", "platform": platform, "state": state,
@@ -352,16 +356,48 @@ def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: s
         return out
     if needs_attention:
         out.update({"status": "down", "detail": "reconnect loop escalated (needs_attention)",
-                    "remediation": "WeCom 连接持续重连失败：检查智能机器人凭证与网络出口"})
+                    "remediation": f"{label} 持续重连失败：检查平台凭证与网络出口"})
         return out
     retrying_since = _iso_to_epoch(entry.get("retrying_since"))
     if retrying_since is not None and (now - retrying_since) > platform_down_minutes * 60.0:
         minutes = int((now - retrying_since) // 60)
         out.update({"status": "down", "detail": f"disconnected and retrying for {minutes} min",
-                    "remediation": "WeCom 断连超过阈值：检查智能机器人凭证与网络出口"})
+                    "remediation": f"{label} 断连超过阈值：检查平台凭证与网络出口"})
         return out
     out.update({"status": "degraded", "detail": f"state={state} (reconnecting)",
-                "remediation": "WeCom 连接异常重连中；持续断连检查凭证与网络"})
+                "remediation": f"{label} 连接异常重连中；持续断连检查平台凭证与网络"})
+    return out
+
+
+def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
+                    platform_down_minutes: float = 10.0) -> Dict[str, Any]:
+    """Every started chat platform in gateway_state.json (this deployment runs
+    wecom + wework), each probed individually; worst status wins. With no
+    platform entries yet the block falls back to a single wecom probe (which
+    reports ``unknown / not started``) so the shape stays stable."""
+    try:
+        record = _read_gateway_state(home)
+    except Exception:
+        record = None
+    platforms = record.get("platforms") if isinstance(record, dict) else None
+    names = sorted(k for k, v in platforms.items() if isinstance(v, dict)) \
+        if isinstance(platforms, dict) else []
+    if not names:
+        return probe_platform(home, now_epoch=now_epoch, platform="wecom",
+                              platform_down_minutes=platform_down_minutes)
+    entries: Dict[str, Any] = {}
+    statuses = []
+    remediations = []
+    for name in names:
+        block = probe_platform(home, now_epoch=now_epoch, platform=name,
+                               platform_down_minutes=platform_down_minutes)
+        entries[name] = block
+        statuses.append(block["status"])
+        if block.get("remediation"):
+            remediations.append(f"[{name}] {block['remediation']}")
+    out: Dict[str, Any] = {"status": aggregate(*statuses), "platforms": entries}
+    if remediations:
+        out["remediation"] = "；".join(remediations)
     return out
 
 
@@ -449,7 +485,7 @@ def build_health_detail(snapshot: Dict[str, Any], *, home: Path, now_epoch: Opti
     home = Path(home)
     process = probe_process(home)
     loop = probe_loop(home, now_epoch=now_epoch)
-    platform = probe_platform(home, now_epoch=now_epoch, platform_down_minutes=platform_down_minutes)
+    platform = probe_platforms(home, now_epoch=now_epoch, platform_down_minutes=platform_down_minutes)
     system = probe_system(home)
     model = model_check(snapshot, now_epoch=now_epoch, consecutive_down=consecutive_down,
                         inflight_stale_s=inflight_stale_s)
