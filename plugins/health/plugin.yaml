@@ -1,0 +1,23 @@
+name: health
+version: "0.1.0"
+description: >
+  (fork, wehermes) In-process passive health endpoint for the WeCom gateway.
+  Serves GET /health (aggregate) and GET /health/detail (per-check detail with
+  Chinese remediation hints) from a daemon thread off the main event loop, so
+  a wedged loop still answers. Checks: process/state-file ownership, loop
+  heartbeat freshness (30s writer, 150s TTL), passive model health (window
+  counters from pre/post_api_request + api_request_error hooks; consecutive
+  failures, fallback inference, in-flight staleness), WeCom platform connection
+  state (gateway_state.json), system readiness (state.db/config/disk/queues +
+  memory pressure), and silent-stall detection (inbound with no progress).
+  Zero active LLM probes. Env: HEALTH_CHECK_ENABLED (default on),
+  HEALTH_CHECK_HOST (127.0.0.1), HEALTH_CHECK_PORT (7860), plus threshold
+  knobs HEALTH_MODEL_WINDOW_S / HEALTH_CONSECUTIVE_ERRORS /
+  HEALTH_INFLIGHT_STALE_S / HEALTH_STUCK_MINUTES / HEALTH_PLATFORM_DOWN_MINUTES.
+author: "wehermes"
+hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_gateway_dispatch
+  - post_tool_call

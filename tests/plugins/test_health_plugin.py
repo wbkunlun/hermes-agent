@@ -472,3 +472,105 @@ class TestHttpServer:
         finally:
             first.shutdown()
             first.server_close()
+
+
+# ---------------------------------------------------------------------------
+# register() wiring + real discovery (Task 6)
+# ---------------------------------------------------------------------------
+
+class _FakeCtx:
+    def __init__(self):
+        self.hooks = {}
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+
+@pytest.fixture
+def plugin():
+    from plugins.plugin_loader import load_plugin_module
+    import logging as _logging
+    return load_plugin_module("plugins.health_under_test", _PLUGIN_DIR, parents=("plugins",),
+                              logger=_logging.getLogger("health-test"))
+
+
+class TestRegister:
+    def test_disabled_skips_everything(self, plugin, monkeypatch):
+        monkeypatch.setenv("HEALTH_CHECK_ENABLED", "0")
+        started = []
+        monkeypatch.setattr(plugin, "start_server", lambda **kw: started.append(kw) or object())
+        ctx = _FakeCtx()
+        plugin.register(ctx)
+        assert ctx.hooks == {} and started == []
+
+    def test_enabled_registers_five_hooks_and_starts_server(self, plugin, monkeypatch):
+        monkeypatch.setenv("HEALTH_CHECK_ENABLED", "1")
+        monkeypatch.setenv("HEALTH_CHECK_HOST", "127.0.0.1")
+        monkeypatch.setenv("HEALTH_CHECK_PORT", "7860")
+        started = []
+        monkeypatch.setattr(plugin, "start_server", lambda **kw: started.append(kw) or object())
+        ctx = _FakeCtx()
+        plugin.register(ctx)
+        assert set(ctx.hooks) == {"pre_api_request", "post_api_request", "api_request_error",
+                                  "pre_gateway_dispatch", "post_tool_call"}
+        assert len(started) == 1
+        assert started[0]["host"] == "127.0.0.1" and started[0]["port"] == 7860
+
+    def test_hooks_feed_counters(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "start_server", lambda **kw: None)
+        ctx = _FakeCtx()
+        plugin.register(ctx)
+        # drive the api hooks with realistic kwargs (hermes_cli/hooks.py payload shapes)
+        ctx.hooks["pre_api_request"](session_id="s1", provider="zhipu", model="glm-4.7")
+        ctx.hooks["post_api_request"](session_id="s1", provider="zhipu", model="glm-4.7",
+                                      api_duration=1.2)
+        ctx.hooks["api_request_error"](session_id="s1", provider="zhipu", model="glm-4.7",
+                                       reason="rate_limit", status_code=429, retryable=True,
+                                       error={"type": "RateLimitError", "message": "slow down"})
+        ctx.hooks["pre_gateway_dispatch"](event=object(), gateway=None, session_store=None)
+        ctx.hooks["post_tool_call"](tool_name="terminal", session_id="s1")
+        counters = plugin._COUNTERS
+        snap = counters.snapshot()
+        assert snap["calls"] == 1 and snap["errors"] == 1
+        assert snap["last_error"]["reason"] == "rate_limit"
+        assert snap["last_inbound_ts"] is not None and snap["last_tool_ts"] is not None
+        assert snap["consecutive_errors"] == 1
+
+    def test_guard_swallows_hook_exceptions(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "start_server", lambda **kw: None)
+        ctx = _FakeCtx()
+        plugin.register(ctx)
+        # the guard captured the bound sink method at register time, so break the
+        # counters method it calls to force the failure path
+        counters = plugin._COUNTERS
+        original = counters.on_success
+
+        def boom(**kw):
+            raise RuntimeError("boom")
+
+        counters.on_success = boom
+        try:
+            ctx.hooks["post_api_request"](session_id="s1")  # must not raise
+        finally:
+            counters.on_success = original
+
+
+class TestRealDiscovery:
+    def test_discovery_serves_health_over_http(self, tmp_path, monkeypatch):
+        """config.yaml enables 'health' → real PluginManager discovery →
+        register() → real server on a free port → GET /health answers."""
+        import yaml as _yaml
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        (home / "config.yaml").write_text(
+            _yaml.safe_dump({"plugins": {"enabled": ["health"]}}), encoding="utf-8")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = probe.getsockname()[1]
+        monkeypatch.setenv("HEALTH_CHECK_PORT", str(free_port))
+        import hermes_cli.plugins as hp
+        hp.discover_plugins(force=True)
+        code, body = _get(f"http://127.0.0.1:{free_port}/health")
+        assert code in (200, 503)
+        assert body["status"] in {"ok", "degraded", "down", "unknown"}
