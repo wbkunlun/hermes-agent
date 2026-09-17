@@ -256,3 +256,172 @@ def stuck_check(snapshot: Dict[str, Any], *, now_epoch: Optional[float] = None,
     else:
         out["detail"] = "recent inbound still within grace window"
     return out
+
+
+# ---------------------------------------------------------------------------
+# Read-only probes over the gateway file contract
+# ---------------------------------------------------------------------------
+
+def _read_gateway_state(home: Path) -> Optional[Dict[str, Any]]:
+    from gateway.status import read_runtime_status
+    record = read_runtime_status(Path(home) / "gateway_state.json")
+    return record if isinstance(record, dict) else None
+
+
+def probe_process(home: Path) -> Dict[str, Any]:
+    """Liveness by construction: an HTTP response proves this process serves.
+    The state file adds ownership — a dead writer means a stale file, a live
+    foreign PID means two gateways share one HERMES_HOME."""
+    out: Dict[str, Any] = {"status": "ok", "pid": os.getpid()}
+    try:
+        record = _read_gateway_state(home)
+    except Exception as exc:
+        out["file"] = "unreadable"
+        out["detail"] = f"gateway_state.json read failed: {type(exc).__name__}"
+        return out
+    if record is None:
+        out["file"] = "missing"
+        out["detail"] = "gateway_state.json not written yet (still starting)"
+        return out
+    out["gateway_state"] = record.get("gateway_state")
+    file_pid = record.get("pid")
+    out["file_pid"] = file_pid if isinstance(file_pid, int) else None
+    try:
+        from gateway.status import runtime_status_pid_is_live
+        live = bool(runtime_status_pid_is_live(record))
+    except Exception:
+        live = True  # cannot judge; the response itself is the liveness proof
+    if not live:
+        out["status"] = "degraded"
+        out["detail"] = "state file describes a dead process (stale from an old gateway?)"
+        out["remediation"] = "gateway_state.json 指向已死进程：疑似异常退出残留；重启容器可清理"
+        return out
+    if isinstance(file_pid, int) and file_pid != os.getpid():
+        out["status"] = "degraded"
+        out["detail"] = "state file owned by another live gateway"
+        out["remediation"] = "另一个 gateway 进程占用同一 HERMES_HOME：检查是否双实例误部署"
+    return out
+
+
+def probe_loop(home: Path, *, now_epoch: Optional[float] = None,
+               ttl_s: float = LOOP_HEARTBEAT_TTL_S) -> Dict[str, Any]:
+    """Main-loop liveness from the unconditionally-written 30s heartbeat file.
+    Stale past the TTL means the asyncio loop stopped dispatching — the exact
+    'stuck' case this endpoint exists to report while it still can."""
+    now = time.time() if now_epoch is None else now_epoch
+    try:
+        raw = json.loads((Path(home) / "state" / "gateway.heartbeat").read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("not an object")
+        ts = _iso_to_epoch(raw.get("updated_at"))
+    except Exception:
+        return {"status": "unknown", "detail": "heartbeat file missing/unreadable (gateway still starting?)"}
+    if ts is None:
+        return {"status": "unknown", "detail": "heartbeat timestamp unparseable"}
+    age = max(0.0, now - ts)
+    out: Dict[str, Any] = {"status": "ok" if age <= ttl_s else "down",
+                           "heartbeat_age_s": round(age, 1), "ttl_s": ttl_s}
+    start = raw.get("start_time")
+    if isinstance(start, (int, float)) and not isinstance(start, bool):
+        out["uptime_s"] = int(max(0.0, now - float(start)))
+    if out["status"] == "down":
+        out["detail"] = f"loop heartbeat stale ({int(age)}s > {int(ttl_s)}s)"
+        out["remediation"] = "主循环卡死：loop watchdog 应已强制退出并重启；若持续出现查 logs 下堆栈转储"
+    return out
+
+
+def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: str = "wecom",
+                   platform_down_minutes: float = 10.0) -> Dict[str, Any]:
+    """Chat-platform connection state from gateway_state.json (adapters persist
+    state/needs_attention/retrying_since via _mark_* helpers)."""
+    now = time.time() if now_epoch is None else now_epoch
+    try:
+        record = _read_gateway_state(home)
+    except Exception:
+        return {"status": "unknown", "detail": "gateway state unreadable"}
+    platforms = record.get("platforms") if isinstance(record, dict) else None
+    entry = platforms.get(platform) if isinstance(platforms, dict) else None
+    if not isinstance(entry, dict):
+        return {"status": "unknown", "detail": f"platform {platform} not started"}
+    state = str(entry.get("state") or "unknown").lower()
+    needs_attention = bool(entry.get("needs_attention"))
+    out: Dict[str, Any] = {"status": "ok", "platform": platform, "state": state,
+                           "needs_attention": needs_attention,
+                           "retrying_since": entry.get("retrying_since")}
+    if state in _CONNECTED_STATES and not needs_attention:
+        return out
+    if needs_attention:
+        out.update({"status": "down", "detail": "reconnect loop escalated (needs_attention)",
+                    "remediation": "WeCom 连接持续重连失败：检查智能机器人凭证与网络出口"})
+        return out
+    retrying_since = _iso_to_epoch(entry.get("retrying_since"))
+    if retrying_since is not None and (now - retrying_since) > platform_down_minutes * 60.0:
+        minutes = int((now - retrying_since) // 60)
+        out.update({"status": "down", "detail": f"disconnected and retrying for {minutes} min",
+                    "remediation": "WeCom 断连超过阈值：检查智能机器人凭证与网络出口"})
+        return out
+    out.update({"status": "degraded", "detail": f"state={state} (reconnecting)",
+                "remediation": "WeCom 连接异常重连中；持续断连检查凭证与网络"})
+    return out
+
+
+def _configured_model(home: Path) -> str:
+    """model from config.yaml, mirroring gateway.run._resolve_gateway_model's
+    read (string, or mapping's default/model key) without importing the runner."""
+    try:
+        import yaml
+        data = yaml.safe_load((Path(home) / "config.yaml").read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    model_cfg = data.get("model") if isinstance(data, dict) else None
+    if isinstance(model_cfg, str):
+        return model_cfg
+    if isinstance(model_cfg, dict):
+        return str(model_cfg.get("default") or model_cfg.get("model") or "")
+    return ""
+
+
+def _system_remediation(readiness: Dict[str, Any]) -> str:
+    checks = readiness.get("checks") if isinstance(readiness.get("checks"), dict) else {}
+
+    def bad(name: str) -> bool:
+        entry = checks.get(name)
+        return isinstance(entry, dict) and entry.get("status") != "ok"
+
+    if bad("disk"):
+        return "磁盘水位过高：清理 $HERMES_HOME（sessions/logs）"
+    if bad("state_db"):
+        return "state.db 不可读/损坏：查磁盘与容器重启历史，必要时按上游修复流程处理"
+    if bad("model"):
+        return "config.yaml 未配置模型：检查 model 配置"
+    if bad("config"):
+        return "config.yaml 解析失败：检查语法"
+    return "系统检查异常：查看 /health/detail 的 system.checks 明细"
+
+
+def probe_system(home: Path, *, runtime_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Shared readiness rollup (state.db ro-probe / config / disk / gateway /
+    queues) plus memory pressure from the heartbeat file. Never raises."""
+    out: Dict[str, Any] = {"status": "ok"}
+    try:
+        from gateway.readiness import collect_runtime_readiness
+        record = runtime_status if runtime_status is not None else _read_gateway_state(home)
+        readiness = collect_runtime_readiness(
+            configured_model=_configured_model(Path(home)), runtime_status=record or {})
+        out["checks"] = readiness.get("checks", {})
+        if readiness.get("status") != "ok":
+            out["status"] = "degraded"
+            out["remediation"] = _system_remediation(readiness)
+    except Exception as exc:
+        out.update({"status": "unknown", "detail": f"readiness failed: {type(exc).__name__}"})
+        return out
+    try:
+        from gateway.memory_status import collect_memory_status
+        memory = collect_memory_status(Path(home))
+        out["memory"] = memory
+        if memory.get("pressure") == "critical":
+            out["status"] = "degraded"
+            out["remediation"] = "内存水位 critical：重启容器释放内存"
+    except Exception:
+        out["memory"] = {"pressure": "unknown"}
+    return out

@@ -222,3 +222,107 @@ class TestStuckCheck:
     def test_ok_within_grace_window(self, lib):
         snap = _snap(lib, last_inbound=950.0)
         assert lib.stuck_check(snap, now_epoch=1000.0, stuck_minutes=10.0)["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# File-contract probes (Task 3)
+# ---------------------------------------------------------------------------
+
+class TestLoopProbe:
+    def test_missing_file_is_unknown(self, lib, home):
+        out = lib.probe_loop(home)
+        assert out["status"] == "unknown"
+
+    def test_fresh_heartbeat_ok_with_uptime(self, lib, home):
+        _write_heartbeat(home, age_s=10.0, start_age_s=3600.0)
+        out = lib.probe_loop(home)
+        assert out["status"] == "ok"
+        assert 0 <= out["heartbeat_age_s"] <= 30
+        assert 3500 <= out["uptime_s"] <= 3700
+
+    def test_stale_heartbeat_is_down_with_remediation(self, lib, home):
+        _write_heartbeat(home, age_s=400.0)
+        out = lib.probe_loop(home)
+        assert out["status"] == "down"
+        assert out["heartbeat_age_s"] >= 400
+        assert "主循环" in out["remediation"]
+
+
+class TestProcessProbe:
+    def test_missing_file_is_ok_starting(self, lib, home):
+        out = lib.probe_process(home)
+        assert out["status"] == "ok" and out["file"] == "missing"
+
+    def test_own_pid_live_ok(self, lib, home, monkeypatch):
+        import os
+        # start_time needs to match the live process for the reuse guard; patch the
+        # validator instead of reproducing the fingerprint.
+        import gateway.status as gw_status
+        monkeypatch.setattr(gw_status, "runtime_status_pid_is_live", lambda record: True)
+        _write_gateway_state(home, {"pid": os.getpid(), "gateway_state": "running"})
+        out = lib.probe_process(home)
+        assert out["status"] == "ok" and out["gateway_state"] == "running"
+
+    def test_dead_file_pid_degraded(self, lib, home, monkeypatch):
+        import gateway.status as gw_status
+        monkeypatch.setattr(gw_status, "runtime_status_pid_is_live", lambda record: False)
+        _write_gateway_state(home, {"pid": 999999})
+        out = lib.probe_process(home)
+        assert out["status"] == "degraded"
+
+    def test_foreign_live_pid_degraded(self, lib, home, monkeypatch):
+        import os
+        import gateway.status as gw_status
+        monkeypatch.setattr(gw_status, "runtime_status_pid_is_live", lambda record: True)
+        _write_gateway_state(home, {"pid": os.getpid() + 1})
+        out = lib.probe_process(home)
+        assert out["status"] == "degraded" and "双实例" in out["remediation"]
+
+
+class TestPlatformProbe:
+    def _record(self, **wecom):
+        return {"platforms": {"wecom": wecom}} if wecom else {"platforms": {}}
+
+    def test_missing_platform_unknown(self, lib, home):
+        _write_gateway_state(home, self._record())
+        assert lib.probe_platform(home)["status"] == "unknown"
+
+    def test_connected_ok(self, lib, home):
+        _write_gateway_state(home, self._record(state="connected"))
+        assert lib.probe_platform(home)["status"] == "ok"
+
+    def test_recent_disconnect_degraded(self, lib, home):
+        _write_gateway_state(home, self._record(state="disconnected", retrying_since=_iso_ago(60)))
+        out = lib.probe_platform(home)
+        assert out["status"] == "degraded"
+
+    def test_sustained_disconnect_down(self, lib, home):
+        _write_gateway_state(home, self._record(state="disconnected", retrying_since=_iso_ago(900)))
+        out = lib.probe_platform(home, platform_down_minutes=10.0)
+        assert out["status"] == "down" and "WeCom" in out["remediation"]
+
+    def test_needs_attention_down(self, lib, home):
+        _write_gateway_state(home, self._record(state="connected", needs_attention=True))
+        assert lib.probe_platform(home)["status"] == "down"
+
+
+class TestSystemProbe:
+    def test_all_ok_with_model_config(self, lib, home):
+        (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
+        out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
+        assert out["status"] == "ok"
+        assert out["checks"]["model"]["status"] == "ok"
+        assert "memory" in out
+
+    def test_missing_model_config_degraded(self, lib, home):
+        out = lib.probe_system(home, runtime_status={})
+        assert out["status"] == "degraded"
+        assert out["checks"]["model"]["status"] == "degraded"
+
+    def test_critical_memory_degraded(self, lib, home, monkeypatch):
+        (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
+        import gateway.memory_status as gw_mem
+        monkeypatch.setattr(gw_mem, "collect_memory_status",
+                            lambda home=None, **kw: {"pressure": "critical"})
+        out = lib.probe_system(home, runtime_status={})
+        assert out["status"] == "degraded" and "内存" in out["remediation"]
