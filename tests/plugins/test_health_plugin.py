@@ -383,3 +383,92 @@ class TestBuildDetail:
         detail = {"status": "degraded", "checked_at": "2026-09-15T00:00:00+00:00", "x": 1}
         assert lib.summarize(detail) == {"status": "degraded",
                                          "checked_at": "2026-09-15T00:00:00+00:00"}
+
+
+# ---------------------------------------------------------------------------
+# HTTP server (Task 5)
+# ---------------------------------------------------------------------------
+
+def _get(url: str, method: str = "GET"):
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8") or "{}"
+        return exc.code, json.loads(body)
+
+
+@pytest.fixture
+def srv(lib, home):
+    mod = _load(_SRV_PATH, "health_server_under_test")
+    counters = lib.HealthCounters(window_s=900)
+
+    def build():
+        from hermes_constants import get_hermes_home
+        return lib.build_health_detail(counters.snapshot(), home=get_hermes_home())
+
+    server = mod.start_server(build_detail=build, host="127.0.0.1", port=0)
+    assert server is not None
+    yield f"http://127.0.0.1:{server.server_address[1]}", server
+    server.shutdown()
+    server.server_close()
+
+
+class TestHttpServer:
+    def test_health_minimal_shape(self, srv):
+        url, _ = srv
+        code, body = _get(f"{url}/health")
+        assert code == 200
+        assert set(body) == {"status", "checked_at"}
+        assert body["status"] in {"ok", "degraded"}
+
+    def test_detail_shape(self, srv):
+        url, _ = srv
+        code, body = _get(f"{url}/health/detail")
+        assert code == 200
+        assert {"process", "loop", "platform", "model", "stuck", "system",
+                "remediation", "status", "checked_at"} <= set(body)
+
+    def test_503_when_down(self, srv, home):
+        url, _ = srv
+        _write_heartbeat(home, age_s=400.0)  # stale loop → down
+        code, body = _get(f"{url}/health")
+        assert code == 503 and body["status"] == "down"
+
+    def test_404_unknown_path(self, srv):
+        url, _ = srv
+        code, _body = _get(f"{url}/nope")
+        assert code == 404
+
+    def test_head_supported(self, srv, home):
+        url, _ = srv
+        _write_heartbeat(home, age_s=400.0)
+        code, body = _get(f"{url}/health", method="HEAD")
+        assert code == 503 and body == {}
+
+    def test_builder_exception_is_500(self, lib, home):
+        mod = _load(_SRV_PATH, "health_server_err_under_test")
+
+        def boom():
+            raise RuntimeError("probe exploded")
+
+        server = mod.start_server(build_detail=boom, host="127.0.0.1", port=0)
+        try:
+            code, body = _get(f"http://127.0.0.1:{server.server_address[1]}/health")
+            assert code == 500 and body["status"] == "unknown"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_bind_failure_returns_none(self, lib):
+        mod = _load(_SRV_PATH, "health_server_bind_under_test")
+        first = mod.start_server(build_detail=lambda: {}, host="127.0.0.1", port=0)
+        assert first is not None
+        try:
+            second = mod.start_server(build_detail=lambda: {}, host="127.0.0.1",
+                                      port=first.server_address[1])
+            assert second is None
+        finally:
+            first.shutdown()
+            first.server_close()
