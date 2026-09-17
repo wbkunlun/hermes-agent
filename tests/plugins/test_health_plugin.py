@@ -326,3 +326,60 @@ class TestSystemProbe:
                             lambda home=None, **kw: {"pressure": "critical"})
         out = lib.probe_system(home, runtime_status={})
         assert out["status"] == "degraded" and "内存" in out["remediation"]
+
+
+# ---------------------------------------------------------------------------
+# Aggregate + payload build (Task 4)
+# ---------------------------------------------------------------------------
+
+class TestAggregate:
+    def test_worst_wins(self, lib):
+        assert lib.aggregate("ok", "degraded", "unknown") == "degraded"
+        assert lib.aggregate("ok", "no_data", "unknown") == "ok"
+        assert lib.aggregate("down", "ok") == "down"
+
+    def test_empty_is_ok(self, lib):
+        assert lib.aggregate() == "ok"
+
+
+class TestBuildDetail:
+    def _home_fresh(self, home):
+        import os
+        _write_heartbeat(home, age_s=5.0, start_age_s=100.0)
+        # own PID so the process probe sees the state file as ours (not a foreign gateway)
+        _write_gateway_state(home, {"pid": os.getpid(), "gateway_state": "running",
+                                    "platforms": {"wecom": {"state": "connected"}}})
+
+    def test_shape_and_ok(self, lib, home):
+        self._home_fresh(home)
+        (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
+        detail = lib.build_health_detail(
+            lib.HealthCounters(window_s=900).snapshot(), home=home)
+        assert detail["status"] == "ok"
+        assert set(detail) >= {"status", "checked_at", "process", "loop", "platform",
+                               "model", "stuck", "system", "remediation", "uptime_s"}
+        assert detail["model"]["status"] == "no_data"
+        assert detail["remediation"] == []
+
+    def test_down_when_loop_stale(self, lib, home):
+        _write_heartbeat(home, age_s=400.0)
+        detail = lib.build_health_detail(
+            lib.HealthCounters().snapshot(), home=home)
+        assert detail["status"] == "down"
+        assert any("主循环" in r for r in detail["remediation"])
+
+    def test_remediations_collected_across_checks(self, lib, home):
+        import os
+        _write_heartbeat(home, age_s=5.0)
+        _write_gateway_state(home, {"pid": os.getpid(), "gateway_state": "running",
+                                    "platforms": {"wecom": {"state": "disconnected",
+                                                            "retrying_since": _iso_ago(1200)}}})
+        detail = lib.build_health_detail(
+            lib.HealthCounters().snapshot(), home=home)
+        assert detail["platform"]["status"] == "down"
+        assert any("WeCom" in r for r in detail["remediation"])
+
+    def test_summarize_minimal(self, lib):
+        detail = {"status": "degraded", "checked_at": "2026-09-15T00:00:00+00:00", "x": 1}
+        assert lib.summarize(detail) == {"status": "degraded",
+                                         "checked_at": "2026-09-15T00:00:00+00:00"}

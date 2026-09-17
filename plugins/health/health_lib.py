@@ -425,3 +425,48 @@ def probe_system(home: Path, *, runtime_status: Optional[Dict[str, Any]] = None)
     except Exception:
         out["memory"] = {"pressure": "unknown"}
     return out
+
+
+# ---------------------------------------------------------------------------
+# Aggregation + payload assembly
+# ---------------------------------------------------------------------------
+
+_AGG_ORDER = {"down": 0, "degraded": 1, "ok": 2, "no_data": 2, "unknown": 2}
+
+
+def aggregate(*statuses: str) -> str:
+    """Worst non-neutral status wins; ok/no_data/unknown are neutral-positive."""
+    worst = min(statuses, key=lambda s: _AGG_ORDER.get(s, 2), default="ok")
+    return worst if worst in _AGG_ORDER else "ok"
+
+
+def build_health_detail(snapshot: Dict[str, Any], *, home: Path, now_epoch: Optional[float] = None,
+                        consecutive_down: int = 3, inflight_stale_s: float = 600.0,
+                        stuck_minutes: float = 10.0, platform_down_minutes: float = 10.0,
+                        ) -> Dict[str, Any]:
+    """Full /health/detail payload: every check plus aggregated status and the
+    collected Chinese remediation hints. All constituent probes never raise."""
+    home = Path(home)
+    process = probe_process(home)
+    loop = probe_loop(home, now_epoch=now_epoch)
+    platform = probe_platform(home, now_epoch=now_epoch, platform_down_minutes=platform_down_minutes)
+    system = probe_system(home)
+    model = model_check(snapshot, now_epoch=now_epoch, consecutive_down=consecutive_down,
+                        inflight_stale_s=inflight_stale_s)
+    stuck = stuck_check(snapshot, now_epoch=now_epoch, stuck_minutes=stuck_minutes)
+    status = aggregate(process["status"], loop["status"], platform["status"],
+                       system["status"], model["status"], stuck["status"])
+    remediation = [block["remediation"] for block in (process, loop, platform, system, model, stuck)
+                   if block.get("remediation")]
+    detail: Dict[str, Any] = {
+        "status": status, "checked_at": utc_now_iso(now_epoch if now_epoch is not None else time.time()),
+        "process": process, "loop": loop, "platform": platform,
+        "model": model, "stuck": stuck, "system": system, "remediation": remediation}
+    if isinstance(loop.get("uptime_s"), int):
+        detail["uptime_s"] = loop["uptime_s"]
+    return detail
+
+
+def summarize(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """The /health minimal body: what a monitor needs and nothing else."""
+    return {"status": detail.get("status"), "checked_at": detail.get("checked_at")}
