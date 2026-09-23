@@ -69,7 +69,9 @@ def _turn_ctx(consumer, source):
 
 def _make_runner(fake_adapter):
     runner = object.__new__(GatewayRunner)
-    runner._adapter_for_source = lambda source: fake_adapter
+    # upstream v2026.9.21 routes heartbeat sends through _delivery_adapter_for
+    # (fail-closed provenance routing) instead of the old _adapter_for_source.
+    runner._delivery_adapter_for = lambda source: fake_adapter
     runner._agent_activity_summary = lambda agent: {}
     return runner
 
