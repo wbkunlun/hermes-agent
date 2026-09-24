@@ -6,6 +6,7 @@ resolves req_id/stream_id internally.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -382,3 +383,43 @@ class TestRunningIndicatorProperty:
         d = WeComStreamDelivery(FakeAdapter(), chat_id="c1")
         d._disabled = True
         assert d.shows_running_indicator is False
+
+
+# ---------------------------------------------------------------------------
+# Upstream consumer contract — run_turn.py reads ``message_id`` directly
+# ---------------------------------------------------------------------------
+
+
+class TestUpstreamConsumerContract:
+    """``_run_agent_mark_streamed_delivery`` (gateway/run_turn.py) accesses
+    ``_sc.message_id`` bare on the transformed/stale-finalize reconciliation
+    paths (upstream v2026.9.21 consumer_stream_deltas contract). WeCom cannot
+    edit sent messages, so the contract implementation is a constant ``None``:
+    the in-place edit paths short-circuit and the complete response is
+    delivered via the normal final send instead of crashing the turn."""
+
+    def test_message_id_is_none_wecom_cannot_edit(self):
+        sc = WeComStreamDelivery(adapter=FakeAdapter())
+        assert sc.message_id is None
+
+    def test_mark_streamed_delivery_transformed_does_not_crash(self, caplog):
+        """response_transformed=True used to raise AttributeError
+        ('WeComStreamDelivery' object has no attribute 'message_id') and abort
+        the whole turn with the reply undelivered; with the contract property
+        it must fall through to the normal final send."""
+        from gateway.run_turn import GatewayTurnMixin
+
+        class _Harness(GatewayTurnMixin):
+            pass
+
+        sc = WeComStreamDelivery(adapter=FakeAdapter())
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[sc],
+            source=SimpleNamespace(platform="wecom", chat_id="cid"),
+            session_key="agent:main:wecom:dm:test",
+        )
+        response = {"final_response": "patched by plugin", "response_transformed": True}
+        with caplog.at_level("WARNING", logger="gateway.run_turn"):
+            asyncio.run(_Harness()._run_agent_mark_streamed_delivery(response, turn_ctx))
+        # Not editable → no in-place reconciliation → the normal final send delivers.
+        assert "already_sent" not in response

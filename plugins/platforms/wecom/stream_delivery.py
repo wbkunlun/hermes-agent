@@ -191,6 +191,15 @@ class WeComStreamDelivery:
         """
         return not self._disabled
 
+    @property
+    def message_id(self) -> Optional[str]:
+        """Upstream consumer contract (``run_turn.py`` reads it bare on the
+        transformed/stale-finalize reconciliation paths): the id of the streamed
+        bubble an in-place edit would target. WeCom cannot edit sent messages,
+        so this is always ``None`` — the edit paths short-circuit and the
+        complete response goes out via the normal final send."""
+        return None
+
     # ------------------------------------------------------------------
     # Sync input API — called from the agent worker thread
     # ------------------------------------------------------------------
