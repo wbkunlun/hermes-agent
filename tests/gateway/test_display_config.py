@@ -1,6 +1,5 @@
 """Tests for gateway.display_config — per-platform display/verbosity resolver."""
 
-
 # ---------------------------------------------------------------------------
 # Resolver: resolution order
 # ---------------------------------------------------------------------------
@@ -22,7 +21,6 @@ class TestToolProgressProvenance:
         ]
         for display, env, expected in cases:
             assert resolve_tool_progress({"display": display}, "slack", env) == expected
-
 
 class TestResolveDisplaySetting:
     """resolve_display_setting() resolves with correct priority."""
@@ -53,7 +51,6 @@ class TestResolveDisplaySetting:
         }
         assert resolve_display_setting(config, "telegram", "tool_progress") == "new"
 
-
     def test_platform_override_only_affects_that_platform(self):
         """Other platforms are unaffected by a specific platform override."""
         from gateway.display_config import resolve_display_setting
@@ -68,7 +65,6 @@ class TestResolveDisplaySetting:
         }
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
-
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides
@@ -93,7 +89,6 @@ class TestBackwardCompat:
         assert resolve_display_setting(config, "signal", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "verbose"
 
-
 # ---------------------------------------------------------------------------
 # YAML normalisation
 # ---------------------------------------------------------------------------
@@ -107,7 +102,6 @@ class TestYAMLNormalisation:
 
         config = {"display": {"tool_progress": False}}
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
-
 
     def test_only_long_running_visibility_accepts_generic_mode(self):
         from gateway.display_config import resolve_display_setting
@@ -133,11 +127,17 @@ class TestYAMLNormalisation:
         config = {"display": {"platforms": {"whatsapp": {"thinking_progress": "false"}}}}
         assert resolve_display_setting(config, "whatsapp", "thinking_progress") is False
 
-
 # ---------------------------------------------------------------------------
 # Built-in platform defaults (tier system)
 # ---------------------------------------------------------------------------
 
+# fork: upstream's "drop duplicates" purge (21c698b7df / 680fa8a92d) removed
+# TestPlatformDefaults wholesale, but these tier guards pin fork-critical
+# defaults. Restored from the fork, minus test_wecom_promoted_to_medium_
+# for_streaming: the v2026.7.10-fork2 TIER_MEDIUM promotion was superseded by
+# the shared {**_TIER_LOW, "streaming": True} entry — the "wecom streams by
+# default" invariant now lives in TestStreamingPerPlatform.test_wecom_
+# default_is_streaming_enabled below.
 class TestPlatformDefaults:
     """Built-in defaults reflect platform capability tiers."""
 
@@ -155,22 +155,10 @@ class TestPlatformDefaults:
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        # Note: wecom was promoted out of this set — see
-        # test_wecom_promoted_to_medium_for_streaming.
-        for plat in ("signal", "bluebubbles", "weixin", "dingtalk", "whatsapp_cloud"):
+        # wecom sits in TIER_LOW too, but keeps "streaming": True (native
+        # msgtype:stream transport) — see test_wecom_default_is_streaming_enabled.
+        for plat in ("signal", "bluebubbles", "weixin", "dingtalk", "whatsapp_cloud", "wecom"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
-
-    def test_wecom_promoted_to_medium_for_streaming(self):
-        """v2026.7.10-fork2 promoted wecom from TIER_LOW to TIER_MEDIUM so it
-        supports streaming output. Regression guard: if wecom is accidentally
-        dropped back to TIER_LOW, streaming breaks silently.
-        """
-        from gateway.display_config import resolve_display_setting
-
-        assert resolve_display_setting({}, "wecom", "tool_progress") == "new", "wecom"
-        # TIER_MEDIUM streaming is None (follow global); it must NOT be the
-        # hard False that TIER_LOW sets (which would disable streaming).
-        assert resolve_display_setting({}, "wecom", "streaming") is not False
 
     def test_whatsapp_cloud_locked_to_low_tier_until_edit_message_lands(self):
         """Regression guard: ``whatsapp_cloud`` must stay TIER_LOW until the
@@ -235,6 +223,66 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "slack", "busy_ack_detail") is False
 
 
+def assert_keeps_platform_display_defaults(cfg):
+    """Every platform resolves every tier key (and tool_progress) exactly as with no config at all.
+
+    Shared by every config seeder's regression test: a seeded global ``display.<key>`` beats each
+    platform tier, because the gateway loader merges no DEFAULT_CONFIG (#121230)."""
+    from gateway.display_config import _PLATFORM_DEFAULTS, resolve_display_setting, resolve_tool_progress
+
+    tier_keys = {key for tier in _PLATFORM_DEFAULTS.values() for key in tier}
+    for platform in _PLATFORM_DEFAULTS:
+        assert resolve_tool_progress(cfg, platform) == resolve_tool_progress({}, platform), platform
+        for key in tier_keys:
+            assert resolve_display_setting(cfg, platform, key) == resolve_display_setting({}, platform, key), (
+                platform, key)
+
+
+class TestInstallerSeededConfigThroughGatewayResolver:
+    """Regression for #121230: a fresh install copies cli-config.yaml.example to config.yaml, and the
+    gateway then rendered reasoning into QQBot/Telegram/... because the template pinned a global
+    ``display.show_reasoning: true`` over every platform's ``False`` default.
+    """
+
+    @staticmethod
+    def _seed_like_installer(home):
+        import shutil
+        from pathlib import Path
+
+        template = Path(__file__).resolve().parents[2] / "cli-config.yaml.example"
+        home.mkdir(parents=True, exist_ok=True)
+        shutil.copy(template, home / "config.yaml")
+        return home / "config.yaml"
+
+    def test_shipped_template_keeps_every_platform_default(self, tmp_path):
+        """The installers, the Docker first boot and ``doctor --fix`` copy cli-config.yaml.example
+        verbatim, so an uncommented ``display.<key>`` there becomes an explicit global value."""
+        from gateway.config import Platform
+        from gateway.run import _load_gateway_config, _resolve_gateway_display_bool
+
+        seeded = _load_gateway_config(self._seed_like_installer(tmp_path / "hermes-home"))
+        assert "display" in seeded  # the loader fails open to {}, which would pass vacuously
+
+        assert_keeps_platform_display_defaults(seeded)
+        # ...and through the resolver the gateway turn actually calls (same arguments as gateway/run_turn.py).
+        assert _resolve_gateway_display_bool(
+            seeded, "qqbot", "show_reasoning", default=False, platform=Platform.QQBOT,
+            require_platform_override_for={Platform.MATTERMOST},
+        ) is False
+
+    def test_explicit_global_opt_in_still_reaches_gateway_platforms(self, tmp_path):
+        """Control: an operator who deliberately writes ``display.show_reasoning: true`` still gets it (#7148)."""
+        from gateway.config import Platform
+        from gateway.run import _load_gateway_config, _resolve_gateway_display_bool
+
+        (tmp_path / "config.yaml").write_text("display:\n  show_reasoning: true\n")
+        cfg = _load_gateway_config(tmp_path / "config.yaml")
+        assert _resolve_gateway_display_bool(
+            cfg, "qqbot", "show_reasoning", default=False, platform=Platform.QQBOT,
+            require_platform_override_for={Platform.MATTERMOST},
+        ) is True
+
+
 # ---------------------------------------------------------------------------
 # Config migration: tool_progress_overrides → display.platforms
 # ---------------------------------------------------------------------------
@@ -244,7 +292,7 @@ class TestConfigMigration:
 
     def test_migration_creates_platforms_entries(self, tmp_path, monkeypatch):
         """Old overrides are migrated into display.platforms.<plat>.tool_progress."""
-        import yaml
+        import hermes_yaml as yaml
 
         config_path = tmp_path / "config.yaml"
         config = {
@@ -256,7 +304,7 @@ class TestConfigMigration:
                 },
             },
         }
-        config_path.write_text(yaml.dump(config), encoding="utf-8")
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         # Re-import to pick up the new HERMES_HOME
@@ -271,14 +319,12 @@ class TestConfigMigration:
         assert platforms.get("signal", {}).get("tool_progress") == "off"
         assert platforms.get("telegram", {}).get("tool_progress") == "all"
 
-
 # ---------------------------------------------------------------------------
 # Streaming per-platform (None = follow global)
 # ---------------------------------------------------------------------------
 
 class TestStreamingPerPlatform:
     """Streaming per-platform override semantics."""
-
 
     def test_explicit_false_disables(self):
         """Explicit False disables streaming for that platform."""
@@ -291,6 +337,10 @@ class TestStreamingPerPlatform:
         }
         assert resolve_display_setting(config, "telegram", "streaming") is False
 
+    # fork: the three wecom guards below were dropped upstream in the
+    # "purge low-value tests" sweep (21c698b7df) as tier-data tautologies,
+    # but they pin the built-in defaults the fork's WeCom streaming gates
+    # rely on — restored verbatim.
     def test_wecom_default_is_streaming_enabled(self):
         """WeCom has a native streaming transport (msgtype: stream) so its
         built-in default opts into streaming even though it sits in the
@@ -316,21 +366,12 @@ class TestStreamingPerPlatform:
         }
         assert resolve_display_setting(config, "wecom", "streaming") is False
 
-
 # ---------------------------------------------------------------------------
 # cleanup_progress — opt-in deletion of temporary progress bubbles
 # ---------------------------------------------------------------------------
 
 class TestCleanupProgress:
     """``cleanup_progress`` is off by default and resolvable per-platform."""
-
-    def test_default_off_for_all_platforms(self):
-        """No config set → cleanup_progress resolves to False everywhere."""
-        from gateway.display_config import resolve_display_setting
-
-        for plat in ("telegram", "discord", "slack", "email"):
-            assert resolve_display_setting({}, plat, "cleanup_progress") is False
-
 
     def test_yaml_true_string_normalises_to_true(self):
         """String 'true'/'yes'/'on' all resolve to True."""
@@ -343,53 +384,3 @@ class TestCleanupProgress:
                 }
             }
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
-
-
-class TestToolProgressGrouping:
-    """resolve_display_setting() for the tool_progress_grouping knob."""
-
-    def test_default_is_accumulate(self):
-        """No config anywhere → global default 'accumulate'."""
-        from gateway.display_config import resolve_display_setting
-
-        assert (
-            resolve_display_setting({}, "telegram", "tool_progress_grouping")
-            == "accumulate"
-        )
-
-    def test_global_separate(self):
-        from gateway.display_config import resolve_display_setting
-
-        config = {"display": {"tool_progress_grouping": "separate"}}
-        assert (
-            resolve_display_setting(config, "discord", "tool_progress_grouping")
-            == "separate"
-        )
-
-
-class TestReasoningStyle:
-    """Per-platform reasoning render style (code | blockquote | subtext)."""
-
-    def test_discord_defaults_to_subtext(self):
-        from gateway.display_config import resolve_display_setting
-
-        assert resolve_display_setting({}, "discord", "reasoning_style") == "subtext"
-
-    def test_other_platforms_default_to_code(self):
-        from gateway.display_config import resolve_display_setting
-
-        for plat in ("telegram", "slack", "matrix", "api_server"):
-            assert (
-                resolve_display_setting({}, plat, "reasoning_style") == "code"
-            ), plat
-
-
-class TestLiveStatusSetting:
-    """display.live_status — tri-state normalisation + platform overrides."""
-
-    def test_default_is_full(self):
-        from gateway.display_config import resolve_display_setting
-
-        assert resolve_display_setting({}, "slack", "live_status") == "full"
-
-

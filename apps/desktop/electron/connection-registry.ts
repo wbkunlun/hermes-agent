@@ -451,6 +451,41 @@ export function registrySourceOwnsPrimaryBackend(
   return Boolean(id) && id === registry.primary && resolvedConnectionId(registry, descriptor) === id
 }
 
+export interface ReuseMatchingPrimaryRemoteBackendOptions<T extends ResolvedConnectionDescriptor> {
+  connectionId: string
+  ensurePrimary: (profile: null | string | undefined) => Promise<T>
+  profile: null | string | undefined
+  registry: ConnectionRegistry
+  source: RegistryConnection
+}
+
+export interface SharedRegistryProfileScope {
+  connectionId: string
+  profile: string
+  sharedRemote: true
+}
+
+/** Reuse the live URL/cloud primary without losing the caller's REST profile scope. */
+export async function reuseMatchingPrimaryRemoteBackend<T extends ResolvedConnectionDescriptor>({
+  connectionId,
+  ensurePrimary,
+  profile,
+  registry,
+  source
+}: ReuseMatchingPrimaryRemoteBackendOptions<T>): Promise<(T & SharedRegistryProfileScope) | null> {
+  if (connectionId !== registry.primary || source.kind === 'local' || source.kind === 'ssh') {
+    return null
+  }
+
+  const descriptor: T = await ensurePrimary(profile)
+
+  if (!registrySourceOwnsPrimaryBackend(registry, connectionId, descriptor)) {
+    return null
+  }
+
+  return { ...descriptor, profile: String(profile ?? '').trim() || 'default', connectionId, sharedRemote: true }
+}
+
 function normalizedSshTarget(route: { host?: unknown; port?: unknown; user?: unknown }): null | string {
   const ssh = normalizeSshConfig({ ...route, mode: 'ssh' })
 
@@ -840,6 +875,17 @@ export interface ConnectionInput {
  * uniqueness context; when `input.id` matches an existing entry this is an
  * edit and that entry is excluded from the label-collision check.
  */
+/**
+ * Auth mode a stored remote-shaped entry actually uses. A Hermes Cloud gateway
+ * signs in through its OAuth session and never keeps a pasted token (the save
+ * path drops one), so a cloud entry on token auth with no token has no
+ * credential at all and Test can only fail (#89529). Read it as oauth; a cloud
+ * entry that does carry a token keeps its mode.
+ */
+function storedAuthMode(kind: ConnectionKind, authMode: unknown, token: unknown): 'oauth' | 'token' {
+  return kind === 'cloud' && !token ? 'oauth' : normAuthMode(authMode)
+}
+
 export function normalizeConnectionInput(input: ConnectionInput, registry: ConnectionRegistry): RegistryConnection {
   const label = String(input.label || '').trim()
 
@@ -939,7 +985,8 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
       throw new Error(`A connection to this gateway URL already exists ("${urlDupe.label}").`)
     }
 
-    const authMode = normAuthMode(input.authMode)
+    // Cloud never stores a token (below), so it is always oauth.
+    const authMode = storedAuthMode(kind, input.authMode, undefined)
     const entry: RegistryConnection = { id, kind, label, url, authMode }
 
     // A token is only meaningful for token-auth remotes. Dropping it here is
@@ -1190,7 +1237,7 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
         }
 
         clean.url = url
-        clean.authMode = normAuthMode(entry.authMode)
+        clean.authMode = storedAuthMode(kind, entry.authMode, entry.token)
 
         if (entry.token !== undefined) {
           clean.token = entry.token

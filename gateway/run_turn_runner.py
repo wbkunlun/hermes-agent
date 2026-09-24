@@ -922,15 +922,19 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and (
-            scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
-        )
+        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
         # fork: WeCom streams by default (native stream frames via send_stream_frame) even
         # when global streaming is off — wehermes deployments initialize config.yaml from
         # cli-config.yaml.example, which ships streaming.enabled=false, and streaming is
         # WeCom's primary reply UX. An explicit display.platforms.wecom.streaming override
-        # still wins. scheduled_heartbeat keeps the upstream no-stream rule (no heartbeat spam).
-        if plat_streaming is None and not want_stream_deltas and not ctx.scheduled_heartbeat and ctx.source.platform == Platform.WECOM:
+        # still wins (False disables; True keeps WeCom streaming on even though #53697's
+        # enabled_for only lets an override narrow the global switch).
+        # scheduled_heartbeat keeps the upstream no-stream rule (no heartbeat spam).
+        if (
+            not ctx.scheduled_heartbeat
+            and ctx.source.platform == Platform.WECOM
+            and plat_streaming is not False
+        ):
             want_stream_deltas = True
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
