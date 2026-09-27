@@ -167,7 +167,7 @@ def source_products(source_checkout):
         encoding="utf-8",
     )
     for script, step, output in [
-        ("generate-icons.mjs", "icons", "web/public/favicon.ico"),
+        ("generate-icons.mjs", "icons", "never-rendered-at-install"),
         ("build/tui.mjs", "tui", "ui-tui/dist/entry.js"),
         ("build/web.mjs", "web", "hermes_cli/web_dist/index.html"),
     ]:
@@ -188,6 +188,9 @@ def source_products(source_checkout):
         "if (!process.argv.includes('--icons')) await import('../generate-icons.mjs');\n",
         encoding="utf-8",
     )
+    # Default-brand icons are committed; updates consume them without rendering.
+    (root / "web/public").mkdir(parents=True, exist_ok=True)
+    (root / "web/public/favicon.ico").write_bytes(b"committed icon")
     return root, acquired
 
 
@@ -252,7 +255,7 @@ def test_update_builds_selected_products_after_one_union_preparation(source_prod
     app.write_text("previous app")
     build_update_products(root, desktop=desktop)
     steps = [event["step"] for event in _events(root)]
-    assert steps == ["deps", "tui", "icons", "web"] + (["desktop"] if desktop else [])
+    assert steps == ["deps", "tui", "web"] + (["desktop"] if desktop else [])
     assert acquired == ["npm"]
     assert (root / "ui-tui/dist/entry.js").read_text() == "tui"
     assert (root / "hermes_cli/web_dist/index.html").read_text() == "web"
@@ -264,7 +267,7 @@ def test_update_builds_selected_products_after_one_union_preparation(source_prod
 
 
 @pytest.mark.platforms("linux")
-@pytest.mark.parametrize("step", ["tui", "icons", "web", "desktop"])
+@pytest.mark.parametrize("step", ["tui", "web", "desktop"])
 def test_update_failure_raises_without_retries_or_replacing_live_app(source_products, step):
     from hermes_cli.source_build import build_update_products
 
@@ -277,7 +280,7 @@ def test_update_failure_raises_without_retries_or_replacing_live_app(source_prod
         build_update_products(root, desktop=True)
     assert app.read_text() == "previous app"
     assert not list((root / "apps/desktop").glob(".staging-*"))
-    order = ["deps", "tui", "icons", "web", "desktop"]
+    order = ["deps", "tui", "web", "desktop"]
     assert [event["step"] for event in _events(root)] == order[:order.index(step) + 1]
     assert acquired == ["npm"]
     assert not (Path(os.environ["HERMES_HOME"]) / "desktop-build-stamp.json").exists()

@@ -319,32 +319,4 @@ native/fts5_cjk/*.so
 # PM lockfile advisory lock; kept in place so waiting writers share its inode
 /pm/.lock.json.lock
 
-# Generated icon assets (scripts/generate_icons.py). Regenerated on demand by
-# every consuming pipeline; sources of truth: assets/nous-girl-*.svg + assets/backgrounds/.
-assets/icon-master.svg
-assets/icon-master-dark.svg
-apps/desktop/assets/icon.png
-apps/desktop/assets/icon.ico
-apps/desktop/assets/icon.icns
-apps/desktop/assets/icon-dark.png
-apps/desktop/assets/icon-dark.ico
-apps/desktop/assets/icon-dark.icns
-apps/desktop/assets/appx/*.png
-apps/desktop/public/apple-touch-icon.png
-apps/desktop/public/nous-girl.png
-apps/desktop/public/nous-girl-dark.png
 apps/desktop/.dist-build*
-apps/bootstrap-installer/src-tauri/icons/*.png
-apps/bootstrap-installer/src-tauri/icons/icon.ico
-apps/bootstrap-installer/src-tauri/icons/icon.icns
-apps/bootstrap-installer/public/nous-girl.png
-website/static/img/logo.png
-website/static/img/logo-dark.png
-website/static/img/nous-logo.png
-website/static/img/nous-logo-dark.png
-website/static/img/favicon-16x16.png
-website/static/img/favicon-32x32.png
-website/static/img/apple-touch-icon.png
-website/static/img/favicon.ico
-website/static/img/favicon.svg
-web/public/favicon.ico

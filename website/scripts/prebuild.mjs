@@ -33,7 +33,6 @@ const repoRoot = resolve(websiteDir, "..");
 const extractScript = join(scriptDir, "extract-skills.py");
 const llmsScript = join(scriptDir, "generate-llms-txt.py");
 const cronBlueprintsScript = join(scriptDir, "extract-automation-blueprints.py");
-const iconGenScript = join(repoRoot, "scripts", "generate-icons.mjs");
 const pluginsScript = join(scriptDir, "extract-plugins.py");
 const pluginStarsScript = join(scriptDir, "fetch-plugin-stars.py");
 const outputFile = join(websiteDir, "static", "api", "skills.json");
@@ -125,19 +124,7 @@ async function ensureUnifiedIndex() {
   }
 }
 
-// 0) Icon assets — the navbar logo, favicons, and apple-touch-icon are
-// generated (not committed). This must fail loudly: a docs build without the
-// logo ships a broken navbar.
-console.log("[prebuild] generating icon assets…");
-{
-  const r = spawnSync("node", [iconGenScript, "--source", repoRoot, "--out", repoRoot], { stdio: "inherit", cwd: repoRoot });
-  if (r.status !== 0) {
-    console.error("[prebuild] icon generation failed — it needs a Hermes runtime Python (HERMES_PYTHON); see the output above");
-    process.exit(1);
-  }
-}
-
-// 0b) Pull unified index if we don't have a fresh one.
+// 0) Pull unified index if we don't have a fresh one.
 await ensureUnifiedIndex();
 
 // 1) skills.json — required for the Skills Hub page.

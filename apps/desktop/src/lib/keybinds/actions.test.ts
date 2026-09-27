@@ -86,3 +86,28 @@ describe('KEYBIND_ACTIONS', () => {
     }
   })
 })
+
+describe('view.tabSlot.N layers over profile.switch.N on ⌘1…⌘9 (#92569)', () => {
+  it('both actions ship on mod+N; the tab slot passes through, the profile switch does not', () => {
+    // Over a tab strip the chord is "tab N"; with no eligible strip the tab
+    // action declines and the same chord is "profile N". Two actions, one
+    // chord: rebinding either changes only that one.
+    for (let slot = 1; slot <= 9; slot += 1) {
+      expect(defaultBindings()[`view.tabSlot.${slot}`]).toEqual([`mod+${slot}`])
+      expect(defaultBindings()[`profile.switch.${slot}`]).toEqual([`mod+${slot}`])
+      expect(keybindAction(`view.tabSlot.${slot}`)).toMatchObject({ category: 'view', passthrough: true })
+      expect(keybindAction(`profile.switch.${slot}`)?.passthrough).toBeUndefined()
+    }
+  })
+
+  it('tab-slot actions precede profile switchers so the chord reaches the tab first', () => {
+    // The combo index is built in KEYBIND_ACTIONS order; the passthrough
+    // action must sit ahead of the one it hands off to.
+    const ids = KEYBIND_ACTIONS.map(action => action.id)
+    const firstTabSlot = ids.indexOf('view.tabSlot.1')
+    const firstProfileSwitch = ids.indexOf('profile.switch.1')
+
+    expect(firstTabSlot).toBeGreaterThanOrEqual(0)
+    expect(firstProfileSwitch).toBeGreaterThan(firstTabSlot)
+  })
+})

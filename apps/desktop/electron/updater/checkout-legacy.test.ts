@@ -7,7 +7,7 @@ import { expect, it, vi } from 'vitest'
 import { type CheckoutStrategyDeps, createCheckoutStrategy } from './checkout'
 import { readSourceUpdate, type SourceUpdate } from './checkout-source'
 
-it('offers manual recovery only for a missing source probe, never for a broken probe', async (): Promise<void> => {
+it('moves a checkout without a source probe to main, but surfaces a broken probe', async (): Promise<void> => {
   const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-channel-'))
   const home: string = path.join(root, 'profile')
   const modulePath: string = path.join(root, 'hermes_cli', 'source_check.py')
@@ -31,7 +31,9 @@ it('offers manual recovery only for a missing source probe, never for a broken p
     defaultUpdateBranch: 'main',
     updateHandoffDwellMs: 0,
     resolveUpdateRoot: (): string => root,
-    resolveUpdaterBinary: vi.fn((): string => 'frozen-updater'),
+    // No staged updater and no repo hand-off script: apply ends on the manual
+    // command card, which exposes the target without spawning anything.
+    resolveUpdaterBinary: vi.fn((): null => null),
     remoteGatewayActive: (): boolean => false,
     emitUpdateProgress: vi.fn(),
     rememberLog: vi.fn(),
@@ -54,14 +56,8 @@ it('offers manual recovery only for a missing source probe, never for a broken p
         fs.rmSync(modulePath)
       }
 
-      expect(await strategy.check()).toMatchObject({ supported: false, reason: 'source-probe-unavailable' })
-      const result: Awaited<ReturnType<typeof strategy.apply>> = await strategy.apply()
-      expect(result).toMatchObject({ manual: true, command: 'hermes update --help' })
-      expect(result.message).toContain('branch or channel')
-      expect(result.command).not.toContain('--branch')
-      expect(deps.stopBackendsForUpdate).not.toHaveBeenCalled()
-      expect(deps.resolveUpdaterBinary).not.toHaveBeenCalled()
-      expect(deps.quit).not.toHaveBeenCalled()
+      expect(await strategy.check()).toMatchObject({ supported: true, updateAvailable: true, branch: 'main' })
+      expect(await strategy.apply()).toMatchObject({ ok: true, manual: true, command: 'hermes update' })
     }
 
     fs.writeFileSync(modulePath, 'def main():\n    raise RuntimeError("invalid channel configuration")\n')
@@ -74,24 +70,38 @@ it('offers manual recovery only for a missing source probe, never for a broken p
   }
 })
 
-it.skipIf(process.platform === 'win32')('uses the install-scoped PM launcher rather than a system Python for source checks', async (): Promise<void> => {
-  const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'pm-source-check-'))
-  const home: string = path.join(root, 'profile')
-  const launcher: string = path.join(root, '.hermes', 'bin', 'hermes')
-  fs.mkdirSync(path.dirname(launcher), { recursive: true })
-  fs.mkdirSync(path.join(root, 'pm'))
-  fs.mkdirSync(home)
-  fs.writeFileSync(launcher, '#!/bin/sh\n[ "$1" = --run-module ] && [ "$2" = hermes_cli.source_check ] || exit 5\nprintf \'%s\\n\' \'{"supported":true,"channel":"stable","behind":-1}\'\n', { mode: 0o755 })
+it.skipIf(process.platform === 'win32')(
+  'uses the install-scoped PM launcher rather than a system Python for source checks',
+  async (): Promise<void> => {
+    const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'pm-source-check-'))
+    const home: string = path.join(root, 'profile')
+    const launcher: string = path.join(root, '.hermes', 'bin', 'hermes')
+    fs.mkdirSync(path.dirname(launcher), { recursive: true })
+    fs.mkdirSync(path.join(root, 'pm'))
+    fs.mkdirSync(home)
+    fs.writeFileSync(
+      launcher,
+      '#!/bin/sh\n[ "$1" = --run-module ] && [ "$2" = hermes_cli.source_check ] || exit 5\nprintf \'%s\\n\' \'{"supported":true,"channel":"stable","behind":-1}\'\n',
+      { mode: 0o755 }
+    )
 
-  try {
-    const probe = { python: '/nonexistent/system-python', git: 'git', updateRoot: root, hermesHome: home, channel: 'stable' as const }
-    await expect(readSourceUpdate(probe)).resolves.toMatchObject({ supported: true, channel: 'stable', behind: null })
-    fs.rmSync(launcher)
-    await expect(readSourceUpdate(probe)).rejects.toThrow('installation launcher is missing')
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
+    try {
+      const probe = {
+        python: '/nonexistent/system-python',
+        git: 'git',
+        updateRoot: root,
+        hermesHome: home,
+        channel: 'stable' as const
+      }
+
+      await expect(readSourceUpdate(probe)).resolves.toMatchObject({ supported: true, channel: 'stable', behind: null })
+      fs.rmSync(launcher)
+      await expect(readSourceUpdate(probe)).rejects.toThrow('installation launcher is missing')
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   }
-})
+)
 
 it.skipIf(process.platform !== 'win32')(
   'runs a PM .cmd source check with quoted paths and refuses a missing launcher',

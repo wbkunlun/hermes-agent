@@ -36,13 +36,9 @@ She renders in front of the border, clipped only to the outer rounded silhouette
 Only nodes near her bottom edge extend to the border; the fitted face and hair stay fixed.
 Standalone wordmarks remain centered and have no border.
 
-GENERATED OUTPUTS ARE NOT COMMITTED. Everything this script writes is
-gitignored and regenerated on demand by the consuming pipelines (website
-prebuild, desktop prebuild/predev, installer prebuild, web prebuild — via
-scripts/generate-icons.mjs). The freshness lane (icons-freshness-check.yml)
-runs --check, which regenerates in memory and asserts structural invariants
-(sizes, transparency, container frame sets) — there are no committed bytes to
-byte-compare against.
+GENERATED OUTPUTS ARE COMMITTED. Regular builds and installs consume them and
+never render; flavored release bundles (canary/commit) render to a product dir.
+icons-freshness-check.yml regenerates, runs --check, and fails on any diff.
 
 Rendering: resvg (resvg-py) for SVG -> PNG fidelity at every size.
 Containers: Pillow for multi-size .ico and .icns.
@@ -125,8 +121,10 @@ BORDER_FRACTION = 0.0407747197
 GIRL_BOXES = {
     "squircle-light.svg": (72.149433, 104.703674, 872.767801, 872.767801),
     "squircle-dark.svg": (72.149433, 104.703674, 872.767801, 872.767801),
-    "squircle-mac-light.svg": (157.949166, 184.039504, 702.522501, 702.522501),
-    "squircle-mac-dark.svg": (157.949166, 184.039504, 702.522501, 702.522501),
+    # Mac: the girl scaled 1.12x about the plate center; the plate stays on the
+    # 824 grid, but a white tile with a ring reads small beside full-color peers.
+    "squircle-mac-light.svg": (122.43, 144.84, 786.83, 786.83),
+    "squircle-mac-dark.svg": (122.43, 144.84, 786.83, 786.83),
 }
 # The brand-kit SVG canvas (both girl svgs share this viewBox).
 GIRL_VIEWBOX = 5487.0615
@@ -178,6 +176,8 @@ TARGETS: list[tuple[str, str, object]] = [
     ("apps/desktop/assets/appx/Square44x44Logo-dark.png", "png_dark", 44),
     ("apps/desktop/assets/appx/Square150x150Logo-dark.png", "png_dark", 150),
     ("apps/desktop/public/apple-touch-icon.png", "png", 1024),
+    # The dev-run Dock icon (app.dock.setIcon): same mac grid as the icns.
+    ("apps/desktop/assets/icon-mac.png", "png_mac", 1024),
     ("apps/desktop/public/nous-girl.png", "girl_light", 256),
     ("apps/desktop/public/nous-girl-dark.png", "girl_dark", 256),
     ("apps/bootstrap-installer/src-tauri/icons/32x32.png", "png", 32),
@@ -462,6 +462,8 @@ def target_bytes(art: IconArt, kind: str, arg: object) -> bytes:
     buf = io.BytesIO()
     if kind == "png":
         save_png(render(art.master, arg), buf)
+    elif kind == "png_mac":
+        save_png(render(art.master_mac, arg), buf)
     elif kind == "png_dark":
         save_png(render(art.master_dark, arg), buf)
     elif kind == "png_white":

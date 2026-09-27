@@ -500,6 +500,25 @@ def _verify_and_restore_state_dbs_post_update() -> None:
             _verify_and_restore_one_state_db(profile_home, label=f"profile {name}")
 
 
+def _invalidate_live_plugin_catalog_caches() -> None:
+    """Drop the cached live plugin catalog under the active home AND every sibling profile's.
+
+    The checkout is shared across profiles, so an update's code swap changes every profile's
+    catalog truth at once: a live snapshot cached before the swap would out-vote the newer
+    in-tree catalog (the pin it just bumped, the entry it just added) for the rest of the cache
+    TTL (#119340). Mirrors the state.db guard's home + siblings iteration. Never raises —
+    :func:`plugin_catalog.invalidate_live_cache_for_home` is best-effort per home.
+    """
+    from hermes_cli.update_cmd import get_hermes_home
+    home = get_hermes_home()
+    from hermes_cli.plugin_catalog import invalidate_live_cache_for_home
+    invalidate_live_cache_for_home(home)
+    with suppress(Exception):
+        from hermes_cli.backup import _sibling_profile_homes
+        for _name, profile_home in _sibling_profile_homes(home):
+            invalidate_live_cache_for_home(profile_home)
+
+
 def _print_bundled_skills_sync_report() -> None:
     """Run ``sync_skills`` (copies new, updates changed, respects user deletions) and print its summary."""
     from tools.skills_sync import sync_skills
@@ -990,9 +1009,8 @@ def _run_post_update_maintenance(
     with _best_effort('Post-update state.db integrity check failed: %s'):
         _verify_and_restore_state_dbs_post_update()
 
-    # Pre-PM installers cloned --depth 1, which hides the release tag identity is
-    # derived from. Fetch the commit graph before the completion line and the
-    # install stamp read that identity.
+    # Both shallow history and missing tags can hide the release identity.
+    # Refresh them before the completion line and install stamp read it.
     try:
         from hermes_cli.gitlock import fetch_full_commit_graph
         from hermes_cli.update_cmd import _no_prompt_git_kwargs
@@ -1000,13 +1018,19 @@ def _run_post_update_maintenance(
             print("  ✓ Fetched release history (commits only) for version identity")
     except (OSError, subprocess.SubprocessError) as exc:
         detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
-        print(f"  ⚠ Could not fetch release history ({detail[0]}); the version shows as git.<sha> until the next update")
+        print(f"  ⚠ Could not refresh release history ({detail[0]}); the version label may be stale or unknown until the next update")
 
     # Seed the model-catalog cache from the checkout instead of a bot-gated, flaky fetch.
     with _best_effort('Model catalog seed during update failed: %s'):
         from hermes_cli.model_catalog import seed_cache_from_checkout
         if seed_cache_from_checkout(_m().PROJECT_ROOT):
             print("  ✓ Model catalog cache refreshed from checkout")
+
+    # Drop the cached live plugin catalog under every profile: the checkout is shared, so a
+    # pre-update snapshot must not out-vote the pins/entries this update just installed for the
+    # rest of the cache TTL (#119340).
+    with _best_effort('Live plugin catalog cache invalidation failed: %s'):
+        _invalidate_live_plugin_catalog_caches()
 
     with _best_effort('Skills sync during update failed: %s'):
         print()

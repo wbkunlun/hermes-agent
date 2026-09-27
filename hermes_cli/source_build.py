@@ -19,7 +19,7 @@ def source_product_current(project_root: Path, product: str, out: Path) -> bool:
         result = subprocess.run(
             [node, str(project_root / "scripts/build/freshness.mjs"),
              "--source", str(project_root), "--product", product, "--out", str(out)],
-            cwd=project_root, env=env, capture_output=True, text=True, check=True,
+            cwd=project_root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
         )
         return result.stdout.strip() == "true"
     except (OSError, subprocess.SubprocessError):
@@ -85,9 +85,8 @@ def build_source_tui(project_root: Path, *, env: dict) -> None:
 
 
 def build_source_web(project_root: Path, *, env: dict, icons: Path | None = None) -> None:
-    if icons is None:
-        icons = project_root
-        run_source_script(project_root, "scripts/generate-icons.mjs", env=env, label="Generating icons")
+    # Default-brand icons are committed; installs never render them.
+    icons = icons or project_root
     run_source_script(project_root, "scripts/build/web.mjs", "--source", str(project_root),
                       "--icons", str(icons), "--out", str(project_root / "hermes_cli/web_dist"), env=env,
                       label="Building the web UI")
@@ -122,7 +121,7 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
         publish_stage("Building the web UI")
         build_source_web(project_root, env=env)
     if desktop:
-        from hermes_cli.main_desktop import _install_rebuilt_desktop_app, build_prepared_desktop
+        from hermes_cli.main_desktop import _refresh_installed_desktop_apps, build_prepared_desktop
 
         publish_stage("Building the desktop app")
         build_prepared_desktop(
@@ -131,11 +130,7 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
         )
         # A current release/ can still sit beside a stale installed copy (an earlier
         # update rebuilt but never installed); healing must not wait for the next build.
-        installed, problems = _install_rebuilt_desktop_app(project_root / "apps/desktop")
-        for app in installed:
-            print(f"  ✓ Installed the rebuilt Desktop app at {app}")
-        for problem in problems:
-            print(f"  ⚠ {problem}")
+        _refresh_installed_desktop_apps(project_root / "apps/desktop")
     # A configured memory provider that no longer ships in core is installed from the
     # catalog for every profile home sharing this venv (config, data and tool names
     # unchanged). The update must finish even if the migration blows up.
