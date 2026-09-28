@@ -16,6 +16,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse  # FORK(wbkunlun): explicit — the deleted PLUGIN-COMPAT
+# shim (#126164) used to re-export this name; _open_connection needs it for proxy resolution.
 
 try:
     import aiohttp
