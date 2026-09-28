@@ -5,14 +5,21 @@ Pulls the sandbox whitelist (commands + users) from the control plane
 credential pair as audit reporting. ``CONTROL_PLANE_AUTH`` already carries
 the ``Bearer `` prefix and is passed through verbatim — NEVER log its value.
 
-Semantics (spec: wehermes docs/superpowers/specs/2026-08-27-platform-dynamic-whitelist-design.md):
+Semantics (spec: wehermes docs/superpowers/specs/2026-08-27-platform-dynamic-whitelist-design.md,
+updated by the 2026-09-28 work order):
 
 * disabled — either env unset: consumers ignore this module entirely and
   keep their existing env/config behavior (zero behavior change).
 * enabled — the platform lists REPLACE the env lists:
   - fetch succeeds   → fresh lists; an empty list = that class unrestricted
-  - fetch fails      → last cached lists (memory, then /opt/data JSON)
-  - no data at all   → deny everything (fail-closed) until first success
+  - fetch fails      → last cached lists (memory, then /opt/data JSON); the
+                       degraded-state WARNING marks the served data STALE
+                       with its cache age
+  - no data at all   → DM admission FAILS OPEN with a per-message WARNING
+                       naming the sender (fork work order 2026-09-28: a
+                       control-plane outage silently dropping private
+                       messages costs far more than admitting one DM);
+                       group admission and command gating stay fail-closed
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import fnmatch
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +44,11 @@ _FETCH_TIMEOUT_S = 10.0
 _MAX_ENTRIES = 200
 _MAX_ENTRY_LEN = 512
 _POLL_INTERVAL_S = 30.0
-_BOOT_BACKOFF_S = (1.0, 5.0, 15.0)
+# Failure backoff ladder (work order 2026-09-28 改动2): 5s → 30s → 2min →
+# 5min cap, jittered ±20%, reset on the first success. A flat 30s retry
+# against a down control plane produced ~600 failed-fetch log lines in 48h.
+_FAILURE_BACKOFF_S = (5.0, 30.0, 120.0, 300.0)
+_JITTER_RANGE = (0.8, 1.2)
 _AUTH_ALERT_INTERVAL_S = 300.0
 
 
@@ -75,19 +87,76 @@ class WhitelistClient:
         self._cache_path = Path(cache_path)
         self._snapshot: Optional[WhitelistSnapshot] = None
         self._last_auth_alert = 0.0
+        # Degraded-state tracking (work order 2026-09-28 改动2): failure /
+        # recovery log lines are emitted on STATE CHANGE only, not per fetch.
+        self._degraded = False
+        self._last_error = ""
         self._load_disk_cache()
 
     @property
     def snapshot(self) -> Optional[WhitelistSnapshot]:
         return self._snapshot
 
+    # ---- degraded-state logging -----------------------------------------
+
+    def _mark_fetch_failure(self, reason: str) -> None:
+        """Entering (or staying in) a fetch-failure state logs once."""
+        self._last_error = reason
+        if self._degraded:
+            return
+        self._degraded = True
+        snap = self._snapshot
+        if snap is not None:
+            age = max(0.0, time.time() - snap.fetched_at)
+            logger.warning(
+                "control-plane whitelist unreachable (%s); serving STALE cache "
+                "(fetched %.0fs ago, updated_at=%s) — group/command gates keep "
+                "using this stale data",
+                reason, age, snap.updated_at,
+            )
+        else:
+            logger.warning(
+                "control-plane whitelist unreachable (%s) and no cached data — "
+                "DM admission fails open until the first successful fetch "
+                "(groups and command gating stay fail-closed)",
+                reason,
+            )
+
+    def _mark_fetch_success(self) -> None:
+        """Recovering from a degraded state logs once."""
+        if not self._degraded:
+            return
+        self._degraded = False
+        snap = self._snapshot
+        logger.info(
+            "control-plane whitelist recovered; fresh lists (%d commands, %d users)",
+            len(snap.commands) if snap else 0,
+            len(snap.users) if snap else 0,
+        )
+
     # ---- decisions ------------------------------------------------------
 
     def user_allowed(self, sender_id: str = "", sender_name: str = "") -> bool:
-        """Empty users = allow all; no snapshot = deny (fail-closed)."""
+        """Empty users = allow all; no snapshot = fail-OPEN for DMs.
+
+        Work order 2026-09-28 改动1: a control-plane outage must not silently
+        drop private messages. No snapshot means either "still in the boot
+        window" (a bounded startup fetch shrinks that window to seconds) or
+        "fetch failing with no cache" — both admit the DM with a WARNING that
+        names the sender and the reason, so the operator sees every
+        fail-open admission in the logs.
+        """
         snap = self._snapshot
         if snap is None:
-            return False
+            reason = (
+                f"fetch failing: {self._last_error}" if self._degraded
+                else "no successful fetch yet (boot window)"
+            )
+            logger.warning(
+                "whitelist degraded: fail-open admitted dm sender=%r name=%r (%s)",
+                sender_id, sender_name, reason,
+            )
+            return True
         if not snap.users:
             return True
         return sender_id in snap.users or sender_name in snap.users
@@ -145,7 +214,9 @@ class WhitelistClient:
     async def refresh(self) -> bool:
         """Fetch once (3 attempts on transient errors). Never raises.
 
-        True = snapshot updated. Any failure keeps the previous snapshot.
+        True = snapshot updated. Any failure keeps the previous snapshot and
+        flips the client into (or keeps it in) the degraded state — logged on
+        state change only (work order 2026-09-28 改动2).
         """
         delays = (0.5, 1.0)
         last_error = ""
@@ -163,48 +234,49 @@ class WhitelistClient:
                 transient = True
             else:
                 if response.status_code == 200:
-                    return self._install_from_payload(response)
+                    if self._install_from_payload(response):
+                        self._mark_fetch_success()
+                        return True
+                    self._mark_fetch_failure("invalid payload from control plane")
+                    return False
                 if response.status_code in (401, 403):
                     self._alert_auth_problem(response.status_code)
+                    self._mark_fetch_failure(f"auth rejected (HTTP {response.status_code})")
                     return False  # credential problem: retrying cannot help
                 if 500 <= response.status_code < 600:
                     last_error = f"HTTP {response.status_code}"
                     transient = True
                 else:
-                    logger.warning(
-                        "control-plane whitelist fetch unexpected HTTP %s; keeping cache",
-                        response.status_code,
-                    )
+                    self._mark_fetch_failure(f"unexpected HTTP {response.status_code}")
                     return False
             if transient and attempt < 2:
                 await asyncio.sleep(delays[attempt])
-        logger.warning(
-            "control-plane whitelist fetch failed after retries (%s); keeping cache",
-            last_error,
-        )
+        self._mark_fetch_failure(last_error)
         return False
 
     def _install_from_payload(self, response) -> bool:
         """Validate the envelope, then swap in the new snapshot + persist.
 
-        Any invalid shape keeps the previous snapshot (fail-safe).
+        Any invalid shape keeps the previous snapshot (fail-safe); shape
+        problems log at debug — the degraded-state WARNING on the caller
+        already tells the operator the fetch produced no usable data.
         """
         try:
             payload = response.json()
         except ValueError:
-            logger.warning("control-plane whitelist: non-JSON body; keeping cache")
+            logger.debug("control-plane whitelist: non-JSON body; keeping cache")
             return False
         if not isinstance(payload, dict) or payload.get("success") is not True:
-            logger.warning("control-plane whitelist: invalid envelope; keeping cache")
+            logger.debug("control-plane whitelist: invalid envelope; keeping cache")
             return False
         data = payload.get("data")
         if not isinstance(data, dict):
-            logger.warning("control-plane whitelist: invalid data field; keeping cache")
+            logger.debug("control-plane whitelist: invalid data field; keeping cache")
             return False
         commands = _clean_list(data.get("commands"))
         users = _clean_list(data.get("users"))
         if commands is None or users is None:
-            logger.warning("control-plane whitelist: invalid list fields; keeping cache")
+            logger.debug("control-plane whitelist: invalid list fields; keeping cache")
             return False
         updated_at = data.get("updated_at")
         self._snapshot = WhitelistSnapshot(
@@ -330,27 +402,62 @@ def _reset_for_tests() -> None:
 _poll_task: Optional["asyncio.Task[None]"] = None
 
 
-async def _poll_loop(client: WhitelistClient, sleep=asyncio.sleep) -> None:
-    """Refresh forever. Boot phase (no snapshot yet) backs off 1/5/15s to
-    shrink the fail-closed window; once data exists the cadence is a flat
-    30s — fetch failures just keep serving the cache."""
+def _jittered(base: float) -> float:
+    """±20% so a fleet of sandboxes doesn't retry in lockstep."""
+    return base * random.uniform(*_JITTER_RANGE)
+
+
+async def _poll_loop(
+    client: WhitelistClient, sleep=asyncio.sleep, jitter=_jittered
+) -> None:
+    """Refresh forever. Failures back off 5s→30s→2min→5min (capped,
+    jittered); the first success resets to the flat 30s cadence (work order
+    2026-09-28 改动2 — a flat retry against a down control plane flooded the
+    logs)."""
     failures = 0
     while True:
         try:
             ok = await client.refresh()
         except Exception:
             logger.warning("control-plane whitelist poll error", exc_info=True)
+            client._mark_fetch_failure("poll loop exception")
             ok = False
         if ok:
             failures = 0
             delay = _POLL_INTERVAL_S
         else:
+            delay = _FAILURE_BACKOFF_S[min(failures, len(_FAILURE_BACKOFF_S) - 1)]
             failures += 1
-            if client.snapshot is None:
-                delay = _BOOT_BACKOFF_S[min(failures - 1, len(_BOOT_BACKOFF_S) - 1)]
-            else:
-                delay = _POLL_INTERVAL_S
-        await sleep(delay)
+        await sleep(jitter(delay))
+
+
+async def ensure_startup_fetch(
+    client: Optional[WhitelistClient] = None, *, rounds: int = 2, pause: float = 2.0
+) -> bool:
+    """Bounded blocking fetch before the gateway enters service (work order
+    2026-09-28 改动1). Up to ``rounds`` refresh() calls (each already retries
+    transient errors internally) with ``pause`` seconds between them.
+
+    True when the feature is disabled or a fetch succeeded. False means the
+    service enters degraded anyway — DM admission fails open (each admission
+    logged), groups and command gating serve whatever the disk cache holds.
+    """
+    if client is None:
+        client = get_platform_whitelist()
+        if client is None:
+            return True
+    for round_index in range(rounds):
+        if await client.refresh():
+            return True
+        if round_index < rounds - 1:
+            await asyncio.sleep(pause)
+    logger.warning(
+        "control-plane whitelist: no data after %d startup attempts — entering "
+        "service degraded (DM admission fails open; groups and command gating "
+        "stay fail-closed)",
+        rounds,
+    )
+    return False
 
 
 def start_poll_task() -> Optional["asyncio.Task[None]"]:

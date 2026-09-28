@@ -3,7 +3,9 @@
 When enabled, the platform users list REPLACES the env allowlists for
 WeWork at the gateway authz layer too (DM and group share the list; a
 group message is authorized when the chat OR the sender is on it).
-Pairing stays a UNION; no cached data fails closed.
+Pairing stays a UNION; no cached data fails OPEN for DMs (fork work
+order 2026-09-28 — message loss costs more than admitting one DM during
+a control-plane outage).
 """
 
 from unittest.mock import MagicMock
@@ -98,10 +100,11 @@ def test_empty_platform_list_allows_all(runner, cpwl):
     assert runner._is_user_authorized(_dm_source(user_id="anyone")) is True
 
 
-def test_no_data_fails_closed(runner, cpwl):
-    """Enabled but never fetched → deny even a previously-known sender."""
+def test_no_data_failopens_dm(runner, cpwl):
+    """Work order 2026-09-28: enabled but never fetched → DM fail-open
+    (admitted with a client-side warning) instead of silent denial."""
     cpwl()  # enabled, never fetched
-    assert runner._is_user_authorized(_dm_source()) is False
+    assert runner._is_user_authorized(_dm_source()) is True
 
 
 def test_group_authorized_by_chat_id_or_sender(runner, cpwl):

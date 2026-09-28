@@ -893,6 +893,70 @@ class TestPostBatch:
         plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
         assert calls["n"] == 2  # 1 transient → 1 retry → success
 
+    # -- Work order 2026-09-28 改动3: dropped batches must be VISIBLE -------
+
+    def test_exhausted_transient_retries_warn_drop(self, plugin, monkeypatch, caplog):
+        """All transient retries exhausted → WARNING names the dropped count,
+        the last error and the intake URL (no more silent black hole)."""
+        import logging
+
+        import httpx
+        monkeypatch.setattr(plugin.time, "sleep", lambda *_: None)
+        events = self._two_event_body(plugin)
+
+        class _Down:
+            calls = 0
+
+            def post(self, url, content=None, headers=None):
+                type(self).calls += 1
+                raise httpx.ConnectError("control plane down")
+
+        client = _Down()
+        with caplog.at_level(logging.WARNING, logger="audit_callback_under_test"):
+            plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert _Down.calls == 3  # 1 attempt + 2 retries
+        warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "dropped 2 events" in r.getMessage()
+        ]
+        assert len(warns) == 1
+        msg = warns[0].getMessage()
+        assert "after retries" in msg
+        assert "ConnectError" in msg
+        assert "http://audit/x" in msg
+
+    def test_5xx_giveup_warns_drop(self, plugin, monkeypatch, caplog):
+        import logging
+        monkeypatch.setattr(plugin.time, "sleep", lambda *_: None)
+        events = self._two_event_body(plugin)
+        client = _SeqClient([_FakeResp(500), _FakeResp(500), _FakeResp(500)])
+        with caplog.at_level(logging.WARNING, logger="audit_callback_under_test"):
+            plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert len(client.calls) == 3
+        msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "dropped 2 events" in r.getMessage()
+        ]
+        assert len(msgs) == 1
+        assert "500" in msgs[0]
+        assert "http://audit/x" in msgs[0]
+
+    def test_4xx_drop_warns(self, plugin, caplog):
+        """A terminal 4xx is not retried, but the dropped batch is still
+        logged at WARNING — the operator must see the loss."""
+        import logging
+        events = self._two_event_body(plugin)
+        client = _SeqClient([_FakeResp(400)])
+        with caplog.at_level(logging.WARNING, logger="audit_callback_under_test"):
+            plugin._post_batch_with_retry(client, "http://audit/x", {}, events)
+        assert len(client.calls) == 1
+        msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "dropped 2 events" in r.getMessage()
+        ]
+        assert len(msgs) == 1
+        assert "400" in msgs[0]
+
 
 # ---------------------------------------------------------------------------
 # Sanity: the v0.4 actor-strip-and-retry path is gone.

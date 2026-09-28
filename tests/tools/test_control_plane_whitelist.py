@@ -1,12 +1,17 @@
 """Tests for the control-plane dynamic whitelist client (fork).
 
 Platform semantics: enabled → platform lists REPLACE env lists; fetch
-failure falls back to cached lists; no data at all = deny everything
-(fail-closed); empty list = that class unrestricted.
+failure falls back to cached lists (marked STALE in the degraded-state
+warning); no data at all = DM admission FAILS OPEN with a warning while
+groups and command gating stay fail-closed (fork work order 2026-09-28);
+empty list = that class unrestricted.
 """
 
 import asyncio
 import json
+import logging
+import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +20,8 @@ import pytest
 
 from tools import control_plane_whitelist as cpwl_mod
 from tools.control_plane_whitelist import WhitelistSnapshot
+
+_CPWL_LOGGER = "tools.control_plane_whitelist"
 
 
 @pytest.fixture
@@ -65,9 +72,25 @@ class TestSingleton:
 
 
 class TestUserAllowed:
-    def test_no_snapshot_denies(self, cp_enabled):
-        """Fail-closed: never-fetched + no disk cache → deny everyone."""
-        assert cp_enabled.user_allowed("zhangsan", "Zhang San") is False
+    def test_no_snapshot_failopens_dm_with_warning(self, cp_enabled, caplog):
+        """Work order 2026-09-28 改动1: never-fetched + no disk cache must not
+        silently drop the DM — fail-open, warning names the sender."""
+        with caplog.at_level(logging.WARNING, logger=_CPWL_LOGGER):
+            assert cp_enabled.user_allowed("zhangsan", "Zhang San") is True
+        warns = [r for r in caplog.records if "whitelist degraded: fail-open" in r.getMessage()]
+        assert len(warns) == 1
+        assert "zhangsan" in warns[0].getMessage()
+
+    def test_failopen_reason_carries_last_fetch_error(self, cp_enabled, monkeypatch, caplog):
+        """After a failed fetch the fail-open reason names the last error, so
+        an operator reading the admission warning knows WHY it degraded."""
+        _patch_http(monkeypatch)
+        _FakeAsyncClient.responses = [_FakeResponse(503)] * 3
+        assert asyncio.run(cp_enabled.refresh()) is False
+        with caplog.at_level(logging.WARNING, logger=_CPWL_LOGGER):
+            assert cp_enabled.user_allowed("lisi", "") is True
+        msg = [r for r in caplog.records if "fail-open" in r.getMessage()][0].getMessage()
+        assert "503" in msg
 
     def test_empty_users_allows_all(self, cp_enabled):
         """Empty platform users list = unrestricted."""
@@ -392,23 +415,98 @@ class TestCommandGate:
         assert cp_enabled.command_gate("anything at all") == "bypass"
 
 
+class TestDegradedStateLogging:
+    """Work order 2026-09-28 改动2: fetch failures log on STATE CHANGE only
+    (enter degraded / recover), never once per failed refresh."""
+
+    @staticmethod
+    def _failing_http(monkeypatch):
+        _patch_http(monkeypatch)
+        # 6 responses = two full refresh() rounds (3 attempts each); the
+        # state-change tests must call refresh twice to prove suppression.
+        _FakeAsyncClient.responses = [_FakeResponse(503)] * 6
+
+    def test_stale_failure_logs_once(self, cp_enabled, monkeypatch, caplog):
+        """With a cached snapshot, repeated failed refreshes produce exactly
+        one enter-degraded WARNING that marks the data STALE."""
+        _install(cp_enabled, users=["zhangsan"])
+        self._failing_http(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=_CPWL_LOGGER):
+            assert asyncio.run(cp_enabled.refresh()) is False
+            assert asyncio.run(cp_enabled.refresh()) is False
+        stale = [r for r in caplog.records if "STALE" in r.getMessage()]
+        assert len(stale) == 1
+
+    def test_no_data_failure_logs_failopen_once(self, cp_enabled, monkeypatch, caplog):
+        """Without a snapshot, repeated failed refreshes produce exactly one
+        enter-degraded WARNING that announces the DM fail-open posture."""
+        self._failing_http(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=_CPWL_LOGGER):
+            assert asyncio.run(cp_enabled.refresh()) is False
+            assert asyncio.run(cp_enabled.refresh()) is False
+        enters = [
+            r for r in caplog.records
+            if "unreachable" in r.getMessage() and "fail" in r.getMessage()
+        ]
+        assert len(enters) == 1
+
+    def test_stale_warning_includes_cache_age(self, cp_enabled, monkeypatch, caplog):
+        """The STALE marker carries how old the served cache is."""
+        _install(cp_enabled, users=["zhangsan"])
+        cp_enabled._snapshot = WhitelistSnapshot(
+            commands=(), users=("zhangsan",), updated_at=None,
+            fetched_at=time.time() - 7200.0,
+        )
+        self._failing_http(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=_CPWL_LOGGER):
+            asyncio.run(cp_enabled.refresh())
+        msg = [
+            r.getMessage() for r in caplog.records if "STALE" in r.getMessage()
+        ]
+        assert len(msg) == 1
+        # Age must be present and ~7200s; refresh()'s real intra-retry sleeps
+        # (0.5+1.0s) make the exact second drift by a couple of ticks.
+        match = re.search(r"fetched (\d+)s ago", msg[0])
+        assert match, msg[0]
+        assert 7195 <= int(match.group(1)) <= 7215
+
+    def test_recovery_logged_once(self, cp_enabled, monkeypatch, caplog):
+        """A success after degraded logs one recovery line and clears the state."""
+        self._failing_http(monkeypatch)
+        with caplog.at_level(logging.INFO, logger=_CPWL_LOGGER):
+            assert asyncio.run(cp_enabled.refresh()) is False
+            _FakeAsyncClient.responses = [_FakeResponse(200, _payload(users=["zhangsan"]))]
+            assert asyncio.run(cp_enabled.refresh()) is True
+            _FakeAsyncClient.responses = [_FakeResponse(200, _payload(users=["zhangsan"]))]
+            assert asyncio.run(cp_enabled.refresh()) is True
+        recovered = [r for r in caplog.records if "recovered" in r.getMessage()]
+        assert len(recovered) == 1
+
+
 class TestPollLoop:
-    def test_boot_backoff_then_steady_30s(self, tmp_path):
-        """No-snapshot failures back off 1/5/15s; after first success the
-        cadence locks to 30s even if later polls fail (cache holds)."""
+    """Work order 2026-09-28 改动2: failure backoff 5s→30s→2min→5min (cap)
+    with jitter; success resets to the flat 30s cadence."""
+
+    @staticmethod
+    def _client(tmp_path, results):
         client = cpwl_mod.WhitelistClient(
             url="https://x/api", auth="Bearer t", cache_path=tmp_path / "c.json",
         )
         calls = {"n": 0}
 
         async def fake_refresh():
+            i = calls["n"]
             calls["n"] += 1
-            if calls["n"] <= 3:
-                return False
-            client._snapshot = WhitelistSnapshot((), (), None, 1.0)
-            return True
+            ok = results[i] if i < len(results) else results[-1]
+            if ok:
+                client._snapshot = WhitelistSnapshot((), (), None, 1.0)
+            return ok
 
         client.refresh = fake_refresh
+        return client
+
+    @staticmethod
+    def _run(client, n_delays):
         delays = []
 
         class _Stop(Exception):
@@ -416,47 +514,84 @@ class TestPollLoop:
 
         async def fake_sleep(d):
             delays.append(d)
-            if len(delays) >= 6:
+            if len(delays) >= n_delays:
                 raise _Stop()
 
         async def run():
             try:
-                await cpwl_mod._poll_loop(client, sleep=fake_sleep)
+                await cpwl_mod._poll_loop(client, sleep=fake_sleep, jitter=lambda base: base)
             except _Stop:
                 pass
 
         asyncio.run(run())
-        assert delays == [1.0, 5.0, 15.0, 30.0, 30.0, 30.0]
+        return delays
 
-    def test_with_snapshot_failures_stay_30s(self, tmp_path):
-        """Once a snapshot exists, failures don't trigger boot backoff."""
-        client = cpwl_mod.WhitelistClient(
-            url="https://x/api", auth="Bearer t", cache_path=tmp_path / "c.json",
-        )
-        client._snapshot = WhitelistSnapshot(("ls*",), (), None, 1.0)
+    def test_failure_backoff_schedule_caps_at_5min(self, tmp_path):
+        client = self._client(tmp_path, [False])
+        assert self._run(client, 5) == [5.0, 30.0, 120.0, 300.0, 300.0]
 
-        async def fake_refresh():
+    def test_backoff_resets_on_success(self, tmp_path):
+        client = self._client(tmp_path, [False, False, True, False, False])
+        assert self._run(client, 5) == [5.0, 30.0, 30.0, 5.0, 30.0]
+
+    def test_jitter_scales_failure_delay(self, tmp_path):
+        client = self._client(tmp_path, [False])
+        delays = []
+
+        class _Stop(Exception):
+            pass
+
+        async def fake_sleep(d):
+            delays.append(d)
+            raise _Stop()
+
+        async def run():
+            try:
+                await cpwl_mod._poll_loop(client, sleep=fake_sleep, jitter=lambda base: base * 2)
+            except _Stop:
+                pass
+
+        asyncio.run(run())
+        assert delays == [10.0]
+
+
+class TestStartupFetch:
+    """Work order 2026-09-28 改动1: a bounded blocking fetch runs before the
+    gateway enters service, so the cold-start window has either fresh data
+    or an explicit degraded state."""
+
+    def test_bounded_rounds_when_control_plane_down(self, cp_enabled, monkeypatch):
+        calls = {"n": 0}
+
+        async def failing():
+            calls["n"] += 1
             return False
 
-        client.refresh = fake_refresh
-        delays = []
+        monkeypatch.setattr(cp_enabled, "refresh", failing)
+        assert asyncio.run(
+            cpwl_mod.ensure_startup_fetch(cp_enabled, rounds=2, pause=0.0)
+        ) is False
+        assert calls["n"] == 2
 
-        class _Stop(Exception):
-            pass
+    def test_success_stops_early(self, cp_enabled, monkeypatch):
+        calls = {"n": 0}
 
-        async def fake_sleep(d):
-            delays.append(d)
-            if len(delays) >= 3:
-                raise _Stop()
+        async def ok():
+            calls["n"] += 1
+            return True
 
-        async def run():
-            try:
-                await cpwl_mod._poll_loop(client, sleep=fake_sleep)
-            except _Stop:
-                pass
+        monkeypatch.setattr(cp_enabled, "refresh", ok)
+        assert asyncio.run(
+            cpwl_mod.ensure_startup_fetch(cp_enabled, rounds=3, pause=0.0)
+        ) is True
+        assert calls["n"] == 1
 
-        asyncio.run(run())
-        assert delays == [30.0, 30.0, 30.0]
+    def test_disabled_feature_is_noop_success(self, monkeypatch):
+        """Feature off → nothing to wait for; startup proceeds immediately."""
+        cpwl_mod._reset_for_tests()
+        monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+        monkeypatch.delenv("CONTROL_PLANE_AUTH", raising=False)
+        assert asyncio.run(cpwl_mod.ensure_startup_fetch()) is True
 
 
 class TestStartPollTask:
@@ -490,3 +625,24 @@ def test_gateway_runner_has_poll_starter():
     from gateway.run import GatewayRunner
 
     assert hasattr(GatewayRunner, "_start_control_plane_whitelist_poll")
+
+
+def test_gateway_poll_starter_awaits_startup_fetch_first(monkeypatch):
+    """Work order 2026-09-28 改动1: the poll starter runs the bounded startup
+    fetch BEFORE launching the background poll task."""
+    from gateway.run import GatewayRunner
+
+    order = []
+
+    async def fake_ensure(**kwargs):
+        order.append("ensure")
+
+    def fake_start():
+        order.append("start")
+        return None
+
+    monkeypatch.setattr(cpwl_mod, "ensure_startup_fetch", fake_ensure)
+    monkeypatch.setattr(cpwl_mod, "start_poll_task", fake_start)
+    runner = object.__new__(GatewayRunner)
+    asyncio.run(runner._start_control_plane_whitelist_poll())
+    assert order == ["ensure", "start"]

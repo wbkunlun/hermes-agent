@@ -113,7 +113,8 @@ def test_parse_inbound_group_targets_wechat_id():
 class TestControlPlaneWhitelistGate:
     """Platform (control-plane) whitelist REPLACES the env allow/policy
     config for BOTH DM senders and groups when CONTROL_PLANE_URL/AUTH are
-    both set. No cached data = drop (fail-closed, silent like groups today)."""
+    both set. No cached data = DM fail-open (work order 2026-09-28), groups
+    stay fail-closed."""
 
     @pytest.fixture
     def cpwl(self, monkeypatch, tmp_path):
@@ -204,10 +205,12 @@ class TestControlPlaneWhitelistGate:
         assert self._adapter()._parse_inbound(self._dm_payload()) is not None
         assert self._adapter()._parse_inbound(self._group_payload()) is not None
 
-    def test_no_data_drops_everything(self, cpwl):
-        """Enabled but never fetched and no cache: fail-closed drops all."""
+    def test_no_data_failopens_dm_drops_group(self, cpwl):
+        """Work order 2026-09-28 改动1: enabled but never fetched and no
+        cache → the DM is ADMITTED (fail-open, warning from the client);
+        groups stay fail-closed."""
         cpwl()  # enabled, never fetched, no cache
-        assert self._adapter()._parse_inbound(self._dm_payload()) is None
+        assert self._adapter()._parse_inbound(self._dm_payload()) is not None
         assert self._adapter()._parse_inbound(self._group_payload()) is None
 
     def test_require_mention_still_applies_on_platform_path(self, cpwl):
@@ -232,16 +235,17 @@ class TestControlPlaneWhitelistGate:
         cpwl_mod._reset_for_tests()
 
     def test_drop_logs_rate_limited(self, cpwl, monkeypatch, caplog):
-        """No-data drops emit a rate-limited warning (operator visibility)."""
+        """Genuine list-miss drops emit a rate-limited warning (operator
+        visibility). No-data DMs no longer drop at all (fail-open)."""
         import logging as _logging
 
         from plugins.platforms.wework import adapter as adapter_mod
 
-        cpwl()  # enabled, never fetched, no cache → fail-closed drops
+        cpwl(users=["zhangsan"])  # real miss: senders below are not listed
         monkeypatch.setattr(adapter_mod, "_cpwl_last_drop_log", 0.0)
         with caplog.at_level(_logging.WARNING, logger="plugins.platforms.wework.adapter"):
             adapter = self._adapter()
-            adapter._parse_inbound(self._dm_payload(t="lg1"))
-            adapter._parse_inbound(self._dm_payload(t="lg2"))
+            adapter._parse_inbound(self._dm_payload(user="lisi", t="lg1"))
+            adapter._parse_inbound(self._dm_payload(user="wangwu", t="lg2"))
         warnings = [r for r in caplog.records if "control-plane whitelist dropped" in r.getMessage()]
         assert len(warnings) == 1  # second drop within 5 min is suppressed

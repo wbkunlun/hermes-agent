@@ -259,6 +259,10 @@ def _post_batch_with_retry(
     path; the platform accepts IngestBatchRequest on the same endpoint that
     accepts IngestSingleRequest. Retries on transient errors / 5xx; on 2xx
     per-item statuses are processed (duplicate is fine, error logged).
+
+    (fork, 2026-09-28): a batch dropped after retries / on a terminal 4xx
+    logs one WARNING naming count + last status + url — still non-blocking,
+    but never a silent black hole again (work order 改动3).
     """
     import httpx
 
@@ -272,21 +276,24 @@ def _post_batch_with_retry(
             if attempt < 2:
                 time.sleep(backoff[attempt])
                 continue
-            logger.debug(
-                "audit-callback: giving up on batch of %d after transient errors: %s",
-                len(events), exc,
+            logger.warning(
+                "audit-callback: dropped %d events after retries (last status=%s, url=%s)",
+                len(events), f"{type(exc).__name__}: {exc}", url,
             )
             return
         except Exception as exc:  # noqa: BLE001 — non-transient; don't retry
-            logger.debug("audit-callback: batch POST error (no retry): %s", exc)
+            logger.warning(
+                "audit-callback: dropped %d events (unretriable POST error, last status=%s, url=%s)",
+                len(events), f"{type(exc).__name__}: {exc}", url,
+            )
             return
         code = resp.status_code
         if code < 500:
             if code >= 400:
                 snippet = getattr(resp, "text", "") or ""
-                logger.debug(
-                    "audit-callback: server returned %d for batch of %d: %s",
-                    code, len(events), snippet[:200],
+                logger.warning(
+                    "audit-callback: dropped %d events (terminal HTTP %d, url=%s): %s",
+                    len(events), code, url, snippet[:200],
                 )
             else:
                 _log_batch_results(resp, events)
@@ -294,9 +301,9 @@ def _post_batch_with_retry(
         if attempt < 2:  # 5xx → retry the whole batch
             time.sleep(backoff[attempt])
             continue
-        logger.debug(
-            "audit-callback: server returned %d for batch of %d after retries",
-            code, len(events),
+        logger.warning(
+            "audit-callback: dropped %d events after retries (last status=HTTP %d, url=%s)",
+            len(events), code, url,
         )
         return
 

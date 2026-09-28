@@ -1413,14 +1413,16 @@ class GatewayStartupMixin:
         )
         return False
 
-    def _start_control_plane_whitelist_poll(self) -> None:
-        """Start the control-plane whitelist poll task (fork). Idempotent
-        and best-effort — a whitelist fetch problem must never be able to
-        abort startup. The task joins the background-task set so stop()
+    async def _start_control_plane_whitelist_poll(self) -> None:
+        """Bounded startup fetch, then the poll task (fork). Idempotent and
+        best-effort — a whitelist fetch problem must never be able to abort
+        startup (work order 2026-09-28 改动1: enter service degraded with DM
+        fail-open instead). The task joins the background-task set so stop()
         cancels it with everything else."""
         try:
-            from tools.control_plane_whitelist import start_poll_task
+            from tools.control_plane_whitelist import ensure_startup_fetch, start_poll_task
 
+            await ensure_startup_fetch()
             task = start_poll_task()
         except Exception:
             logger.debug("control-plane whitelist poll not started", exc_info=True)
@@ -1448,7 +1450,7 @@ class GatewayStartupMixin:
             )
         self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
         self._start_loop_heartbeat_task()
-        self._start_control_plane_whitelist_poll()
+        await self._start_control_plane_whitelist_poll()
         from gateway.run_heartbeat_restore import restore_heartbeat_watches
         self._start_heartbeat_poller()  # Keep retrying even when the first scan is empty.
         await restore_heartbeat_watches(self)
