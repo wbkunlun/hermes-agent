@@ -745,12 +745,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     return last_result
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import re  # noqa: F401,E402
-import time  # noqa: F401,E402
+# ---- fork: WeCom-scoped agent registration ---------------------------------
+# Upstream removed the PLUGIN-COMPAT shim (SEND_MESSAGE_SCHEMA et al., #126164)
+# with no agent-facing replacement — the schema below is now fork-owned, kept
+# solely to feed the registration at the bottom of this block.
+#
+# ``send_message`` is registered as an agent-callable tool, scoped narrowly to
+# the WeCom platform toolsets (hermes-wecom / hermes-wecom-callback in
+# toolsets.py) so the agent can notify a specific WeCom user on request. Other
+# platforms are unchanged: the send engine above remains the shared transport
+# for cron delivery (cron/scheduler.py), the ``hermes send`` CLI command
+# (hermes_cli/send_cmd.py), the gateway kanban notifier (dashboard-toggled,
+# outside agent control) and the standalone MCP server (mcp_serve.py).
+# WeCom sends route through the gateway's live in-process adapter (see
+# _CHUNKED_ROUTES above), so they never open a competing WebSocket (846609).
 
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
@@ -790,20 +798,6 @@ SEND_MESSAGE_SCHEMA = {
         "required": []
     }
 }
-
-
-
-
-# ---- fork: WeCom-scoped agent registration ---------------------------------
-# ``send_message`` is registered as an agent-callable tool, scoped narrowly to
-# the WeCom platform toolsets (hermes-wecom / hermes-wecom-callback in
-# toolsets.py) so the agent can notify a specific WeCom user on request. Other
-# platforms are unchanged: the send engine above remains the shared transport
-# for cron delivery (cron/scheduler.py), the ``hermes send`` CLI command
-# (hermes_cli/send_cmd.py), the gateway kanban notifier (dashboard-toggled,
-# outside agent control) and the standalone MCP server (mcp_serve.py).
-# WeCom sends route through the gateway's live in-process adapter (see
-# _CHUNKED_ROUTES above), so they never open a competing WebSocket (846609).
 
 
 def _check_send_message():
