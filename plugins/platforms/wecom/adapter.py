@@ -36,7 +36,7 @@ from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from plugins.platforms.wecom.stream_delivery import WeComStreamDelivery
 from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from utils import env_float
+from utils import env_float, env_int
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
@@ -167,6 +167,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         self._text_batch_delay_seconds = env_float("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
         self._attachment_text_merge_delay_seconds = _extra_float("attachment_text_merge_delay_seconds", 0.8)
+        # fork: group pending-redelivery queue (groups are passive-reply-only — a send with no live
+        # req_id is stashed and flushed pre-turn on the group's next inbound message). TTL 0 disables.
+        self._group_pending_ttl_seconds = env_float("HERMES_WECOM_GROUP_PENDING_TTL_SECONDS", 21600.0)
+        self._group_pending_max = env_int("HERMES_WECOM_GROUP_PENDING_MAX", 5)
         # Stream keep-alive config (see streaming.py STREAM_* constants).
         self._stream_safe_duration_seconds = _extra_float("stream_safe_duration_seconds", STREAM_SAFE_DURATION_SECONDS)
         self._stream_keepalive_enabled = bool(extra.get("stream_keepalive_enabled", STREAM_KEEPALIVE_ENABLED_DEFAULT))
@@ -178,6 +182,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
         self._stream_turns: Dict[str, StreamTurn] = {}
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups can't receive proactive APP_CMD_SEND
+        # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id; and the
+        # DM chatid→userid map (wohR-style chat ids learned from inbound senders) so agent-fallback
+        # can resolve a self-built-app touser. Both in-memory only — rebuilt by inbound traffic.
+        self._pending_group_sends: Dict[str, List[Tuple[float, str]]] = {}
+        self._dm_userid_by_chat: Dict[str, str] = {}
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
@@ -600,6 +609,14 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             return
         # Post-policy: cache req_id so sends can fall back to passive reply (required in groups).
         self._remember_chat_req_id(chat_id, req_id)
+        # fork: learn the DM touser (wohR-style chat ids carry the userid only on the sender), then
+        # flush any pending group redeliveries — pre-turn reply frames on a fresh req_id are legal
+        # (welcome + approval-prompt precedents), and this runs before the text-batch/turn so the
+        # redelivery is ordered ahead of the reply on the same per-chat normal lane.
+        if not is_group and sender_id and sender_id != chat_id:
+            bounded_put(self._dm_userid_by_chat, chat_id, sender_id, DEDUP_MAX_SIZE)
+        if self._pending_group_sends.get(chat_id):
+            self._flush_group_pending(chat_id)
         text, reply_text = self._extract_text(body)
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()  # "@Bot /approve" -> "/approve"
@@ -734,6 +751,68 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         """Explicit reply_to mapping, else the chat's last inbound req_id."""
         return self._reply_req_id_for_message(reply_to) or self._last_chat_req_ids.get(chat_id)
 
+    def _stash_group_pending(self, chat_id: str, content: str) -> bool:
+        """fork: park an undeliverable group send for redelivery on the chat's next inbound req_id.
+
+        Groups are passive-reply-only, so a scheduled push landing in a quiet group has no channel
+        at fire time; the entry is flushed pre-turn by ``_flush_group_pending``. Returns True when
+        the content is parked (or already parked — the live and standalone cron lanes both land
+        here with identical content, so exact-content dedup collapses the duplicate attempt
+        without dropping the redelivery).
+        """
+        pending = getattr(self, "_pending_group_sends", None)  # bare __new__ test stubs skip queueing
+        if pending is None:
+            return False
+        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
+        if ttl <= 0:
+            return False
+        now = time.time()
+        entries = [(ts, text) for ts, text in pending.get(chat_id, []) if now - ts < ttl]
+        if any(text == content for _, text in entries):
+            logger.info("[%s] Group send already queued for redelivery (chat=%s, queued=%d) — duplicate live/standalone attempt not re-queued", self.name, chat_id, len(entries))
+            pending[chat_id] = entries
+            return True
+        max_pending = getattr(self, "_group_pending_max", 5)
+        while len(entries) >= max_pending:  # newest scheduled reports matter more; drop oldest
+            dropped_ts, _ = entries.pop(0)
+            logger.warning("[%s] Group pending queue full (chat=%s, max=%d) — dropping entry scheduled %s", self.name, chat_id, max_pending, time.strftime("%H:%M", time.localtime(dropped_ts)))
+        entries.append((now, content))
+        pending[chat_id] = entries
+        logger.warning("[%s] Group send queued for redelivery on next group message (chat=%s, queued=%d, ttl=%.0fs)", self.name, chat_id, len(entries), ttl)
+        return True
+
+    def _flush_group_pending(self, chat_id: str) -> None:
+        """Redeliver parked group sends on the fresh inbound req_id (fire-and-forget).
+
+        Each entry goes through the normal ``send()`` lane so ordering with the upcoming turn reply
+        holds; a failed redelivery is dropped (``is_redelivery`` blocks re-stashing — a fresh
+        req_id failing means a later one will not help either).
+        """
+        pending = getattr(self, "_pending_group_sends", None)
+        if not pending:
+            return
+        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
+        now = time.time()
+        stashed = pending.pop(chat_id, [])
+        entries = [(ts, text) for ts, text in stashed if now - ts < ttl]
+        if len(entries) != len(stashed):
+            logger.info("[%s] Group redelivery: %d expired of %d stashed entries dropped (chat=%s, ttl=%.0fs)", self.name, len(stashed) - len(entries), len(stashed), chat_id, ttl)
+        for ts, content in entries:
+            header = f"⏰ 定时补发（原定 {time.strftime('%H:%M', time.localtime(ts))}）"
+            # Header must not push the composed frame past the server cap the markdown path slices at.
+            body = content[: max(0, self.MAX_MESSAGE_LENGTH - len(header) - len("\n---\n"))]
+            asyncio.ensure_future(self._redeliver_group_pending(chat_id, f"{header}\n---\n{body}"))
+
+    async def _redeliver_group_pending(self, chat_id: str, composed: str) -> None:
+        """One flushed entry; never raises into the event loop (fire-and-forget owner)."""
+        try:
+            result = await self.send(chat_id, composed, metadata={"is_redelivery": True})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Group redelivery raised and was dropped (chat=%s): %s", self.name, chat_id, exc)
+            return
+        if not getattr(result, "success", False):
+            logger.warning("[%s] Group redelivery failed and was dropped (chat=%s, error=%s)", self.name, chat_id, getattr(result, "error", None))
+
     async def _force_reconnect_on_stale_subscription(self, errcode: int) -> None:
         """On 846609 (subscription lost) drop req_ids bound to the dead session. Do NOT close the
         WS: a second connection gets kicked and invalidates the first (infinite kick loop)."""
@@ -774,21 +853,42 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         is_control = metadata.pop("is_approval_prompt", False)
         # Approval *confirmations* must not consume the req_id the stream consumer still needs.
         force_proactive = bool(metadata.pop("force_proactive_send", False))
-        return await self._enqueue_chat_send(chat_id, lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive), is_control=is_control)
+        # fork: a flushed pending entry must never re-stash on failure (redelivery loop guard).
+        is_redelivery = bool(metadata.pop("is_redelivery", False))
+        return await self._enqueue_chat_send(
+            chat_id,
+            lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery),
+            is_control=is_control,
+        )
 
-    async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False) -> SendResult:
+    async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False, is_control: bool = False, is_redelivery: bool = False) -> SendResult:
         """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
+        # fork: group-ness covers operator-configured groups too — the inbound-learned set is
+        # in-memory and wiped on restart, which must not strand a configured group's pending queue.
+        # (getattr: bare __new__ test stubs drive _send_inner without running __init__.)
+        is_group_chat = chat_id in self._group_chat_ids or chat_id in getattr(self, "_groups", {})
         try:
-            reply_req_id = None if force_proactive and chat_id not in self._group_chat_ids else self._cached_reply_req_id(chat_id, reply_to)
+            reply_req_id = None if force_proactive and not is_group_chat else self._cached_reply_req_id(chat_id, reply_to)
             if reply_req_id:
                 try:
                     response = await self._send_reply_markdown(reply_req_id, content)
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
+                    if is_group_chat:
+                        # Groups cannot receive proactive APP_CMD_SEND — park the content for the
+                        # next inbound instead of attempting a send the server will refuse.
+                        logger.warning("[%s] Passive reply failed for group chat %s (%s) — queueing for redelivery", self.name, chat_id, passive_err)
+                        if not is_control and not is_redelivery:
+                            self._stash_group_pending(chat_id, content)
+                        # Proactive attempt used to surface 846609 and schedule the stale-req_id
+                        # purge via _fail_or_fallback; keep that recovery for the dead session.
+                        return self._send_failure(f"Group passive reply failed: {passive_err}", str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(passive_err))
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
                     response = await self._send_proactive_markdown(chat_id, content)
-            elif chat_id in self._group_chat_ids:
+            elif is_group_chat:
                 logger.warning("[%s] No cached req_id for group chat %s — cannot send (groups require passive reply via req_id)", self.name, chat_id)
+                if not is_control and not is_redelivery and self._stash_group_pending(chat_id, content):
+                    return SendResult(success=False, error="No req_id available for group chat (passive reply required; queued for redelivery on next group message)")
                 return SendResult(success=False, error="No req_id available for group chat (passive reply required)")
             else:
                 response = await self._send_proactive_markdown(chat_id, content)
@@ -828,17 +928,20 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         Enabled iff WECOM_CALLBACK_{CORP_ID,CORP_SECRET,AGENT_ID} are set and
         WECOM_AGENT_FALLBACK is not an explicit off value (see
         ``_agent_fallback_client``).  Group chats never fall back — the aibot
-        group chat_id is not a valid self-built-app touser, so there is no
-        usable mapping (documented limitation; groups keep the passive
-        req_id path).
+        group chat_id is not a valid self-built-app touser (documented
+        limitation; groups keep the passive req_id path).  DM chat ids that ARE
+        the corp userid go through unchanged; wohR-style DM room ids resolve
+        via ``_dm_userid_by_chat`` (in-memory, learned from inbound senders —
+        an unknown id after a restart falls back to the raw chat_id).
         """
         if chat_id in self._group_chat_ids:
             return None
         client = _agent_fallback_client()
         if client is None:
             return None
+        touser = (getattr(self, "_dm_userid_by_chat", None) or {}).get(chat_id, chat_id)
         try:
-            ok, err = await client.send_markdown(chat_id, content)
+            ok, err = await client.send_markdown(touser, content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] agent fallback raised after bot failure (%s): %s",
                            self.name, reason, exc)
@@ -969,6 +1072,16 @@ def _agent_fallback_client() -> Optional[Any]:
     return _agent_fallback_client_cache["client"]
 
 
+def _consume_cross_loop_result(future) -> None:
+    """Absorb the outcome of a cross-loop send abandoned at timeout (shielded, still running on
+    the gateway loop) so its result/exception is observed — the consume_detached_task_result
+    pattern; without this the executor logs "exception was never retrieved"."""
+    try:
+        future.result()
+    except Exception:  # noqa: BLE001 — observation only, the owner already gave up
+        pass
+
+
 async def _standalone_send(
 
     pconfig,
@@ -1010,9 +1123,17 @@ async def _standalone_send(
         _runner, _live = _live_adapter(Platform.WECOM)
     except Exception:
         _runner = None
-    if _runner is not None:
-        if _live is not None:
-            _live_error: Optional[str] = None
+    if _runner is not None and _live is not None:
+        # fork: awaiting the live adapter off the gateway loop parks the per-chat queue's future
+        # on THIS loop while the gateway worker completes it cross-thread via plain call_soon —
+        # the wakeup never reaches our selector, so a failure known in ~100ms only surfaces at the
+        # caller's 60s wait_for (observed in prod: the "delivery error" logged exactly +60s).
+        # Detect the foreign loop up front and go straight to the threadsafe dispatch.
+        _gateway_loop = getattr(_runner, "_gateway_loop", None)
+        _off_loop = _gateway_loop is not None and _gateway_loop.is_running() and asyncio.get_running_loop() is not _gateway_loop
+        _live_error: Optional[str] = None
+        _need_cross_loop = _off_loop
+        if not _off_loop:
             try:
                 _result = await _live.send(chat_id, message)
             except asyncio.CancelledError:
@@ -1039,44 +1160,51 @@ async def _standalone_send(
             # safe_schedule_threadsafe instead of opening an ephemeral WS —
             # an ephemeral connection would displace the gateway's sole
             # subscription (errcode 846609), disrupting all live traffic.
-            if _live_error:
-                _gateway_loop = getattr(_runner, "_gateway_loop", None)
-                if _gateway_loop is not None and not _gateway_loop.is_closed():
+            _need_cross_loop = True
+        if _need_cross_loop:
+            if _gateway_loop is not None and _gateway_loop.is_running():
+                try:
+                    from agent.async_utils import safe_schedule_threadsafe
+                    _future = safe_schedule_threadsafe(
+                        _live.send(chat_id, message),
+                        _gateway_loop,
+                    )
+                except Exception as _sched_err:
+                    logger.debug(
+                        "[%s] standalone_send: cross-loop schedule failed (%s)",
+                        "wecom", _sched_err,
+                    )
+                    return {"error": _live_error}
+                if _future is not None:
                     try:
-                        from agent.async_utils import safe_schedule_threadsafe
-                        _future = safe_schedule_threadsafe(
-                            _live.send(chat_id, message),
-                            _gateway_loop,
-                        )
-                    except Exception as _sched_err:
+                        # wrap_future bridges the concurrent future with call_soon_threadsafe (a
+                        # correct cross-thread wakeup); shield keeps the gateway-loop send
+                        # un-cancelled on timeout (#115469; mirrors _dispatch_on_gateway_loop).
+                        _cross_result = await asyncio.wait_for(
+                            asyncio.shield(asyncio.wrap_future(_future)), timeout=30)
+                    except asyncio.TimeoutError:
+                        _future.add_done_callback(_consume_cross_loop_result)
+                        return {"error": "WeCom cross-loop send failed: timeout"}
+                    except Exception as _cross_err:
                         logger.debug(
-                            "[%s] standalone_send: cross-loop schedule failed (%s)",
-                            "wecom", _sched_err,
+                            "[%s] standalone_send: cross-loop send failed (%s)",
+                            "wecom", _cross_err,
                         )
-                        return {"error": _live_error}
-                    if _future is not None:
-                        try:
-                            _cross_result = _future.result(timeout=30)
-                        except Exception as _cross_err:
-                            logger.debug(
-                                "[%s] standalone_send: cross-loop send failed (%s)",
-                                "wecom", _cross_err,
-                            )
-                            return {"error": f"WeCom cross-loop send failed: {_cross_err}"}
-                        if getattr(_cross_result, "success", False):
-                            return {
-                                "success": True,
-                                "platform": "wecom",
-                                "chat_id": chat_id,
-                                "message_id": getattr(_cross_result, "message_id", None),
-                            }
+                        return {"error": f"WeCom cross-loop send failed: {_cross_err}"}
+                    if getattr(_cross_result, "success", False):
                         return {
-                            "error": f"WeCom send failed: {getattr(_cross_result, 'error', None)}",
+                            "success": True,
+                            "platform": "wecom",
+                            "chat_id": chat_id,
+                            "message_id": getattr(_cross_result, "message_id", None),
                         }
-                # No reachable gateway loop: do NOT open an ephemeral WS here —
-                # it would displace the live subscription (846609). Return the
-                # original error; the caller may retry.
-                return {"error": _live_error}
+                    return {
+                        "error": f"WeCom send failed: {getattr(_cross_result, 'error', None)}",
+                    }
+            # No reachable gateway loop: do NOT open an ephemeral WS here —
+            # it would displace the live subscription (846609). Return the
+            # original error; the caller may retry.
+            return {"error": _live_error or "WeCom send failed: no reachable gateway loop"}
 
     # Agent-channel fallback BEFORE any ephemeral WebSocket: an ephemeral
     # subscribe displaces the gateway's sole WS session (errcode 846609),

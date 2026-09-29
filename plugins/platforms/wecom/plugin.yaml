@@ -83,3 +83,11 @@ optional_env:
     description: "Set 0/false/off to disable Bot→self-built-app delivery fallback"
     prompt: "Disable agent fallback? (default enabled when callback env set)"
     password: false
+  - name: HERMES_WECOM_GROUP_PENDING_TTL_SECONDS
+    description: "TTL seconds for the group pending-redelivery queue (scheduled sends stashed until the group's next inbound message); 0 disables"
+    prompt: "Group pending redelivery TTL seconds (default 21600)"
+    password: false
+  - name: HERMES_WECOM_GROUP_PENDING_MAX
+    description: "Max stashed entries per group before the oldest is dropped"
+    prompt: "Group pending queue cap (default 5)"
+    password: false

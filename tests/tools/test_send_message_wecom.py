@@ -138,11 +138,12 @@ class TestWecomStandaloneSend:
         ephemeral.disconnect.assert_awaited_once()
 
     def test_cross_loop_falls_back_to_gateway_loop_schedule_not_ephemeral(self):
-        """A live adapter whose send fails with a "different event loop" error
-        (cron's asyncio.run fallback creates a new loop, but the adapter's
-        websocket futures are bound to the gateway loop) must be re-scheduled
-        onto the gateway loop — NOT re-sent via an ephemeral WS, which would
-        displace the main subscription (errcode 846609)."""
+        """A caller on a foreign loop (cron's asyncio.run fallback creates a new
+        loop) must be detected up front and the send scheduled onto the gateway
+        loop WITHOUT first awaiting the live adapter (an off-loop await parks
+        the per-chat queue future on the caller's loop — the 60s stall) and
+        WITHOUT an ephemeral WS, which would displace the main subscription
+        (errcode 846609)."""
         # Gateway loop runs in a background thread (as the real gateway does);
         # asyncio.run_coroutine_threadsafe requires a running loop.
         gateway_loop = asyncio.new_event_loop()
@@ -152,9 +153,7 @@ class TestWecomStandaloneSend:
             send_calls = []
 
             async def _send(*args, **kwargs):
-                send_calls.append(len(send_calls))
-                if len(send_calls) == 1:
-                    raise RuntimeError("Future attached to a different loop")
+                send_calls.append(asyncio.get_running_loop())
                 return SimpleNamespace(success=True, message_id="cross-m1")
 
             live_adapter = SimpleNamespace(send=_send)
@@ -186,7 +185,10 @@ class TestWecomStandaloneSend:
 
             assert result["success"] is True
             assert result["message_id"] == "cross-m1"
-            assert len(send_calls) == 2, "must retry on the gateway loop"
+            # Exactly one send, executed ON the gateway loop — the doomed
+            # off-loop direct call is skipped by the pre-check (the old flow's
+            # first failing attempt no longer happens).
+            assert send_calls == [gateway_loop], "send must run on the gateway loop exactly once"
             # CRITICAL: no ephemeral WS was opened (would displace subscription).
             ephemeral.connect.assert_not_awaited()
             ephemeral.send.assert_not_awaited()

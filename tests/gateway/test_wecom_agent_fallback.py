@@ -306,3 +306,137 @@ class TestStandaloneFallback:
 
         source = inspect.getsource(wecom_adapter._standalone_send)
         assert source.count("check_wecom_requirements()") == 1
+
+    @pytest.mark.asyncio
+    async def test_standalone_skips_direct_live_send_off_gateway_loop(self, monkeypatch):
+        """fork 跨 loop 修复：caller 不在 gateway loop 上时必须跳过对 live adapter 的直调（异 loop
+        await 会把 per-chat 队列 future 停在本 loop、gateway worker 跨线程唤醒不了——生产 60s 卡顿
+        根因），直接走 threadsafe 派发。"""
+        import asyncio
+        import concurrent.futures
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from gateway.config import PlatformConfig
+        import tools.send_message_senders as senders
+        import agent.async_utils as async_utils
+
+        gateway_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=gateway_loop.run_forever, daemon=True)
+        thread.start()
+
+        fake_live = SimpleNamespace(send=AsyncMock())
+        scheduled = []
+
+        def fake_schedule(coro, loop):
+            scheduled.append(loop)
+            coro.close()  # 结果由桩直接给出，真实协程不执行
+            fut = concurrent.futures.Future()
+            fut.set_result(SimpleNamespace(success=True, message_id="cross-1"))
+            return fut
+
+        monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", fake_schedule)
+        monkeypatch.setattr(
+            senders, "_live_adapter",
+            lambda platform: (SimpleNamespace(_gateway_loop=gateway_loop), fake_live),
+        )
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: None)
+
+        try:
+            result = await wecom_adapter._standalone_send(
+                PlatformConfig(enabled=True), "zhangsan", "cron hello",
+            )
+            assert result.get("success") is True
+            assert result.get("message_id") == "cross-1"
+            fake_live.send.assert_not_awaited()  # 异 loop 直调被跳过
+            assert scheduled == [gateway_loop]  # 走的是 threadsafe 派发
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            thread.join(timeout=2)
+            gateway_loop.close()
+
+    @pytest.mark.asyncio
+    async def test_standalone_uses_direct_send_on_gateway_loop(self, monkeypatch):
+        """caller 就在 gateway loop 上时保留直调（无跨线程派发开销）。"""
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from gateway.config import PlatformConfig
+        import tools.send_message_senders as senders
+
+        fake_live = SimpleNamespace(
+            send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="direct-1"))
+        )
+        runner = SimpleNamespace(_gateway_loop=asyncio.get_running_loop())
+        monkeypatch.setattr(senders, "_live_adapter", lambda platform: (runner, fake_live))
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: None)
+
+        result = await wecom_adapter._standalone_send(
+            PlatformConfig(enabled=True), "zhangsan", "cron hello",
+        )
+        assert result.get("success") is True
+        assert result.get("message_id") == "direct-1"
+        fake_live.send.assert_awaited_once_with("zhangsan", "cron hello")
+
+    @pytest.mark.asyncio
+    async def test_standalone_cross_loop_result_flows_via_wrap_future(self, monkeypatch):
+        """跨 loop 结果经 wrap_future 回流到本次 await，且等待期间本 loop 保持可调度
+        （旧的阻塞 .result() 会把 loop 卡死，并发任务全部饿死）。"""
+        import asyncio
+        import concurrent.futures
+        import threading
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from gateway.config import PlatformConfig
+        import tools.send_message_senders as senders
+        import agent.async_utils as async_utils
+
+        gateway_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=gateway_loop.run_forever, daemon=True)
+        thread.start()
+        fake_live = SimpleNamespace(send=AsyncMock())
+
+        def fake_schedule(coro, loop):
+            coro.close()
+            fut = concurrent.futures.Future()
+
+            def complete():
+                time.sleep(0.05)  # 50ms 后另一线程才给出结果
+                fut.set_result(SimpleNamespace(success=True, message_id="delayed-1"))
+
+            threading.Thread(target=complete, daemon=True).start()
+            return fut
+
+        monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", fake_schedule)
+        monkeypatch.setattr(
+            senders, "_live_adapter",
+            lambda platform: (SimpleNamespace(_gateway_loop=gateway_loop), fake_live),
+        )
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: None)
+
+        ticks = []
+
+        async def ticker():
+            for _ in range(10):
+                ticks.append(1)
+                await asyncio.sleep(0.01)
+
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            result = await wecom_adapter._standalone_send(
+                PlatformConfig(enabled=True), "zhangsan", "cron hello",
+            )
+            assert result.get("success") is True
+            assert result.get("message_id") == "delayed-1"
+            # 等待期间本 loop 保持可调度：旧的阻塞 .result() 此刻 ticks 应为 0
+            assert len(ticks) >= 2, f"loop starved during cross-loop send: only {len(ticks)} ticks"
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            thread.join(timeout=2)
+            gateway_loop.close()
+            ticker_task.cancel()
+            try:
+                await ticker_task
+            except asyncio.CancelledError:
+                pass

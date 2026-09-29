@@ -460,6 +460,220 @@ class TestSend:
         adapter._send_request.assert_not_awaited()
 
 
+class TestGroupPendingRedelivery:
+    """fork: 群聊补发队列 — a group send with no live req_id is stashed and flushed pre-turn on the
+    group's next inbound message (groups are passive-reply-only; scheduled pushes have no channel)."""
+
+    def _adapter(self, **extra):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra=extra))
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})
+        adapter._send_reply_request = AsyncMock(return_value={"errcode": 0})
+        return adapter
+
+    async def _drain_workers(self, adapter):
+        """Cancel the per-chat send workers so they never outlive the test's event loop."""
+        for worker in list(adapter._chat_workers.values()) + list(adapter._control_workers.values()):
+            worker.cancel()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_group_send_without_req_id_stashes_and_fails(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+
+        result = await adapter.send("g1", "morning report")
+
+        assert result.success is False
+        assert "queued for redelivery" in (result.error or "")
+        adapter._send_request.assert_not_awaited()  # no doomed proactive APP_CMD_SEND
+        entries = adapter._pending_group_sends.get("g1")
+        assert entries and len(entries) == 1 and entries[0][1] == "morning report"
+
+    @pytest.mark.asyncio
+    async def test_group_passive_failure_stashes_instead_of_proactive(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._last_chat_req_ids["g1"] = "req-stale"
+        adapter._send_reply_request = AsyncMock(side_effect=RuntimeError("WeCom errcode 846608: stream window expired"))
+
+        result = await adapter.send("g1", "afternoon report")
+
+        assert result.success is False
+        assert "Group passive reply failed" in (result.error or "")
+        adapter._send_request.assert_not_awaited()  # groups cannot receive APP_CMD_SEND
+        entries = adapter._pending_group_sends.get("g1")
+        assert entries and entries[0][1] == "afternoon report"
+
+    @pytest.mark.asyncio
+    async def test_control_lane_never_stashes(self):
+        """Approval prompts (control lane) must not be redelivered hours later into a group."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+
+        result = await adapter.send("g1", "⚠️ approval prompt", metadata={"is_approval_prompt": True})
+
+        assert result.success is False
+        assert adapter._pending_group_sends.get("g1") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_redelivery_flag_never_stashes(self):
+        """A flushed entry that fails again must drop, not re-queue (loop guard)."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+
+        result = await adapter.send("g1", "⏰ 定时补发（原定 09:03）\n---\nreport", metadata={"is_redelivery": True})
+
+        assert result.success is False
+        assert adapter._pending_group_sends.get("g1") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_duplicate_content_not_re_stashed(self):
+        """The live and standalone cron lanes both land here with identical content — dedup."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+
+        await adapter.send("g1", "night report")
+        result = await adapter.send("g1", "night report")
+
+        assert result.success is False
+        entries = adapter._pending_group_sends["g1"]
+        assert len(entries) == 1 and entries[0][1] == "night report"
+
+    @pytest.mark.asyncio
+    async def test_cap_drops_oldest(self):
+        adapter = self._adapter()
+        adapter._group_pending_max = 2
+        adapter._group_chat_ids.add("g1")
+
+        for content in ("r1", "r2", "r3"):
+            await adapter.send("g1", content)
+
+        assert [text for _, text in adapter._pending_group_sends["g1"]] == ["r2", "r3"]
+
+    @pytest.mark.asyncio
+    async def test_ttl_prunes_at_stash_and_flush(self):
+        import time as _time
+
+        adapter = self._adapter()
+        adapter._group_pending_ttl_seconds = 100
+        adapter._group_chat_ids.add("g1")
+        adapter._pending_group_sends["g1"] = [(_time.time() - 500, "ancient"), (_time.time(), "fresh")]
+        adapter._redeliver_group_pending = AsyncMock()
+
+        await adapter.send("g1", "new")  # stash prunes the expired entry
+        assert [text for _, text in adapter._pending_group_sends["g1"]] == ["fresh", "new"]
+
+        adapter._flush_group_pending("g1")
+        await asyncio.sleep(0)
+        adapter._redeliver_group_pending.reset_mock()
+        adapter._pending_group_sends["g1"] = [(_time.time() - 500, "expired-now")]
+        adapter._flush_group_pending("g1")  # flush prunes again (entry ages past TTL meanwhile)
+        await asyncio.sleep(0)
+        adapter._redeliver_group_pending.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inbound_group_message_flushes_pending_with_header(self):
+        adapter = self._adapter(group_policy="allowlist", group_allow_from=["group-1"])
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+        adapter._group_chat_ids.add("group-1")
+        import time as _time
+        adapter._pending_group_sends["group-1"] = [(_time.time(), "morning report")]
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-fresh"},
+            "body": {
+                "msgid": "msg-flush",
+                "chatid": "group-1",
+                "chattype": "group",
+                "msgtype": "text",
+                "from": {"userid": "alice"},
+                "text": {"content": "有人说话了"},
+            },
+        }
+        await adapter._on_message(payload)
+        for _ in range(6):  # pump: flush task → per-chat queue worker → reply send
+            await asyncio.sleep(0)
+
+        assert adapter._pending_group_sends.get("group-1") in (None, [])
+        assert adapter._send_reply_request.await_count >= 1
+        flushed_content = adapter._send_reply_request.await_args.args[1]["markdown"]["content"]
+        assert flushed_content.startswith("⏰ 定时补发")
+        assert "morning report" in flushed_content
+        adapter.handle_message.assert_awaited_once()  # the inbound turn itself still runs
+        await self._drain_workers(adapter)
+
+    @pytest.mark.asyncio
+    async def test_flush_failure_drops_entry(self):
+        """A redelivery failing on a FRESH req_id is dropped — never re-stashed despite the header."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_reply_request = AsyncMock(return_value={"errcode": 846604, "errmsg": "req_id expired"})
+
+        adapter._last_chat_req_ids["g1"] = "req-fresh"  # flush path resolves a req_id…
+        await adapter._redeliver_group_pending("g1", "⏰ 定时补发（原定 09:03）\n---\nstale report")
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+        assert adapter._pending_group_sends.get("g1") in (None, [])
+        await self._drain_workers(adapter)
+
+    @pytest.mark.asyncio
+    async def test_dm_chatid_userid_mapping_learned(self):
+        adapter = self._adapter()
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+        adapter._admit_inbound = lambda is_group, chat_id, sender_id: True
+
+        dm_payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-dm"},
+            "body": {"msgid": "msg-dm", "chatid": "wohR123", "chattype": "single", "msgtype": "text",
+                     "from": {"userid": "zhangsan"}, "text": {"content": "hi"}},
+        }
+        await adapter._on_message(dm_payload)
+        assert adapter._dm_userid_by_chat.get("wohR123") == "zhangsan"
+
+        group_payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-grp"},
+            "body": {"msgid": "msg-grp", "chatid": "wrhR9", "chattype": "group", "msgtype": "text",
+                     "from": {"userid": "lisi"}, "text": {"content": "hi"}},
+        }
+        await adapter._on_message(group_payload)
+        assert "wrhR9" not in adapter._dm_userid_by_chat  # groups never map
+
+    @pytest.mark.asyncio
+    async def test_agent_fallback_resolves_userid_from_dm_mapping(self, monkeypatch):
+        import plugins.platforms.wecom.adapter as wecom_adapter
+        from gateway.config import Platform
+
+        adapter = wecom_adapter.WeComAdapter.__new__(wecom_adapter.WeComAdapter)
+        adapter.platform = Platform.WECOM
+        adapter._group_chat_ids = set()
+        adapter._dm_userid_by_chat = {"wohR123": "zhangsan"}
+        sent = []
+
+        class FakeClient:
+            async def send_markdown(self, touser, content):
+                sent.append((touser, content))
+                return True, None
+
+        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: FakeClient())
+        result = await adapter._try_agent_fallback("wohR123", "hello", "bot send failed")
+        assert result is not None and result.success is True
+        assert sent == [("zhangsan", "hello")]  # wohR chat id resolved to the corp userid
+
+        result2 = await adapter._try_agent_fallback("sarihuang", "hello", "bot send failed")
+        assert result2 is not None and result2.success is True
+        assert sent[-1] == ("sarihuang", "hello")  # username-style id passes through unchanged
+
+
 class TestInboundMessages:
     @pytest.mark.asyncio
     async def test_on_message_builds_event(self):
