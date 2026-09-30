@@ -39,6 +39,8 @@ import queue
 import time
 from typing import Any, Optional
 
+from plugins.platforms.wecom.streaming import MAX_STREAM_CONTENT_LENGTH
+
 logger = logging.getLogger(__name__)
 
 # Push at most one stream frame every STREAM_THROTTLE_INTERVAL seconds.
@@ -49,6 +51,10 @@ LONG_RUNNING_THRESHOLD = 60
 # Give up streaming after this many consecutive failed frame sends (e.g. no
 # cached req_id for the chat). The final reply then falls back to plain send().
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
+# fork 2026-09-30 (audit module-2 H4): fold the think block in the FINAL frame;
+# intermediates keep every line. Unbounded think + answer text could exceed the
+# 20480-byte frame cap and byte-truncate the ANSWER tail.
+MAX_FINAL_THINK_LINES = 30
 
 # Queue signals (state is mutated synchronously by the input methods; these only
 # wake the run loop).
@@ -91,12 +97,17 @@ def _build_display_content(
     session_link: str,
     text: str,
     finished: bool = False,
+    fold_think: bool = False,
 ) -> str:
     """Build the combined display: ``<think>`` block + session link + answer text.
 
     While thinking (no answer text and not finished) the ``<think>`` tag is left
     *unclosed* so WeCom shows an animated "正在思考" indicator instead of a
     collapsed "已完成思考" block. Ported from clawrelay's orchestrator.
+
+    With ``fold_think`` (final frame only) the oldest think steps beyond
+    ``MAX_FINAL_THINK_LINES`` collapse into a single marker line, so the answer
+    text is never pushed past the frame's byte cap by a tool-heavy think block.
     """
     parts: list = []
     if thinking_lines or thinking_buf:
@@ -105,6 +116,9 @@ def _build_display_content(
             preview = thinking_buf[-200:]
             prefix = "..." if len(thinking_buf) > 200 else ""
             lines.append(f"💭 {prefix}{preview}")
+        if fold_think and len(lines) > MAX_FINAL_THINK_LINES:
+            dropped = len(lines) - MAX_FINAL_THINK_LINES
+            lines = [f"...（已折叠前 {dropped} 步）"] + lines[-MAX_FINAL_THINK_LINES:]
         think_content = "<think>\n" + "\n".join(lines)
         # Close the think block once answer text arrives (or on finish);
         # otherwise keep it open so WeCom renders "正在思考".
@@ -351,7 +365,18 @@ class WeComStreamDelivery:
             self.accumulated_text = _EMPTY_REPLY_FALLBACK
         if not self._error_mode:
             self.thinking_lines.append("✨ 回复完成")
-        display = self._display(finished=True)
+        display = self._display(finished=True, fold_think=True)
+        # fork 2026-09-30 (audit module-2 H4): if even the folded display exceeds the
+        # frame budget the adapter byte-truncates it (keep-head) and marking the turn
+        # delivered would silently lose the tail — decline instead and leave
+        # _final_response_sent unset so the gateway's regular send delivers the full
+        # reply in properly split segments exactly once.
+        if len(display.encode("utf-8")) > MAX_STREAM_CONTENT_LENGTH:
+            logger.info(
+                "[wecom-stream] final display %d bytes exceeds frame budget %d — declining finalize; gateway regular send will deliver the full reply",
+                len(display.encode("utf-8")), MAX_STREAM_CONTENT_LENGTH,
+            )
+            return
         # Set the flag ONLY when the finalize frame actually went through. The
         # adapter's Layer 2 clock fallback (stream age >= 330s, keep-alive off
         # by default) declines finish=True and returns False precisely so the
@@ -410,11 +435,12 @@ class WeComStreamDelivery:
     # ------------------------------------------------------------------
     # Display helper
     # ------------------------------------------------------------------
-    def _display(self, finished: bool = False) -> str:
+    def _display(self, finished: bool = False, fold_think: bool = False) -> str:
         return _build_display_content(
             self.thinking_lines,
             self.thinking_buf,
             self.chat_record_url,
             self.accumulated_text,
             finished=finished,
+            fold_think=fold_think,
         )
