@@ -159,11 +159,13 @@ import { sessionContextDrift } from '../session-context-drift'
 import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
 
 import { sessionCreateOverrideParams, type SessionCreateOverrides, type SessionSeedMessage } from './create-overrides'
+import { markSessionCreatedThisRun, sessionCreatedThisRun } from './created-this-run'
 import { captureDisplayHydration } from './display-hydration'
 import { reconcilePersistedLiveTurn } from './persisted-live-turn'
 import { provisionalTranscriptPaint, transcriptRestScope } from './provisional-transcript'
 import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
 import { projectPendingConnection, restorePendingConnectionFromSnapshot } from './restore-pending-connection'
+import { createGatewaySession } from './session-create-request'
 import {
   createPersistedDisplayTranscriptProvenance,
   hasPersistedDisplayTranscriptProvenance,
@@ -223,15 +225,6 @@ interface SessionActionsOptions {
     storedSessionId?: string | null
   ) => ClientSessionState
 }
-
-// Stored ids created in THIS renderer run. A brand-new session lives only in the
-// gateway's in-memory map until its first turn persists a state.db row — so if a
-// respawning/flapping backend drops it, both resume RPC and the REST transcript
-// 404 even though the user just made it. We must NOT treat that as "gone" (which
-// yanks them to a fresh draft — the "new sessions clear themselves" bug); the
-// bounded retry rebinds it when the backend returns. Boot-into-a-stale-last-id
-// (NOT in this set) still legitimately drops to a draft.
-const createdThisRun = new Set<string>()
 
 const branchMessagesFingerprint = (messages: BranchMessage[]): string =>
   JSON.stringify(messages.map(({ content, role }) => [role, content]))
@@ -738,17 +731,7 @@ export function useSessionActions({
         let stored: null | string
 
         try {
-          created = capturedRoute
-            ? await requestGatewayForAgent<SessionCreateResponse>(
-                capturedRoute.connectionId,
-                capturedRoute.profile,
-                'session.create',
-                params,
-                undefined,
-                undefined,
-                { spawnPriority: 'foreground' }
-              )
-            : await requestGateway<SessionCreateResponse>('session.create', params)
+          created = await createGatewaySession(capturedRoute, params, requestGateway)
 
           stored = created.stored_session_id ?? null
 
@@ -815,7 +798,7 @@ export function useSessionActions({
         ensureSessionState(created.session_id, stored)
 
         if (stored) {
-          createdThisRun.add(stored)
+          markSessionCreatedThisRun(stored)
           // Seed the sidebar preview with the user's first message so the row
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
@@ -1027,17 +1010,7 @@ export function useSessionActions({
         let stored: string | undefined
 
         try {
-          created = capturedRoute
-            ? await requestGatewayForAgent<SessionCreateResponse>(
-                capturedRoute.connectionId,
-                capturedRoute.profile,
-                'session.create',
-                params,
-                undefined,
-                undefined,
-                { spawnPriority: 'foreground' }
-              )
-            : await requestGateway<SessionCreateResponse>('session.create', params)
+          created = await createGatewaySession(capturedRoute, params, requestGateway)
 
           stored = created.stored_session_id
 
@@ -1069,7 +1042,7 @@ export function useSessionActions({
           return
         }
 
-        createdThisRun.add(stored)
+        markSessionCreatedThisRun(stored)
 
         // Seed the per-runtime cache so the tile renders immediately without a
         // redundant resume. Only add the row to the SIDEBAR when `listed` — an
@@ -2445,7 +2418,7 @@ export function useSessionActions({
           }
 
           const verdict = goneSessionVerdict({
-            createdThisRun: createdThisRun.has(storedSessionId),
+            createdThisRun: sessionCreatedThisRun(storedSessionId),
             stillListed,
             switchInFlight:
               $gatewaySwitching.get() ||
