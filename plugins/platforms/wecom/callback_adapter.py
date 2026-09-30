@@ -51,6 +51,10 @@ _TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
 # 自建应用 markdown 消息内容上限 4096 字节（UTF-8），超长分段发送。
 MARKDOWN_MAX_BYTES = 4096
 
+# 自建应用 text 消息内容上限 2048 字节（UTF-8）——字符切片会让 2049~6144 字节的中文
+# 回复整条被服务端拒绝（审计 2026-09-29 模块1 H1）；与 markdown 同款字节级分段。
+TEXT_MAX_BYTES = 2048
+
 # media/upload 临时素材（3 天有效）支持的类型与大小上限，与 Smart-Robot
 # 通道的降级规则保持一致（image/video 10MB、voice 2MB、file 20MB）。
 UPLOAD_MEDIA_TYPES = {"image", "voice", "video", "file"}
@@ -72,6 +76,9 @@ def _split_markdown_bytes(content: str, max_bytes: int = MARKDOWN_MAX_BYTES) -> 
     current = ""
     for line in content.splitlines(keepends=True):
         while len(line.encode("utf-8")) > max_bytes:  # pathological no-newline line
+            if current:  # 硬切前先冲刷已累积行，保住内容顺序（审计 2026-09-29 模块1 H1 补充）
+                segments.append(current)
+                current = ""
             cut = max_bytes
             while len(line[:cut].encode("utf-8")) > max_bytes:
                 cut -= 1
@@ -247,14 +254,22 @@ class WecomCallbackAdapter(BasePlatformAdapter):
     ) -> SendResult:
         app = self._resolve_app_for_chat(chat_id)
         touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
-        payload = {
-            "touser": touser,
-            "msgtype": "text",
-            "agentid": int(str(app.get("agent_id") or 0)),
-            "text": {"content": content[:2048]},
-            "safe": 0,
-        }
-        return await self._post_message(app, payload)
+        segments = _split_markdown_bytes(str(content or ""), max_bytes=TEXT_MAX_BYTES)
+        if not segments:
+            return SendResult(success=False, error="empty text content")
+        last = SendResult(success=False, error="no segments")
+        for segment in segments:
+            payload = {
+                "touser": touser,
+                "msgtype": "text",
+                "agentid": int(str(app.get("agent_id") or 0)),
+                "text": {"content": segment},
+                "safe": 0,
+            }
+            last = await self._post_message(app, payload)
+            if not last.success:
+                return last
+        return last
 
     async def send_markdown(
         self,
