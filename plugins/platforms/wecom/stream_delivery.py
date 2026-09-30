@@ -118,7 +118,7 @@ def _build_display_content(
             lines.append(f"💭 {prefix}{preview}")
         if fold_think and len(lines) > MAX_FINAL_THINK_LINES:
             dropped = len(lines) - MAX_FINAL_THINK_LINES
-            lines = [f"...（已折叠前 {dropped} 步）"] + lines[-MAX_FINAL_THINK_LINES:]
+            lines = [f"...（已折叠前 {dropped} 行）"] + lines[-MAX_FINAL_THINK_LINES:]
         think_content = "<think>\n" + "\n".join(lines)
         # Close the think block once answer text arrives (or on finish);
         # otherwise keep it open so WeCom renders "正在思考".
@@ -371,10 +371,11 @@ class WeComStreamDelivery:
         # delivered would silently lose the tail — decline instead and leave
         # _final_response_sent unset so the gateway's regular send delivers the full
         # reply in properly split segments exactly once.
-        if len(display.encode("utf-8")) > MAX_STREAM_CONTENT_LENGTH:
+        size = len(display.encode("utf-8"))
+        if size > MAX_STREAM_CONTENT_LENGTH:
             logger.info(
                 "[wecom-stream] final display %d bytes exceeds frame budget %d — declining finalize; gateway regular send will deliver the full reply",
-                len(display.encode("utf-8")), MAX_STREAM_CONTENT_LENGTH,
+                size, MAX_STREAM_CONTENT_LENGTH,
             )
             return
         # Set the flag ONLY when the finalize frame actually went through. The
