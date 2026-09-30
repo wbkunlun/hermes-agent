@@ -126,6 +126,41 @@ class WeComStreamMixin:
         finally:
             self._release_pending(queue, normalized, frame)
 
+    async def _send_reply_correlated(self, req_id: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        """Send a NON-stream reply frame (passive markdown / replyMedia) on the SHARED
+        per-req_id registry. fork 2026-09-30 (audit module-1 H2): passive replies used
+        to register in ``_pending_responses`` while stream frames used ``_reply_queues``;
+        the same inbound req_id could sit in both and ``_dispatch_payload`` resolved
+        reply-queues first, so a stream ack could "answer" a passive future (or vice
+        versa) — the passive reply then timed out, looked failed, and the DM was
+        re-delivered via proactive/fallback as a duplicate. One registry serializes both
+        frame kinds per req_id. Unlike final stream frames, an ack timeout RAISES so the
+        caller's passive→proactive fallback (846604 recovery) still fires.
+        The ack timeout is the caller's REQUEST_TIMEOUT_SECONDS (not _REPLY_ACK_TIMEOUT,
+        which is a single-point knob tuned for the stream double-send race)."""
+        self._require_ws()
+        req_id = self._require_reply_req_id(req_id)
+        queue = self._reply_queues.setdefault(req_id, ReplyQueue(req_id))
+        if queue.pending_ack is not None:
+            await self._drain_pending_ack(queue, req_id)
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        # is_final=True borrows the stream-final drain semantics (await own ack); it only affects logging here.
+        frame = ReplyFrame(body=body, future=future, is_final=True, sent_at=time.monotonic())
+        # Re-attach: the drain above may have popped the queue (orphan → timeout).
+        self._reply_queues[req_id] = queue
+        queue.pending_ack = frame
+        try:
+            await self._send_json({"cmd": APP_CMD_RESPONSE, "headers": {"req_id": req_id}, "body": body})
+        except Exception:
+            self._release_pending(queue, req_id, frame)
+            if not future.done():
+                future.cancel()
+            raise
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._release_pending(queue, req_id, frame)
+
     async def _drain_pending_ack(self, queue: ReplyQueue, req_id: str) -> None:
         """Before a final frame: wait (bounded) for the pending intermediate's ack, then clear it."""
         pending_frame = queue.pending_ack
@@ -138,6 +173,13 @@ class WeComStreamMixin:
                 "[%s] Reply ack timeout waiting for pending (req_id=%s) — pending_stream_id=%s pending_finish=%s elapsed=%.1fs. Possible causes: ack cmd filtered, ack req_id mismatch, or WeCom did not ack.",
                 *pending_desc, _elapsed(pending_frame.sent_at),
             )
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if not pending_frame.future.cancelled() or (task is not None and task.cancelling() > 0):
+                raise  # genuine cancellation of THIS task must propagate
+            # pending future was cancelled by its owner (final ack timeout / send-failure
+            # cleanup) — shield mirrors the cancel out here; treat as drain-failed, keep sending.
+            logger.info("[%s] Reply ack drain: pending frame future cancelled by owner (req_id=%s) — treating as drain failure, continuing", self.name, req_id)
         except Exception:
             pass
         queue.pending_ack = None  # resolved or timed out either way

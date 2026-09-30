@@ -548,7 +548,13 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
     async def _send_reply_request(self, reply_req_id: str, body: Dict[str, Any], cmd: str = APP_CMD_RESPONSE, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
         """Send a reply frame correlated to an inbound callback req_id."""
         self._require_ws()
-        return await self._request(cmd, self._require_reply_req_id(reply_req_id), body, timeout)
+        normalized = self._require_reply_req_id(reply_req_id)
+        if cmd != APP_CMD_RESPONSE:
+            # welcome frames use their own cmd and their own correlation slot
+            return await self._request(cmd, normalized, body, timeout)
+        # fork 2026-09-30 (audit module-1 H2): respond_msg frames share the req_id
+        # namespace with stream frames — route through the single reply registry.
+        return await self._send_reply_correlated(normalized, body, timeout)
 
     @staticmethod
     def _require_reply_req_id(reply_req_id: str) -> str:
