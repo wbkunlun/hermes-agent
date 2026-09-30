@@ -41,6 +41,7 @@ from utils import env_float, env_int
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
+from plugins.platforms.wecom.callback_adapter import _split_markdown_bytes
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
     STREAM_NOT_SUBSCRIBED_ERRCODE, MAX_STREAM_CONTENT_LENGTH,
@@ -69,6 +70,11 @@ CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
 NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
 
 MAX_MESSAGE_LENGTH = 4000
+# fork 2026-09-30 (audit module-1 M1.8): aibot markdown frames are capped in UTF-8
+# BYTES (server-side), like stream frames — the old [:4000] CHAR slice shipped
+# 12KB CJK frames whole and the server rejected them. 4000 chars of ASCII stays
+# one segment; CJK splits at ≤4096 bytes.
+AIBOT_MARKDOWN_MAX_BYTES = 4096
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -806,9 +812,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             logger.info("[%s] Group redelivery: %d expired of %d stashed entries dropped (chat=%s, ttl=%.0fs)", self.name, len(stashed) - len(entries), len(stashed), chat_id, ttl)
         for ts, content in entries:
             header = f"⏰ 定时补发（原定 {time.strftime('%H:%M', time.localtime(ts))}）"
-            # Header must not push the composed frame past the server cap the markdown path slices at.
-            body = content[: max(0, self.MAX_MESSAGE_LENGTH - len(header) - len("\n---\n"))]
-            asyncio.ensure_future(self._redeliver_group_pending(chat_id, f"{header}\n---\n{body}"))
+            # No pre-slice: _send_inner byte-segments downstream; the header rides segment 1.
+            asyncio.ensure_future(self._redeliver_group_pending(chat_id, f"{header}\n---\n{content}"))
 
     async def _redeliver_group_pending(self, chat_id: str, composed: str) -> None:
         """One flushed entry; never raises into the event loop (fire-and-forget owner)."""
@@ -840,16 +845,30 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         if error:
             raise RuntimeError(f"{operation} failed: {error}")
 
-    def _markdown_body(self, content: str) -> Dict[str, Any]:
-        return {"msgtype": "markdown", "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]}}
-
     async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
-        response = await self._send_reply_request(reply_req_id, self._markdown_body(content))
-        self._raise_for_wecom_error(response, "send reply markdown")
+        # fork 2026-09-30: sequential segments on one req_id — same multi-frame
+        # precedent the stream path set (APP_CMD_RESPONSE frames are versioned per
+        # req_id). NOTE production watchpoint: if WeCom ever replaces (errcode 6000)
+        # instead of stacking markdown reply frames, segment tails will vanish —
+        # watch agent.log for 6000 on multi-segment sends after rollout.
+        segments = _markdown_segments(content)
+        if not segments:
+            # 注意：不要用 "send reply markdown failed:" 前缀——那是生产旧镜像的判别指纹
+            raise RuntimeError("send reply markdown: empty content")
+        response: Dict[str, Any] = {}
+        for segment in segments:
+            response = await self._send_reply_request(reply_req_id, {"msgtype": "markdown", "markdown": {"content": segment}})
+            self._raise_for_wecom_error(response, "send reply markdown")
         return response
 
     async def _send_proactive_markdown(self, chat_id: str, content: str) -> Dict[str, Any]:
-        return await self._send_request(APP_CMD_SEND, {"chatid": chat_id, **self._markdown_body(content)})
+        segments = _markdown_segments(content)
+        if not segments:
+            raise RuntimeError("send proactive markdown: empty content")
+        response: Dict[str, Any] = {}
+        for segment in segments:
+            response = await self._send_request(APP_CMD_SEND, {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": segment}})
+        return response
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send standalone markdown (never touches active streams); serialized per chat for the 30 msgs/min
@@ -1082,6 +1101,11 @@ def _warn_if_agent_fallback_unconfigured() -> None:
             "WECOM_AGENT_FALLBACK=off to silence this when intentional.",
             ", ".join(missing),
         )
+
+
+def _markdown_segments(content: str) -> list:
+    """Byte-accurate markdown segments for aibot reply/proactive frames."""
+    return _split_markdown_bytes(str(content or ""), max_bytes=AIBOT_MARKDOWN_MAX_BYTES)
 
 
 def _agent_fallback_client() -> Optional[Any]:
