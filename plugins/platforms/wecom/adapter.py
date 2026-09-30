@@ -213,6 +213,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             self._listen_task, self._heartbeat_task = asyncio.create_task(self._listen_loop()), asyncio.create_task(self._heartbeat_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             self._wire_plugin_handlers(None)  # ctx.register_platform_handler hooks
+            _warn_if_agent_fallback_unconfigured()
             return True
         except Exception as exc:
             self._set_fatal_error("wecom_connect_error", f"WeCom startup failed: {exc}", retryable=True)
@@ -1049,6 +1050,32 @@ async def _send_via(adapter, chat_id, message, *, live: bool):
 
 _AGENT_FALLBACK_OFF_VALUES = {"0", "false", "off", "no"}
 _agent_fallback_client_cache: Dict[str, Any] = {"env": None, "client": None}
+
+
+def _warn_if_agent_fallback_unconfigured() -> None:
+    """fork (audit 2026-09-29 module-1 M1.5): a WARNING on each successful connect
+    (startup, reconnects, ephemeral standalone connects) when the DM fallback channel
+    is missing its env — the 846609 DM-loss incident had this as its silent half."""
+    import os as _os
+
+    if _os.getenv("WECOM_AGENT_FALLBACK", "").strip().lower() in _AGENT_FALLBACK_OFF_VALUES:
+        return
+    missing = [
+        name
+        for name, value in (
+            ("WECOM_CALLBACK_CORP_ID", _os.getenv("WECOM_CALLBACK_CORP_ID", "").strip()),
+            ("WECOM_CALLBACK_CORP_SECRET", _os.getenv("WECOM_CALLBACK_CORP_SECRET", "").strip()),
+            ("WECOM_CALLBACK_AGENT_ID", _os.getenv("WECOM_CALLBACK_AGENT_ID", "").strip()),
+        )
+        if not value
+    ]
+    if missing:
+        logger.warning(
+            "[wecom] agent-fallback disabled: missing env %s — if the bot channel fails "
+            "(846609) DMs have no self-built-app fallback and will be lost. Set "
+            "WECOM_AGENT_FALLBACK=off to silence this when intentional.",
+            ", ".join(missing),
+        )
 
 
 def _agent_fallback_client() -> Optional[Any]:
