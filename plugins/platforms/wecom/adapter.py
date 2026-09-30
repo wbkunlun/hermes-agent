@@ -74,6 +74,7 @@ MAX_MESSAGE_LENGTH = 4000
 # BYTES (server-side), like stream frames — the old [:4000] CHAR slice shipped
 # 12KB CJK frames whole and the server rejected them. 4000 chars of ASCII stays
 # one segment; CJK splits at ≤4096 bytes.
+# 与 callback 渠道 MARKDOWN_MAX_BYTES=4096 同值——两渠道上限独立演进，改一处勿忘另一处。
 AIBOT_MARKDOWN_MAX_BYTES = 4096
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
@@ -858,7 +859,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         response: Dict[str, Any] = {}
         for segment in segments:
             response = await self._send_reply_request(reply_req_id, {"msgtype": "markdown", "markdown": {"content": segment}})
-            self._raise_for_wecom_error(response, "send reply markdown")
+            # "segment" 措辞同样是反指纹：错误串前缀绝不能是 "send reply markdown failed:"
+            self._raise_for_wecom_error(response, "send reply markdown segment")
         return response
 
     async def _send_proactive_markdown(self, chat_id: str, content: str) -> Dict[str, Any]:
@@ -868,6 +870,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         response: Dict[str, Any] = {}
         for segment in segments:
             response = await self._send_request(APP_CMD_SEND, {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": segment}})
+            # 质量评审 C-1：非末段 errcode 曾被后续成功段覆盖 → 静默部分丢失 + 假成功
+            self._raise_for_wecom_error(response, "send proactive markdown segment")
         return response
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
