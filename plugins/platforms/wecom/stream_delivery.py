@@ -51,7 +51,7 @@ LONG_RUNNING_THRESHOLD = 60
 # Give up streaming after this many consecutive failed frame sends (e.g. no
 # cached req_id for the chat). The final reply then falls back to plain send().
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
-# fork 2026-09-30 (audit module-2 H4): fold the think block in the FINAL frame;
+# fork 2026-09-30 (audit 2026-09-29 module-2 H4): fold the think block in the FINAL frame;
 # intermediates keep every line. Unbounded think + answer text could exceed the
 # 20480-byte frame cap and byte-truncate the ANSWER tail.
 MAX_FINAL_THINK_LINES = 30
@@ -366,7 +366,7 @@ class WeComStreamDelivery:
         if not self._error_mode:
             self.thinking_lines.append("✨ 回复完成")
         display = self._display(finished=True, fold_think=True)
-        # fork 2026-09-30 (audit module-2 H4): if even the folded display exceeds the
+        # fork 2026-09-30 (audit 2026-09-29 module-2 H4): if even the folded display exceeds the
         # frame budget the adapter byte-truncates it (keep-head) and marking the turn
         # delivered would silently lose the tail — decline instead and leave
         # _final_response_sent unset so the gateway's regular send delivers the full

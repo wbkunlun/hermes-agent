@@ -52,7 +52,7 @@ _TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
 MARKDOWN_MAX_BYTES = 4096
 
 # 自建应用 text 消息内容上限 2048 字节（UTF-8）——字符切片会让 2049~6144 字节的中文
-# 回复整条被服务端拒绝（审计 2026-09-29 模块1 H1）；与 markdown 同款字节级分段。
+# 回复整条被服务端拒绝（audit 2026-09-29 module-1 H1）；与 markdown 同款字节级分段。
 TEXT_MAX_BYTES = 2048
 
 # media/upload 临时素材（3 天有效）支持的类型与大小上限，与 Smart-Robot
@@ -76,7 +76,7 @@ def _split_markdown_bytes(content: str, max_bytes: int = MARKDOWN_MAX_BYTES) -> 
     current = ""
     for line in content.splitlines(keepends=True):
         while len(line.encode("utf-8")) > max_bytes:  # pathological no-newline line
-            if current:  # 硬切前先冲刷已累积行，保住内容顺序（审计 2026-09-29 模块1 H1 补充）
+            if current:  # 硬切前先冲刷已累积行，保住内容顺序（audit 2026-09-29 module-1 H1 addendum）
                 segments.append(current)
                 current = ""
             cut = max_bytes

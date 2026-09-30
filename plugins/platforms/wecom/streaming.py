@@ -128,7 +128,7 @@ class WeComStreamMixin:
 
     async def _send_reply_correlated(self, req_id: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         """Send a NON-stream reply frame (passive markdown / replyMedia) on the SHARED
-        per-req_id registry. fork 2026-09-30 (audit module-1 H2): passive replies used
+        per-req_id registry. fork 2026-09-30 (audit 2026-09-29 module-1 H2): passive replies used
         to register in ``_pending_responses`` while stream frames used ``_reply_queues``;
         the same inbound req_id could sit in both and ``_dispatch_payload`` resolved
         reply-queues first, so a stream ack could "answer" a passive future (or vice

@@ -70,7 +70,7 @@ CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
 NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
 
 MAX_MESSAGE_LENGTH = 4000
-# fork 2026-09-30 (audit module-1 M1.8): aibot markdown frames are capped in UTF-8
+# fork 2026-09-30 (audit 2026-09-29 module-1 M1.8): aibot markdown frames are capped in UTF-8
 # BYTES (server-side), like stream frames — the old [:4000] CHAR slice shipped
 # 12KB CJK frames whole and the server rejected them. 4000 chars of ASCII stays
 # one segment; CJK splits at ≤4096 bytes.
@@ -559,7 +559,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         if cmd != APP_CMD_RESPONSE:
             # welcome frames use their own cmd and their own correlation slot
             return await self._request(cmd, normalized, body, timeout)
-        # fork 2026-09-30 (audit module-1 H2): respond_msg frames share the req_id
+        # fork 2026-09-30 (audit 2026-09-29 module-1 H2): respond_msg frames share the req_id
         # namespace with stream frames — route through the single reply registry.
         return await self._send_reply_correlated(normalized, body, timeout)
 
