@@ -861,12 +861,18 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             is_control=is_control,
         )
 
+    def _is_group_chat(self, chat_id: str) -> bool:
+        """fork: single source of truth for group-ness — inbound-learned set UNION
+        operator-configured groups. The learned set is in-memory and wiped on
+        restart; a configured group must keep its group semantics (passive-only
+        reply, redelivery parking, no agent fallback) across restarts.
+        (getattr: bare __new__ test stubs drive send paths without __init__.)
+        (audit 2026-09-29 module-1 M1.7)"""
+        return chat_id in self._group_chat_ids or chat_id in getattr(self, "_groups", {})
+
     async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False, is_control: bool = False, is_redelivery: bool = False) -> SendResult:
         """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
-        # fork: group-ness covers operator-configured groups too — the inbound-learned set is
-        # in-memory and wiped on restart, which must not strand a configured group's pending queue.
-        # (getattr: bare __new__ test stubs drive _send_inner without running __init__.)
-        is_group_chat = chat_id in self._group_chat_ids or chat_id in getattr(self, "_groups", {})
+        is_group_chat = self._is_group_chat(chat_id)
         try:
             reply_req_id = None if force_proactive and not is_group_chat else self._cached_reply_req_id(chat_id, reply_to)
             if reply_req_id:
@@ -934,7 +940,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         via ``_dm_userid_by_chat`` (in-memory, learned from inbound senders —
         an unknown id after a restart falls back to the raw chat_id).
         """
-        if chat_id in self._group_chat_ids:
+        if self._is_group_chat(chat_id):
             return None
         client = _agent_fallback_client()
         if client is None:
