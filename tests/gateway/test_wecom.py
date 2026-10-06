@@ -442,9 +442,9 @@ class TestSend:
         adapter._send_request.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_group_send_fails_early_without_req_id(self):
-        """Group chats with no cached req_id must fail with a clear error
-        instead of attempting APP_CMD_SEND (which WeCom will reject)."""
+    async def test_group_send_without_req_id_goes_proactive(self):
+        """fork 2026-10-06: official aibot_send_msg supports group chats (chat_type=2) —
+        a quiet group at fire time delivers proactively instead of failing."""
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
@@ -454,21 +454,26 @@ class TestSend:
 
         result = await adapter.send("group-no-req", "hello group")
 
-        assert result.success is False
-        assert "req_id" in (result.error or "").lower()
-        # Should NOT attempt APP_CMD_SEND
-        adapter._send_request.assert_not_awaited()
+        assert result.success is True
+        adapter._send_request.assert_awaited_once()
+        cmd, body = adapter._send_request.await_args.args[0], adapter._send_request.await_args.args[1]
+        assert cmd == "aibot_send_msg"
+        assert body["chatid"] == "group-no-req"
+        assert body["chat_type"] == 2
+        assert not adapter._pending_group_sends.get("group-no-req")
 
 
 class TestGroupPendingRedelivery:
-    """fork: 群聊补发队列 — a group send with no live req_id is stashed and flushed pre-turn on the
-    group's next inbound message (groups are passive-reply-only; scheduled pushes have no channel)."""
+    """fork: 群聊补发队列 — a group send that fails BOTH channels (passive req_id + proactive
+    aibot_send_msg, fork 2026-10-06) is stashed and flushed pre-turn on the group's next inbound."""
 
     def _adapter(self, **extra):
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True, extra=extra))
-        adapter._send_request = AsyncMock(return_value={"errcode": 0})
+        # Proactive fails by default (stash tests mean "both channels dead"); override to
+        # {"errcode": 0} in tests that exercise the proactive-success path.
+        adapter._send_request = AsyncMock(return_value={"errcode": 40058, "errmsg": "invalid chatid"})
         adapter._send_reply_request = AsyncMock(return_value={"errcode": 0})
         return adapter
 
@@ -479,43 +484,99 @@ class TestGroupPendingRedelivery:
         await asyncio.sleep(0)
 
     @pytest.mark.asyncio
-    async def test_group_send_without_req_id_stashes_and_fails(self):
+    async def test_group_send_without_req_id_proactive_failure_stashes(self):
         adapter = self._adapter()
         adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 40058, "errmsg": "invalid chatid"})
 
         result = await adapter.send("g1", "morning report")
 
         assert result.success is False
         assert "queued for redelivery" in (result.error or "")
-        adapter._send_request.assert_not_awaited()  # no doomed proactive APP_CMD_SEND
+        adapter._send_request.assert_awaited_once()  # proactive attempted (chat_type=2) before parking
+        assert adapter._send_request.await_args.args[1]["chat_type"] == 2
         entries = adapter._pending_group_sends.get("g1")
         assert entries and len(entries) == 1 and entries[0][1] == "morning report"
 
     @pytest.mark.asyncio
-    async def test_group_passive_failure_stashes_instead_of_proactive(self):
+    async def test_group_passive_failure_falls_back_to_proactive(self):
         adapter = self._adapter()
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})
         adapter._group_chat_ids.add("g1")
         adapter._last_chat_req_ids["g1"] = "req-stale"
         adapter._send_reply_request = AsyncMock(side_effect=RuntimeError("WeCom errcode 846608: stream window expired"))
 
         result = await adapter.send("g1", "afternoon report")
 
+        assert result.success is True
+        adapter._send_request.assert_awaited_once()
+        assert adapter._send_request.await_args.args[1]["chat_type"] == 2
+        assert not adapter._pending_group_sends.get("g1")
+
+    @pytest.mark.asyncio
+    async def test_group_passive_and_proactive_failure_stashes(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._last_chat_req_ids["g1"] = "req-stale"
+        adapter._send_reply_request = AsyncMock(side_effect=RuntimeError("WeCom errcode 846608: stream window expired"))
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        result = await adapter.send("g1", "afternoon report")
+
         assert result.success is False
-        assert "Group passive reply failed" in (result.error or "")
-        adapter._send_request.assert_not_awaited()  # groups cannot receive APP_CMD_SEND
+        assert "passive" in (result.error or "") and "proactive" in (result.error or "")
+        assert "queued for redelivery" in (result.error or "")
         entries = adapter._pending_group_sends.get("g1")
         assert entries and entries[0][1] == "afternoon report"
 
     @pytest.mark.asyncio
     async def test_control_lane_never_stashes(self):
-        """Approval prompts (control lane) must not be redelivered hours later into a group."""
+        """Approval prompts (control lane) must not be redelivered hours later into a group;
+        they may deliver via proactive aibot_send_msg but never park."""
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})
+        adapter._group_chat_ids.add("g1")
+
+        result = await adapter.send("g1", "⚠️ approval prompt", metadata={"is_approval_prompt": True})
+
+        assert result.success is True  # proactive chat_type=2 lane
+        assert adapter._pending_group_sends.get("g1") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_control_lane_proactive_failure_no_stash(self):
         adapter = self._adapter()
         adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 40058, "errmsg": "invalid chatid"})
 
         result = await adapter.send("g1", "⚠️ approval prompt", metadata={"is_approval_prompt": True})
 
         assert result.success is False
         assert adapter._pending_group_sends.get("g1") in (None, [])
+
+    @pytest.mark.asyncio
+    async def test_dm_proactive_body_has_no_chat_type(self):
+        """DM proactive sends keep the historical body (no chat_type key)."""
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})
+
+        result = await adapter.send("bryce", "dm hello")
+
+        assert result.success is True
+        assert "chat_type" not in adapter._send_request.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_group_proactive_846609_schedules_purge(self):
+        """846609 in the proactive error must schedule the stale-req_id purge (dead session)."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._last_chat_req_ids["other"] = "req-other"
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        result = await adapter.send("g1", "report")
+
+        assert result.success is False
+        await asyncio.sleep(0)  # let the ensure_future purge run
+        assert not adapter._last_chat_req_ids
 
     @pytest.mark.asyncio
     async def test_redelivery_flag_never_stashes(self):

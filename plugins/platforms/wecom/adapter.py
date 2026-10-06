@@ -174,8 +174,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         self._text_batch_delay_seconds = env_float("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
         self._attachment_text_merge_delay_seconds = _extra_float("attachment_text_merge_delay_seconds", 0.8)
-        # fork: group pending-redelivery queue (groups are passive-reply-only — a send with no live
-        # req_id is stashed and flushed pre-turn on the group's next inbound message). TTL 0 disables.
+        # fork: group pending-redelivery queue (a group send with no live req_id AND a dead
+        # proactive aibot_send_msg is stashed and flushed pre-turn on the group's next inbound
+        # message — fork 2026-10-06 added the proactive fallback). TTL 0 disables.
         self._group_pending_ttl_seconds = env_float("HERMES_WECOM_GROUP_PENDING_TTL_SECONDS", 21600.0)
         self._group_pending_max = env_int("HERMES_WECOM_GROUP_PENDING_MAX", 5)
         # Stream keep-alive config (see streaming.py STREAM_* constants).
@@ -188,7 +189,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         self._last_chat_req_ids: Dict[str, str] = {}
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
         self._stream_turns: Dict[str, StreamTurn] = {}
-        self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups can't receive proactive APP_CMD_SEND
+        self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups: passive reply first, proactive aibot_send_msg fallback (fork 2026-10-06)
         # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id; and the
         # DM chatid→userid map (wohR-style chat ids learned from inbound senders) so agent-fallback
         # can resolve a self-built-app touser. Both in-memory only — rebuilt by inbound traffic.
@@ -768,8 +769,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
     def _stash_group_pending(self, chat_id: str, content: str) -> bool:
         """fork: park an undeliverable group send for redelivery on the chat's next inbound req_id.
 
-        Groups are passive-reply-only, so a scheduled push landing in a quiet group has no channel
-        at fire time; the entry is flushed pre-turn by ``_flush_group_pending``. Returns True when
+        Both group channels must be dead to land here (passive req_id gone AND proactive
+        aibot_send_msg failed — e.g. a chat that never messaged the bot, the official
+        prerequisite); the entry is flushed pre-turn by ``_flush_group_pending``. Returns True when
         the content is parked (or already parked — the live and standalone cron lanes both land
         here with identical content, so exact-content dedup collapses the duplicate attempt
         without dropping the redelivery).
@@ -863,16 +865,33 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             self._raise_for_wecom_error(response, "send reply markdown segment")
         return response
 
-    async def _send_proactive_markdown(self, chat_id: str, content: str) -> Dict[str, Any]:
+    async def _send_proactive_markdown(self, chat_id: str, content: str, chat_type: Optional[int] = None) -> Dict[str, Any]:
         segments = _markdown_segments(content)
         if not segments:
             raise RuntimeError("send proactive markdown: empty content")
         response: Dict[str, Any] = {}
         for segment in segments:
-            response = await self._send_request(APP_CMD_SEND, {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": segment}})
+            # fork 2026-10-06: chat_type only sent when explicit — DMs keep the historical unset
+            # body (0/absent = compat mode); groups pass 2 per official aibot_send_msg docs.
+            body: Dict[str, Any] = {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": segment}}
+            if chat_type is not None:
+                body["chat_type"] = chat_type
+            response = await self._send_request(APP_CMD_SEND, body)
             # 质量评审 C-1：非末段 errcode 曾被后续成功段覆盖 → 静默部分丢失 + 假成功
             self._raise_for_wecom_error(response, "send proactive markdown segment")
         return response
+
+    async def _group_proactive_send(self, chat_id: str, content: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """fork 2026-10-06: official aibot_send_msg accepts group chatids (chat_type=2; docs:
+        群聊填回调事件中获取的 chatid, prerequisite = the chat has messaged the bot before).
+        Passive reply stays first choice; this is the fallback when no live req_id exists
+        (scheduled pushes, post-846609 purge). Returns (response, None) or (None, error)."""
+        try:
+            response = await self._send_proactive_markdown(chat_id, content, chat_type=2)
+        except (asyncio.TimeoutError, RuntimeError) as exc:
+            return None, str(exc)
+        error = self._response_error(response)
+        return (response, None) if error is None else (None, error)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send standalone markdown (never touches active streams); serialized per chat for the 30 msgs/min
@@ -910,22 +929,31 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
                     response = await self._send_reply_markdown(reply_req_id, content)
                 except (asyncio.TimeoutError, RuntimeError) as passive_err:
                     if is_group_chat:
-                        # Groups cannot receive proactive APP_CMD_SEND — park the content for the
-                        # next inbound instead of attempting a send the server will refuse.
-                        logger.warning("[%s] Passive reply failed for group chat %s (%s) — queueing for redelivery", self.name, chat_id, passive_err)
-                        if not is_control and not is_redelivery:
-                            self._stash_group_pending(chat_id, content)
-                        # Proactive attempt used to surface 846609 and schedule the stale-req_id
-                        # purge via _fail_or_fallback; keep that recovery for the dead session.
-                        return self._send_failure(f"Group passive reply failed: {passive_err}", str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(passive_err))
+                        # fork 2026-10-06: passive reply died (stale req_id after a resubscribe) — the
+                        # official aibot_send_msg delivers to groups too (chat_type=2); try it, then park.
+                        logger.warning("[%s] Passive reply failed for group chat %s (%s) — trying proactive aibot_send_msg", self.name, chat_id, passive_err)
+                        response, proactive_error = await self._group_proactive_send(chat_id, content)
+                        if proactive_error is None:
+                            logger.info("[%s] Group send delivered via proactive aibot_send_msg after passive failure (chat=%s)", self.name, chat_id)
+                            return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
+                        stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
+                        combined = f"Group send failed (passive: {passive_err}; proactive: {proactive_error})" + (" (queued for redelivery on next group message)" if stashed else "")
+                        return self._send_failure(combined, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in combined)
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
                     response = await self._send_proactive_markdown(chat_id, content)
             elif is_group_chat:
-                logger.warning("[%s] No cached req_id for group chat %s — cannot send (groups require passive reply via req_id)", self.name, chat_id)
-                if not is_control and not is_redelivery and self._stash_group_pending(chat_id, content):
-                    return SendResult(success=False, error="No req_id available for group chat (passive reply required; queued for redelivery on next group message)")
-                return SendResult(success=False, error="No req_id available for group chat (passive reply required)")
+                # fork 2026-10-06: quiet group at fire time (no live req_id) — official aibot_send_msg
+                # supports group chatids; deliver proactively instead of parking for the next inbound.
+                logger.info("[%s] No cached req_id for group chat %s — sending via proactive aibot_send_msg", self.name, chat_id)
+                response, proactive_error = await self._group_proactive_send(chat_id, content)
+                if proactive_error is None:
+                    return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
+                logger.warning("[%s] Group proactive send failed (chat=%s): %s", self.name, chat_id, proactive_error)
+                stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
+                message = f"Group proactive send failed: {proactive_error}" + (" (queued for redelivery on next group message)" if stashed else "")
+                # 846609 schedules the stale-req_id purge even when stashed — the cache holds dead req_ids.
+                return self._send_failure(message, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in proactive_error)
             else:
                 response = await self._send_proactive_markdown(chat_id, content)
         except asyncio.TimeoutError:
@@ -965,7 +993,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         WECOM_AGENT_FALLBACK is not an explicit off value (see
         ``_agent_fallback_client``).  Group chats never fall back — the aibot
         group chat_id is not a valid self-built-app touser (documented
-        limitation; groups keep the passive req_id path).  DM chat ids that ARE
+        limitation; groups fall back to proactive aibot_send_msg instead,
+        fork 2026-10-06).  DM chat ids that ARE
         the corp userid go through unchanged; wohR-style DM room ids resolve
         via ``_dm_userid_by_chat`` (in-memory, learned from inbound senders —
         an unknown id after a restart falls back to the raw chat_id).
