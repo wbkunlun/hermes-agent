@@ -34,7 +34,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.helpers import MessageDeduplicator, send_chunks
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
 
 logger = logging.getLogger(__name__)
@@ -48,12 +48,9 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 _SEND_URL = "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token="
 _TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
 
-# 自建应用 markdown 消息内容上限 4096 字节（UTF-8），超长分段发送。
+# 自建应用 markdown 消息内容上限 4096 字节（UTF-8），超长分段发送
+# （fork 自研分段已换轨上游 truncate_message(len_fn=_utf8_len)+send_chunks，resync 2026-10-07）。
 MARKDOWN_MAX_BYTES = 4096
-
-# 自建应用 text 消息内容上限 2048 字节（UTF-8）——字符切片会让 2049~6144 字节的中文
-# 回复整条被服务端拒绝（audit 2026-09-29 module-1 H1）；与 markdown 同款字节级分段。
-TEXT_MAX_BYTES = 2048
 
 # media/upload 临时素材（3 天有效）支持的类型与大小上限，与 Smart-Robot
 # 通道的降级规则保持一致（image/video 10MB、voice 2MB、file 20MB）。
@@ -67,7 +64,12 @@ MEDIA_MAX_BYTES = {
 
 
 def _split_markdown_bytes(content: str, max_bytes: int = MARKDOWN_MAX_BYTES) -> List[str]:
-    """Split markdown into ≤max_bytes UTF-8 segments, preferring line breaks."""
+    """Split markdown into ≤max_bytes UTF-8 segments, preferring line breaks.
+
+    Kept for the aibot stream/proactive frames path (adapter._markdown_segments,
+    v2026.10.6-fork1 生产观察线 — errcode 6000 归因不混入新分段实现);
+    send()/send_markdown() 已换轨上游 truncate_message+send_chunks (resync 2026-10-07).
+    """
     if not content:
         return []
     if len(content.encode("utf-8")) <= max_bytes:
@@ -91,6 +93,10 @@ def _split_markdown_bytes(content: str, max_bytes: int = MARKDOWN_MAX_BYTES) -> 
     if current:
         segments.append(current)
     return segments
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
 
 
 def check_wecom_callback_requirements() -> bool:
@@ -130,6 +136,11 @@ def _ack():
 class WecomCallbackAdapter(BasePlatformAdapter):
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
+    # message/send keeps only the first 2048 BYTES of text.content and drops the rest silently
+    # (audit 2026-09-29 module-1 H1: 字符切片让 2049~6144 字节中文整条被拒；fork 曾用
+    # TEXT_MAX_BYTES 自研分段，resync 2026-10-07 换轨上游 truncate_message+send_chunks).
+    MAX_MESSAGE_LENGTH = 2048
+    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH, _utf8_len)
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM_CALLBACK)
         extra = config.extra or {}
@@ -252,24 +263,17 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        app = self._resolve_app_for_chat(chat_id)
-        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
-        segments = _split_markdown_bytes(str(content or ""), max_bytes=TEXT_MAX_BYTES)
-        if not segments:
+        """One text message per MAX_MESSAGE_LENGTH-byte chunk; stops at the first failure."""
+        content = str(content or "")
+        if not content:
             return SendResult(success=False, error="empty text content")
-        last = SendResult(success=False, error="no segments")
-        for segment in segments:
-            payload = {
-                "touser": touser,
-                "msgtype": "text",
-                "agentid": int(str(app.get("agent_id") or 0)),
-                "text": {"content": segment},
-                "safe": 0,
-            }
-            last = await self._post_message(app, payload)
-            if not last.success:
-                return last
-        return last
+        app = self._resolve_app_for_chat(chat_id)
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=_utf8_len)
+        return await send_chunks(chunks, lambda chunk: self._send_text(app, chat_id, chunk))
+
+    async def _send_text(self, app: Dict[str, Any], chat_id: str, content: str) -> SendResult:
+        payload = {"touser": chat_id.split(":", 1)[-1], "msgtype": "text", "agentid": int(str(app.get("agent_id") or 0)), "text": {"content": content}, "safe": 0}
+        return await self._post_message(app, payload)
 
     async def send_markdown(
         self,
@@ -277,25 +281,16 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send markdown via message/send; segments content over 4096 UTF-8 bytes."""
+        """Send markdown via message/send; chunks content over MARKDOWN_MAX_BYTES UTF-8 bytes."""
         del metadata
         app = self._resolve_app_for_chat(chat_id)
-        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
-        segments = _split_markdown_bytes(content)
-        if not segments:
-            return SendResult(success=False, error="empty markdown content")
-        last = SendResult(success=False, error="no segments")
-        for segment in segments:
-            payload = {
-                "touser": touser,
-                "msgtype": "markdown",
-                "agentid": int(str(app.get("agent_id") or 0)),
-                "markdown": {"content": segment},
-            }
-            last = await self._post_message(app, payload)
-            if not last.success:
-                return last
-        return last
+        chunks = self.truncate_message(content, MARKDOWN_MAX_BYTES, len_fn=_utf8_len)
+        return await send_chunks(chunks, lambda chunk: self._post_message(app, {
+            "touser": chat_id.split(":", 1)[-1],
+            "msgtype": "markdown",
+            "agentid": int(str(app.get("agent_id") or 0)),
+            "markdown": {"content": chunk},
+        }))
 
     async def upload_media(
         self,
@@ -492,9 +487,8 @@ class WecomAgentFallbackClient:
         self.agent_id = agent_id
 
     async def send_markdown(self, touser: str, content: str) -> tuple:
-        """Send markdown segments; returns (ok, error_message)."""
-        segments = _split_markdown_bytes(content)
-        if not segments:
+        """Send markdown chunks; returns (ok, error_message)."""
+        if not content:
             return False, "empty content"
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
@@ -506,7 +500,7 @@ class WecomAgentFallbackClient:
                 if token_body.get("errcode") != 0:
                     return False, f"token refresh failed: {token_body}"
                 token = token_body["access_token"]
-                for segment in segments:
+                for segment in BasePlatformAdapter.truncate_message(content, MARKDOWN_MAX_BYTES, len_fn=_utf8_len):
                     payload = {
                         "touser": touser,
                         "msgtype": "markdown",

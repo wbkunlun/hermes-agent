@@ -1,5 +1,7 @@
 """Tests for wecom_callback markdown + media outbound (② Agent-fallback)."""
 
+import re
+
 import pytest
 
 from gateway.config import PlatformConfig
@@ -90,7 +92,8 @@ class TestSendMarkdown:
         result = await adapter.send_markdown("ww1234567890:alice", content)
         assert result.success is True
         assert len(client.posts) == 2
-        joined = "".join(p["json"]["markdown"]["content"] for p in client.posts)
+        # truncate_message（resync 2026-10-07 换轨）加 " (n/m)" 指示器——剥离后验内容完整
+        joined = "".join(re.sub(r" \(\d+/\d+\)$", "", p["json"]["markdown"]["content"]) for p in client.posts)
         assert joined == content
 
     @pytest.mark.asyncio

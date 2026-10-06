@@ -167,6 +167,7 @@ When the callback platform's env credentials (`WECOM_CALLBACK_CORP_ID` / `CORP_S
 - **No typing indicators** — the callback model doesn't support typing status
 - **Text only (inbound)** — text messages for input; image/file/voice input not yet implemented. Outbound markdown and media are supported (see above). The agent is aware of outbound media capabilities via the WeCom platform hint (images, documents, video, voice).
 - **Response latency** — agent sessions take 3–30 minutes; users see the reply when processing completes
+- **2048-byte text messages** — WeCom keeps only the first 2048 bytes of a text message, so longer replies (and cron output) are split across several messages; CJK text fits roughly 680 characters per message
 
 ## Troubleshooting
 

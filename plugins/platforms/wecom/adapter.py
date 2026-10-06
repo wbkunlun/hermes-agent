@@ -31,7 +31,7 @@ AIOHTTP_AVAILABLE = aiohttp is not None
 HTTPX_AVAILABLE = httpx is not None
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import MessageDeduplicator, bounded_put
+from gateway.platforms.helpers import MessageDeduplicator, bounded_put, send_chunks
 from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from plugins.platforms.wecom.stream_delivery import WeComStreamDelivery
 from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
@@ -133,6 +133,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
     # running indicator) instead of the generic GatewayStreamConsumer.
     WECOM_STREAM_DELIVERY = WeComStreamDelivery
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
+    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     _SPLIT_THRESHOLD = 3900  # chunks near the 4000-char client split are almost certainly continued
 
     def __init__(self, config: PlatformConfig):
@@ -904,11 +905,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         force_proactive = bool(metadata.pop("force_proactive_send", False))
         # fork: a flushed pending entry must never re-stash on failure (redelivery loop guard).
         is_redelivery = bool(metadata.pop("is_redelivery", False))
-        return await self._enqueue_chat_send(
-            chat_id,
-            lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery),
-            is_control=is_control,
-        )
+        # One queued send per chunk so each one draws a token from the 30 msgs/min bucket.
+        return await send_chunks(self.truncate_message(content, self.MAX_MESSAGE_LENGTH), lambda chunk: self._enqueue_chat_send(
+            chat_id, lambda: self._send_inner(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery), is_control=is_control))
 
     def _is_group_chat(self, chat_id: str) -> bool:
         """fork: single source of truth for group-ness — inbound-learned set UNION

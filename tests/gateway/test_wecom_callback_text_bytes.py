@@ -3,9 +3,13 @@ respect WeCom's 2048 UTF-8 BYTE cap. The old char slice (content[:2048]) let
 683..2048 CJK chars through as 2049..6144 bytes and the server rejected the
 WHOLE reply — no segmentation, no retry, the DM was lost."""
 import asyncio
+import re
 
 from plugins.platforms.wecom import callback_adapter as ca
 from plugins.platforms.wecom.callback_adapter import SendResult
+
+# 上游 truncate_message（resync 2026-10-07 换轨）给多块加 " (n/m)" 指示器后缀
+_CHUNK_INDICATOR = re.compile(r" \(\d+/\d+\)$")
 
 
 def _make_adapter():
@@ -29,7 +33,7 @@ def test_text_send_segments_cjk_by_utf8_bytes():
     assert len(post.payloads) == 2
     sizes = [len(p["text"]["content"].encode("utf-8")) for p in post.payloads]
     assert all(s <= 2048 for s in sizes), sizes
-    assert "".join(p["text"]["content"] for p in post.payloads) == text
+    assert "".join(_CHUNK_INDICATOR.sub("", p["text"]["content"]) for p in post.payloads) == text
 
 
 def test_text_send_short_ascii_single_frame():
