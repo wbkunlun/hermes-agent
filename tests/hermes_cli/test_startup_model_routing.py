@@ -206,3 +206,15 @@ def test_oneshot_and_tui_qualified_model_never_reaches_default_provider(tmp_path
     choice = _resolve_model_and_provider(cfg, None, None)
     assert (choice.provider, choice.model) == ("custom:jetson-vllm", "nemotron-nano-30b")
     assert tui_server._resolve_startup_runtime() == ("nemotron-nano-30b", "custom:jetson-vllm")
+
+
+def test_startup_route_tolerates_quoted_string_providers_slot(monkeypatch):
+    """fork 2026-10-08: config.yaml ``providers: '{}'`` (quoted-string slot — the validator
+    warns, every reader is supposed to ignore it) reached this function as a truthy str and
+    crashed startup with AttributeError: 'str' object has no attribute 'items'."""
+    monkeypatch.setattr(model_switch, "DIRECT_ALIASES", {})
+    route = model_switch.resolve_startup_model_route(
+        "nous/deepseek-v4-pro",
+        user_providers="{}",
+    )
+    assert route is None  # no configured providers → nothing to route, but NO crash

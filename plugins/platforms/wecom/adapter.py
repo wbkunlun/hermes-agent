@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pm import install_hint
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from utils import env_float, env_int
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
+from plugins.platforms.wecom.learned_chats import LearnedChatsMixin
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.callback_adapter import _split_markdown_bytes
 from plugins.platforms.wecom.streaming import (
@@ -84,6 +86,20 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 DEDUP_MAX_SIZE = 1000
 
 
+def _parse_group_retry_delays(raw: str) -> Tuple[float, ...]:
+    """fork 2026-10-08: timed-retry schedule for group sends parked in the 846609 dead
+    window (socket dead → subscribe-ack pending; a send landing there gets a REAL 846609
+    response because _open_connection sets self._ws before the SUBSCRIBE ack). Reconnect
+    backoff is 2..60s, so 30s/120s retries land after the resubscribe; a quiet group's
+    next inbound may be hours away. Comma-separated seconds; "0" disables."""
+    try:
+        values = [float(part) for part in str(raw or "").replace(";", ",").split(",") if str(part).strip()]
+    except ValueError:
+        return (30.0, 120.0)
+    values = [v for v in values if v > 0]
+    return tuple(values) or (30.0, 120.0)
+
+
 def check_wecom_requirements() -> bool:
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
 
@@ -117,7 +133,7 @@ def _content_of(container: Dict[str, Any], key: str) -> str:
     return str(_dict_or_empty(container, key).get("content") or "").strip()
 
 
-class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
+class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, LearnedChatsMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     ALLOW_ALL_ENV_PREFIX = "WECOM"
@@ -180,6 +196,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         # message — fork 2026-10-06 added the proactive fallback). TTL 0 disables.
         self._group_pending_ttl_seconds = env_float("HERMES_WECOM_GROUP_PENDING_TTL_SECONDS", 21600.0)
         self._group_pending_max = env_int("HERMES_WECOM_GROUP_PENDING_MAX", 5)
+        # fork 2026-10-08: dead-window timed retry schedule for parked group sends.
+        self._group_retry_delays = _parse_group_retry_delays(os.getenv("HERMES_WECOM_GROUP_RETRY_DELAYS", "30,120"))
+        self._group_retry_timers: Dict[str, asyncio.TimerHandle] = {}
+        self._group_retry_attempts: Dict[str, int] = {}
         # Stream keep-alive config (see streaming.py STREAM_* constants).
         self._stream_safe_duration_seconds = _extra_float("stream_safe_duration_seconds", STREAM_SAFE_DURATION_SECONDS)
         self._stream_keepalive_enabled = bool(extra.get("stream_keepalive_enabled", STREAM_KEEPALIVE_ENABLED_DEFAULT))
@@ -193,9 +213,15 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups: passive reply first, proactive aibot_send_msg fallback (fork 2026-10-06)
         # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id; and the
         # DM chatid→userid map (wohR-style chat ids learned from inbound senders) so agent-fallback
-        # can resolve a self-built-app touser. Both in-memory only — rebuilt by inbound traffic.
+        # can resolve a self-built-app touser. The learned classification persists to
+        # wecom_learned_chats.json (fork 2026-10-08, see learned_chats.py); the pending queue stays
+        # in-memory by design (TTL/时效语义).
         self._pending_group_sends: Dict[str, List[Tuple[float, str]]] = {}
         self._dm_userid_by_chat: Dict[str, str] = {}
+        # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
+        # their group semantics and scheduled pushes take the DM branch — 2026-10-08 incident).
+        self._learned_save_handle = None
+        self._load_learned_chats()
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
@@ -233,6 +259,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
     async def disconnect(self) -> None:
         self._running = False
         self._mark_disconnected()
+        self._cancel_learned_save()
+        for handle in list(self._group_retry_timers.values()):
+            handle.cancel()
+        self._group_retry_timers.clear()
+        self._group_retry_attempts.clear()
         for task in list(self._chat_workers.values()) + list(self._control_workers.values()):
             task.cancel()
         for registry in (self._chat_workers, self._control_workers, self._chat_queues, self._control_queues):
@@ -630,7 +661,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         # (welcome + approval-prompt precedents), and this runs before the text-batch/turn so the
         # redelivery is ordered ahead of the reply on the same per-chat normal lane.
         if not is_group and sender_id and sender_id != chat_id:
-            bounded_put(self._dm_userid_by_chat, chat_id, sender_id, DEDUP_MAX_SIZE)
+            self._remember_dm_userid(chat_id, sender_id)  # fork 2026-10-08: learn AND persist the fallback touser
         if self._pending_group_sends.get(chat_id):
             self._flush_group_pending(chat_id)
         text, reply_text = self._extract_text(body)
@@ -683,7 +714,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             if not allowed:
                 logger.info("[%s] DM sender %s blocked by policy", self.name, sender_id)
             return allowed
-        self._group_chat_ids.add(chat_id)
+        # fork 2026-10-08: classify AND persist — pre-policy by design, so a policy-dropped
+        # group still gets group semantics on the send path (passive-first, ⏰ parking).
+        self._note_learned_group(chat_id)
         allowed = self._is_group_allowed(chat_id, sender_id)
         if not allowed:
             logger.info(
@@ -785,6 +818,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             return False
         now = time.time()
         entries = [(ts, text) for ts, text in pending.get(chat_id, []) if now - ts < ttl]
+        if not entries:
+            self._group_retry_attempts.pop(chat_id, None)  # fork 2026-10-08: fresh parking episode — retry budget restored
         if any(text == content for _, text in entries):
             logger.info("[%s] Group send already queued for redelivery (chat=%s, queued=%d) — duplicate live/standalone attempt not re-queued", self.name, chat_id, len(entries))
             pending[chat_id] = entries
@@ -828,6 +863,69 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             return
         if not getattr(result, "success", False):
             logger.warning("[%s] Group redelivery failed and was dropped (chat=%s, error=%s)", self.name, chat_id, getattr(result, "error", None))
+
+    def _schedule_group_retry(self, chat_id: str) -> None:
+        """fork 2026-10-08: 846609 dead-window — retry parked group sends after the
+        resubscribe instead of only waiting for the group's next inbound. One timer per
+        chat (the live+standalone cron lanes stash identical content ~35ms apart and
+        coalesce here); attempts are capped at len(_group_retry_delays)."""
+        if chat_id in self._group_retry_timers:
+            return
+        delays = getattr(self, "_group_retry_delays", ()) or ()
+        attempt = self._group_retry_attempts.get(chat_id, 0)
+        if attempt >= len(delays):
+            return
+        delay = float(delays[attempt])
+        loop = asyncio.get_running_loop()
+        self._group_retry_timers[chat_id] = loop.call_later(
+            delay, lambda cid=chat_id: self._group_retry_fire(cid)
+        )
+        logger.info("[%s] Group send parked in the 846609 dead window — timed retry in %.0fs (chat=%s)", self.name, delay, chat_id)
+
+    def _group_retry_fire(self, chat_id: str) -> None:
+        self._group_retry_timers.pop(chat_id, None)
+        asyncio.ensure_future(self._group_retry_flush(chat_id))
+
+    async def _group_retry_flush(self, chat_id: str) -> None:
+        """Timed flush of parked entries: deliver VERBATIM (on time — no ⏰ header), keep
+        entries parked on failure (unlike the inbound flush's drop-on-failure: at +30s the
+        req_id cache is still empty and the resubscribe may genuinely not be done)."""
+        pending = getattr(self, "_pending_group_sends", None)
+        entries = list(pending.get(chat_id, [])) if pending else []
+        if not entries:
+            self._group_retry_attempts.pop(chat_id, None)
+            return
+        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
+        now = time.time()
+        dead_session, delivered = False, 0
+        for ts, content in entries:
+            if now - ts >= ttl:
+                continue
+            result = await self.send(chat_id, content, metadata={"is_redelivery": True})
+            if getattr(result, "success", False):
+                self._unstash_group_pending(chat_id, ts, content)
+                delivered += 1
+            elif str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(getattr(result, "error", "") or ""):
+                dead_session = True
+        remaining = [e for e in (pending.get(chat_id) or []) if now - e[0] < ttl]
+        if not remaining:
+            self._group_retry_attempts.pop(chat_id, None)
+            return
+        if delivered or not dead_session:
+            return  # non-dead failures stay parked for the inbound ⏰ flush
+        self._group_retry_attempts[chat_id] = self._group_retry_attempts.get(chat_id, 0) + 1
+        self._schedule_group_retry(chat_id)
+
+    def _unstash_group_pending(self, chat_id: str, ts: float, content: str) -> None:
+        """Remove one delivered entry from the pending queue (timed-retry success path)."""
+        pending = getattr(self, "_pending_group_sends", None)
+        entries = pending.get(chat_id) if pending else None
+        if not entries:
+            return
+        with contextlib.suppress(ValueError):
+            entries.remove((ts, content))
+        if not entries:
+            pending.pop(chat_id, None)
 
     async def _force_reconnect_on_stale_subscription(self, errcode: int) -> None:
         """On 846609 (subscription lost) drop req_ids bound to the dead session. Do NOT close the
@@ -911,9 +1009,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
 
     def _is_group_chat(self, chat_id: str) -> bool:
         """fork: single source of truth for group-ness — inbound-learned set UNION
-        operator-configured groups. The learned set is in-memory and wiped on
-        restart; a configured group must keep its group semantics (passive-only
-        reply, redelivery parking, no agent fallback) across restarts.
+        operator-configured groups. The learned set persists to
+        ``<HERMES_HOME>/wecom_learned_chats.json`` (fork 2026-10-08) so a restart no
+        longer wipes it; a configured group keeps its group semantics (passive-first
+        reply, redelivery parking, no agent fallback) across restarts either way.
         (getattr: bare __new__ test stubs drive send paths without __init__.)
         (audit 2026-09-29 module-1 M1.7)"""
         return chat_id in self._group_chat_ids or chat_id in getattr(self, "_groups", {})
@@ -937,6 +1036,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
                             return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
                         stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
                         combined = f"Group send failed (passive: {passive_err}; proactive: {proactive_error})" + (" (queued for redelivery on next group message)" if stashed else "")
+                        if stashed and str(STREAM_NOT_SUBSCRIBED_ERRCODE) in combined:
+                            self._schedule_group_retry(chat_id)
                         return self._send_failure(combined, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in combined)
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
@@ -951,6 +1052,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
                 logger.warning("[%s] Group proactive send failed (chat=%s): %s", self.name, chat_id, proactive_error)
                 stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
                 message = f"Group proactive send failed: {proactive_error}" + (" (queued for redelivery on next group message)" if stashed else "")
+                if stashed and str(STREAM_NOT_SUBSCRIBED_ERRCODE) in proactive_error:
+                    self._schedule_group_retry(chat_id)
                 # 846609 schedules the stale-req_id purge even when stashed — the cache holds dead req_ids.
                 return self._send_failure(message, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in proactive_error)
             else:

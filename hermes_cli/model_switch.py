@@ -367,6 +367,10 @@ def resolve_startup_model_route(
     (``anthropic/claude-opus-4.6`` on OpenRouter) the input stays on the aggregator — a
     ``providers:`` block for the same vendor must not steal the route."""
     raw = _clean(raw_model)
+    # fork 2026-10-08: a quoted-string ``providers: '{}'`` slot in config.yaml (warned by the
+    # validator, ignored by every other reader) arrives here as a truthy str and crashed
+    # startup on ``.items()`` — coerce once, both consumers below stay dict-safe.
+    user_providers = user_providers if isinstance(user_providers, dict) else None
     if not raw:
         return None
 

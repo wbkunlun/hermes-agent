@@ -481,6 +481,9 @@ class TestGroupPendingRedelivery:
         """Cancel the per-chat send workers so they never outlive the test's event loop."""
         for worker in list(adapter._chat_workers.values()) + list(adapter._control_workers.values()):
             worker.cancel()
+        for handle in list(getattr(adapter, "_group_retry_timers", {}).values()):
+            handle.cancel()
+        adapter._group_retry_timers = {}
         await asyncio.sleep(0)
 
     @pytest.mark.asyncio
@@ -733,6 +736,108 @@ class TestGroupPendingRedelivery:
         result2 = await adapter._try_agent_fallback("sarihuang", "hello", "bot send failed")
         assert result2 is not None and result2.success is True
         assert sent[-1] == ("sarihuang", "hello")  # username-style id passes through unchanged
+
+
+class TestGroupDeadWindowRetry:
+    """fork 2026-10-08: a group send parked in the 846609 dead window (socket dead →
+    subscribe-ack pending; _open_connection sets self._ws before the SUBSCRIBE ack, so
+    sends there get a REAL 846609 response) gets a timed retry after the resubscribe
+    instead of waiting for the group's next inbound — quiet groups stay silent for hours.
+    """
+
+    def _adapter(self, delays=(0.01,)):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        # Proactive fails by default (these tests mean "both channels dead"); override
+        # _send_request per test to flip the outcome.
+        adapter._send_request = AsyncMock(return_value={"errcode": 40058, "errmsg": "invalid chatid"})
+        adapter._send_reply_request = AsyncMock(return_value={"errcode": 0})
+        adapter._group_retry_delays = delays
+        return adapter
+
+    async def _drain(self, adapter):
+        for worker in list(adapter._chat_workers.values()) + list(adapter._control_workers.values()):
+            worker.cancel()
+        for handle in list(adapter._group_retry_timers.values()):
+            handle.cancel()
+        adapter._group_retry_timers = {}
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_846609_stash_schedules_timed_retry_and_recovers(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        result = await adapter.send("g1", "17:31 report")
+        assert result.success is False
+        assert "g1" in adapter._group_retry_timers
+
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})  # resubscribed by now
+        await asyncio.sleep(0.05)
+
+        assert adapter._pending_group_sends.get("g1") in (None, [])
+        bodies = [call.args[1] for call in adapter._send_request.await_args_list]
+        assert all(b["chat_type"] == 2 for b in bodies)
+        assert any(b["markdown"]["content"] == "17:31 report" for b in bodies)  # verbatim, no ⏰ header
+        assert "g1" not in adapter._group_retry_attempts
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_retry_failure_reschedules_once_then_stops(self):
+        adapter = self._adapter(delays=(0.01, 0.02))
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        await adapter.send("g1", "report")
+        await asyncio.sleep(0.12)  # both timed attempts fire and fail
+
+        assert adapter._group_retry_attempts.get("g1") == 2
+        assert "g1" not in adapter._group_retry_timers  # budget spent
+        # stays parked — the inbound ⏰ flush path still owns the entry
+        assert [t for _, t in adapter._pending_group_sends["g1"]] == ["report"]
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_non_846609_failure_gets_no_timer(self):
+        """40058 (chat never messaged the bot) would fail identically on retry — no timer."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 40058, "errmsg": "invalid chatid"})
+
+        await adapter.send("g1", "report")
+
+        assert adapter._group_retry_timers == {}
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_control_lane_never_retries(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        result = await adapter.send("g1", "⚠️ approval", metadata={"is_approval_prompt": True})
+
+        assert result.success is False
+        assert adapter._group_retry_timers == {}
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_fresh_episode_resets_retry_budget(self):
+        adapter = self._adapter(delays=(0.01,))
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        await adapter.send("g1", "report")
+        await asyncio.sleep(0.05)  # timed attempt 1 fires and fails
+        assert adapter._group_retry_attempts.get("g1") == 1
+
+        adapter._pending_group_sends.pop("g1", None)  # queue drained (e.g. inbound flush delivered)
+        await adapter.send("g1", "later report")  # fresh parking episode
+
+        assert "g1" in adapter._group_retry_timers  # budget restored
+        await self._drain(adapter)
 
 
 class TestInboundMessages:
