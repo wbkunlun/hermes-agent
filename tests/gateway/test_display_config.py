@@ -175,10 +175,13 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "whatsapp_cloud", "streaming") is False
 
     def test_minimal_tier_platforms(self):
-        """Email, SMS, webhook default to 'off' tool progress."""
+        """Email, SMS, webhook default to 'off' tool progress.
+
+        (homeassistant left this list with the upstream v2026.10.7 core exit —
+        no in-tree tier row means resolve falls back to 'all', by design.)"""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("email", "sms", "webhook", "homeassistant"):
+        for plat in ("email", "sms", "webhook"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
     def test_low_tier_streaming_defaults_to_false(self):
