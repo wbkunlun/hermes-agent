@@ -841,6 +841,30 @@ class TestGroupDeadWindowRetry:
         assert "g1" in adapter._group_retry_timers  # budget restored
         await self._drain(adapter)
 
+    @pytest.mark.asyncio
+    async def test_first_attempt_extended_when_kicked(self):
+        """fork 2026-10-09 hotfix: when kicked, the first group timed-retry delay is
+        floored at kicked_backoff + buffer so the attempt fires AFTER the listen loop
+        reconnects, not inside its kicked-backoff sleep (where the send would just
+        846609 again). Without the floor the 30s default retry would fire ~30s after
+        the original failure while the listen loop is still asleep for ~60s."""
+        adapter = self._adapter(delays=(0.01, 0.02))
+        adapter.KICKED_RESUBSCRIBE_BUFFER = 0.01
+        adapter._kicked_backoff_seconds = 0.1
+        adapter._kicked_at_monotonic = time.monotonic()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+
+        await adapter.send("g1", "report")
+
+        handle = adapter._group_retry_timers["g1"]
+        loop = asyncio.get_running_loop()
+        remaining = handle.when() - loop.time()
+        # The original delay was 0.01s; with the fix the actual delay is at least
+        # kicked_backoff (0.1s) + buffer (0.01s) = 0.11s, less the few ms spent in setup.
+        assert remaining > 0.08, f"timed retry should be floored by kicked_backoff, got {remaining:.3f}s"
+        await self._drain(adapter)
+
 
 class TestKickDetection:
     """fork 2026-10-09: official docs allow ONE live subscription per bot; a newer
@@ -896,6 +920,25 @@ class TestKickDetection:
         assert adapter._kicked_at_monotonic is None
         assert adapter._connected_at_monotonic is not None
         assert adapter._reconnect_delay(0) == 2  # floor lifted
+
+    def test_resubscribe_window_extends_when_kicked(self):
+        """fork 2026-10-09 hotfix: the DM `_await_resubscribe` timeout and the group
+        timed-retry delay both feed through ``_resubscribe_window``; when kicked they
+        must extend past the listen loop's kicked-backoff sleep, otherwise every
+        kicked+846609 message is lost (production 2026-10-09 17:31)."""
+        adapter = self._adapter(backoff=0.05)
+        adapter.KICKED_RESUBSCRIBE_BUFFER = 0.01
+        # Not kicked: base is returned unchanged
+        assert adapter._resubscribe_window(0.02) == 0.02
+        assert adapter._resubscribe_window(0.5) == 0.5
+        # Kicked: base is floored at kicked_backoff + buffer
+        adapter._kicked_at_monotonic = time.monotonic()
+        assert adapter._resubscribe_window(0.02) == pytest.approx(0.06)  # 0.05 + 0.01
+        # Base still wins when already longer than the floor (operator raised the budget)
+        assert adapter._resubscribe_window(0.5) == 0.5
+        # After the kick clears (resubscribe ack), base is back to unchanged
+        adapter._note_ws_established()
+        assert adapter._resubscribe_window(0.02) == 0.02
 
 
 class TestCloseDetail:
@@ -1158,6 +1201,45 @@ class TestDmDeadWindowRetry:
 
         assert result.success is False
         adapter._await_resubscribe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dm_retry_waits_through_kicked_backoff(self):
+        """fork 2026-10-09 hotfix: when kicked, ``_await_resubscribe`` must extend its
+        timeout past the listen loop's kicked-backoff sleep or the DM retry times out
+        BEFORE the resubscribe and the message is lost (production 2026-10-09 17:31:09
+        cron: kicked_backoff=60, dm_resubscribe_timeout=15, message lost at +15s, the
+        listen loop only resubscribed at +60s)."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.KICKED_RESUBSCRIBE_BUFFER = 0.01
+        adapter._kicked_backoff_seconds = 0.1
+        adapter._dm_resubscribe_timeout = 0.02  # intentionally less than kicked_backoff
+        adapter._kicked_at_monotonic = time.monotonic()
+
+        class _FakeWS:
+            closed = False
+            async def close(self):
+                self.closed = True
+        adapter._ws = _FakeWS()
+        adapter._subscribed_gen = 0
+        adapter._subscribed_event.clear()
+        adapter._resubscribe_pending = False
+
+        # Resubscribe fires AFTER the kicked backoff: with the fix, effective timeout
+        # is max(0.02, 0.1 + 0.01) = 0.11s, so the 0.09s resubscribe is awaited and seen.
+        # Without the fix the original 0.02s timeout would already have expired.
+        async def delayed_recovery():
+            await asyncio.sleep(0.09)
+            adapter._note_ws_established()
+        asyncio.create_task(delayed_recovery())
+
+        # Bypass the full ``send()`` path: exercise ``_await_resubscribe`` directly
+        # with the production 0.02s base and verify the bumped timeout is honored.
+        result = await adapter._await_resubscribe(timeout=0.02)
+        assert result is True
+        # Sanity: the kicked-backoff floor was actually consulted (not a no-op return).
+        assert adapter._ws.closed is True  # _schedule_recycle ran
 
 
 class TestInboundMessages:

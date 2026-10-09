@@ -151,6 +151,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     _SPLIT_THRESHOLD = 3900  # chunks near the 4000-char client split are almost certainly continued
+    # fork 2026-10-09 hotfix: when the listen loop is in the kicked-backoff sleep
+    # (default 60s), any resubscribe-aware retry (DM `_await_resubscribe`, group
+    # timed retry) must wait past that sleep + connect+ack time or it times out
+    # BEFORE the resubscribe — production 2026-10-09 17:31:09 group cron lost a
+    # message because `_dm_resubscribe_timeout=15` < `_kicked_backoff_seconds=60`.
+    KICKED_RESUBSCRIBE_BUFFER = 5.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM)
@@ -467,6 +473,18 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._subscribed_gen += 1
         self._subscribed_event.set()
 
+    def _resubscribe_window(self, base: float) -> float:
+        """fork 2026-10-09 hotfix: extend a resubscribe-aware wait when the listen loop
+        is in the kicked-backoff sleep. Without this, a DM/group retry whose nominal
+        timeout is shorter than ``_kicked_backoff_seconds`` (e.g. 15s default vs 60s
+        default backoff) always times out BEFORE the resubscribe — every kicked+846609
+        message is lost. Buffer covers connect+ack after the backoff ends. The base
+        value still wins when it's already longer (an operator may have raised the
+        retry budget for other reasons)."""
+        if self._kicked_at_monotonic is None:
+            return base
+        return max(base, self._kicked_backoff_seconds + self.KICKED_RESUBSCRIBE_BUFFER)
+
     def _schedule_recycle(self, reason: str) -> None:
         """fork 2026-10-09: the subscription can die while the socket stays transport-alive
         (app-level pings keep a zombie open — production 2026-10-09 08:56: sends 846609'd
@@ -493,9 +511,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         """fork 2026-10-09: wait (bounded) for a fresh SUBSCRIBE ack after scheduling a
         connection recycle — the DM dead-window retry uses this so a cron push that hit
         846609 redelivers within seconds instead of being lost outright (groups have the
-        timed-retry queue; DMs had nothing before this)."""
+        timed-retry queue; DMs had nothing before this). fork 2026-10-09 hotfix: when
+        kicked, the listen loop is in its backoff sleep so the timeout must ride it out
+        — see ``_resubscribe_window``."""
         target_gen = self._subscribed_gen + 1
         self._schedule_recycle("errcode 846609 (awaiting resubscribe)")
+        timeout = self._resubscribe_window(timeout)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._subscribed_gen >= target_gen:
@@ -1009,14 +1030,17 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         """fork 2026-10-08: 846609 dead-window — retry parked group sends after the
         resubscribe instead of only waiting for the group's next inbound. One timer per
         chat (the live+standalone cron lanes stash identical content ~35ms apart and
-        coalesce here); attempts are capped at len(_group_retry_delays)."""
+        coalesce here); attempts are capped at len(_group_retry_delays). fork 2026-10-09
+        hotfix: when kicked the first attempt would otherwise fire INSIDE the
+        kicked-backoff sleep and 846609 again — extend the delay to ride it out (see
+        ``_resubscribe_window``)."""
         if chat_id in self._group_retry_timers:
             return
         delays = getattr(self, "_group_retry_delays", ()) or ()
         attempt = self._group_retry_attempts.get(chat_id, 0)
         if attempt >= len(delays):
             return
-        delay = float(delays[attempt])
+        delay = self._resubscribe_window(float(delays[attempt]))
         loop = asyncio.get_running_loop()
         self._group_retry_timers[chat_id] = loop.call_later(
             delay, lambda cid=chat_id: self._group_retry_fire(cid)
