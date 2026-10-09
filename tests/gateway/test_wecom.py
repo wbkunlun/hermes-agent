@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import logging
 import os
 import socket
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch  # fork: patch used by zombie/reconnect regression tests
 
@@ -838,6 +840,324 @@ class TestGroupDeadWindowRetry:
 
         assert "g1" in adapter._group_retry_timers  # budget restored
         await self._drain(adapter)
+
+
+class TestKickDetection:
+    """fork 2026-10-09: official docs allow ONE live subscription per bot; a newer
+    subscribe displaces this one with a NESTED body.event.eventtype disconnected_event —
+    the old flat body.event_type read never matched (detection was dead code), and the
+    designed permanent-suppress response would strand the gateway offline after an
+    ephemeral kicker. Now: loud warning + elevated reconnect backoff."""
+
+    def _adapter(self, backoff=90.0):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._kicked_backoff_seconds = backoff
+        adapter._running = True
+        return adapter
+
+    def _kick_payload(self, nested=True):
+        body = (
+            {"msgtype": "event", "event": {"eventtype": "disconnected_event"}}
+            if nested else {"event_type": "disconnected_event"}
+        )
+        return {"cmd": "aibot_event_callback", "headers": {"req_id": "req-k"}, "body": body}
+
+    @pytest.mark.asyncio
+    async def test_nested_schema_displacement_detected(self, caplog):
+        adapter = self._adapter()
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.wecom.adapter"):
+            await adapter._dispatch_payload(self._kick_payload())
+        assert "Displaced by a newer WeCom WS subscription" in caplog.text
+        assert adapter._kicked_at_monotonic is not None
+        assert adapter._running is True  # no permanent suppress anymore
+
+    @pytest.mark.asyncio
+    async def test_legacy_flat_event_type_still_detected(self, caplog):
+        adapter = self._adapter()
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.wecom.adapter"):
+            await adapter._dispatch_payload(self._kick_payload(nested=False))
+        assert adapter._kicked_at_monotonic is not None
+
+    def test_reconnect_delay_floored_after_kick(self):
+        from plugins.platforms.wecom.adapter import RECONNECT_BACKOFF
+
+        adapter = self._adapter(backoff=90.0)
+        assert adapter._reconnect_delay(0) == RECONNECT_BACKOFF[0]  # no floor when not kicked
+        adapter._kicked_at_monotonic = time.monotonic()
+        assert adapter._reconnect_delay(0) == 90.0
+        assert adapter._reconnect_delay(len(RECONNECT_BACKOFF) + 5) == 90.0  # floor beats cap too
+
+    def test_establishment_clears_kick_flag(self):
+        adapter = self._adapter()
+        adapter._kicked_at_monotonic = time.monotonic()
+        adapter._note_ws_established()
+        assert adapter._kicked_at_monotonic is None
+        assert adapter._connected_at_monotonic is not None
+        assert adapter._reconnect_delay(0) == 2  # floor lifted
+
+
+class TestCloseDetail:
+    """fork 2026-10-09: the close raise sites keep the aiohttp close code + uptime so a
+    server displacement (4xxx) is distinguishable from a network drop (1006) in the
+    existing "WebSocket error" warning, without touching any logging call site."""
+
+    @pytest.mark.asyncio
+    async def test_closed_guard_raise_carries_code_and_uptime(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._connected_at_monotonic = time.monotonic() - 123.0
+
+        class _FakeWS:
+            closed = True
+            close_code = 1006
+
+            def exception(self):
+                return None
+
+        adapter._ws = _FakeWS()
+        with pytest.raises(RuntimeError, match=r"already closed before read \(code=1006, uptime=12[0-9]s\)"):
+            await adapter._read_events()
+
+    def test_close_detail_from_close_frame_tuple(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._connected_at_monotonic = time.monotonic() - 10.0
+
+        class _FakeWS:
+            closed = False
+            close_code = None
+
+            def exception(self):
+                return None
+
+        adapter._ws = _FakeWS()
+        detail = adapter._ws_close_detail(msg=SimpleNamespace(data=(4001, "displaced")))
+        assert "code=4001" in detail
+        assert "reason='displaced'" in detail
+
+
+class TestPongVerification:
+    """fork 2026-10-09: heartbeat ACK counting per the official @wecom/aibot-node-sdk
+    (WsConnectionManager: pongs keyed by req_id prefix, maxMissedPong=2, check-before-send,
+    terminate on threshold). Production 2026-10-09 08:56: a subscription-revoked socket kept
+    accepting ping frames for hours — sends 846609'd while the heartbeat read healthy."""
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_pong_resets_missed_count(self):
+        adapter = self._adapter()
+        adapter._missed_pong_count = 2
+
+        await adapter._dispatch_payload({"headers": {"req_id": "ping-abc"}, "errcode": 0, "errmsg": "ok"})
+
+        assert adapter._missed_pong_count == 0
+
+    @pytest.mark.asyncio
+    async def test_pong_with_cmd_field_also_routes(self):
+        """A pong arriving with an explicit cmd must still count — the SDK keys by req_id
+        prefix precisely because the frame shape varies."""
+        adapter = self._adapter()
+        adapter._missed_pong_count = 1
+
+        await adapter._dispatch_payload({"cmd": "pong", "headers": {"req_id": "ping-abc"}, "errcode": 0})
+
+        assert adapter._missed_pong_count == 0
+
+    @pytest.mark.asyncio
+    async def test_pong_error_keeps_count_and_warns(self, caplog):
+        adapter = self._adapter()
+        adapter._missed_pong_count = 1
+
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.wecom.adapter"):
+            await adapter._dispatch_payload(
+                {"headers": {"req_id": "ping-abc"}, "errcode": 846609, "errmsg": "not subscribed"}
+            )
+
+        assert adapter._missed_pong_count == 1  # SDK behavior: no reset on errored ack
+        assert "Heartbeat ack error" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_terminates_after_missed_pongs(self, monkeypatch, caplog):
+        import plugins.platforms.wecom.adapter as wecom_module
+
+        adapter = self._adapter()
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+        sent_pings = []
+        ws = SimpleNamespace(closed=False, close=AsyncMock())
+
+        async def _record_send_json(payload):
+            sent_pings.append(payload)
+
+        adapter._ws = ws
+        adapter._send_json = _record_send_json
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        try:
+            await asyncio.sleep(0.15)  # ~15 ticks: count 0→1→2 then threshold trips
+        finally:
+            adapter._running = False
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for _ in range(3):  # let the ensure_future close run
+            await asyncio.sleep(0)
+
+        # Official ping shape: {cmd, headers} — no body.
+        assert sent_pings and all("body" not in p for p in sent_pings)
+        assert sent_pings[0]["cmd"] == "ping"
+        assert sent_pings[0]["headers"]["req_id"].startswith("ping-")
+        # Exactly max_missed_pong pings went out before the threshold tripped the recycle.
+        assert len(sent_pings) == adapter._max_missed_pong
+        assert adapter._resubscribe_pending is True
+        ws.close.assert_awaited_once()
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.wecom.adapter"):
+            pass
+        assert "connection considered dead" in caplog.text
+
+
+class TestSubscriptionRecycle:
+    """fork 2026-10-09: 846609 now recycles the zombie socket (once per episode) instead of
+    only purging req_id caches — production kept a subscription-dead socket "alive" for
+    hours because nothing ever closed it. _note_ws_established clears the episode."""
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False, close=AsyncMock())
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_846609_purge_recycles_socket_once(self, caplog):
+        adapter = self._adapter()
+        adapter._last_chat_req_ids["chat-1"] = "req-1"
+        adapter._reply_req_ids["msg-1"] = "req-1"
+
+        with caplog.at_level(logging.WARNING, logger="plugins.platforms.wecom.adapter"):
+            await adapter._force_reconnect_on_stale_subscription(846609)
+            await asyncio.sleep(0)
+            await adapter._force_reconnect_on_stale_subscription(846609)  # burst collapses
+            await asyncio.sleep(0)
+
+        assert not adapter._last_chat_req_ids and not adapter._reply_req_ids
+        assert adapter._resubscribe_pending is True
+        adapter._ws.close.assert_awaited_once()  # second call did not re-close
+        assert "recycling connection to resubscribe" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_non_846609_errcode_is_noop(self):
+        adapter = self._adapter()
+
+        await adapter._force_reconnect_on_stale_subscription(40058)
+
+        assert adapter._resubscribe_pending is False
+        adapter._ws.close.assert_not_awaited()
+
+    def test_establishment_clears_episode_and_bumps_generation(self):
+        adapter = self._adapter()
+        adapter._resubscribe_pending = True
+        adapter._missed_pong_count = 2
+
+        adapter._note_ws_established()
+
+        assert adapter._resubscribe_pending is False
+        assert adapter._missed_pong_count == 0
+        assert adapter._subscribed_gen == 1
+        assert adapter._subscribed_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_await_resubscribe_returns_on_fresh_subscribe(self):
+        adapter = self._adapter()
+
+        waiter = asyncio.create_task(adapter._await_resubscribe(timeout=1.0))
+        await asyncio.sleep(0)
+        adapter._note_ws_established()  # reconnect completed + SUBSCRIBE acked
+
+        assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+    @pytest.mark.asyncio
+    async def test_await_resubscribe_times_out_without_recovery(self):
+        adapter = self._adapter()
+        adapter._resubscribe_pending = True  # recycle already in flight, never completes
+
+        assert await adapter._await_resubscribe(timeout=0.05) is False
+
+
+class TestDmDeadWindowRetry:
+    """fork 2026-10-09: DM sends hitting 846609 recycle + retry once after the resubscribe
+    (groups got the timed-retry queue in v2026.10.8-fork1; DMs had nothing — production
+    2026-10-09 08:56 lost a cron DM this exact way)."""
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._dm_resubscribe_timeout = 0.05
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_dm_846609_retries_once_after_resubscribe(self):
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(side_effect=[
+            {"errcode": 846609, "errmsg": "not subscribed"},
+            {"errcode": 0, "errmsg": "ok"},
+        ])
+        adapter._await_resubscribe = AsyncMock(return_value=True)
+
+        result = await adapter.send("wohR_KCgAA8YOkA", "09:00 cron report")
+
+        assert result.success is True
+        assert adapter._send_request.await_count == 2
+        adapter._await_resubscribe.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dm_846609_without_recovery_fails_clean(self):
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+        adapter._await_resubscribe = AsyncMock(return_value=False)
+
+        result = await adapter.send("wohR_KCgAA8YOkA", "09:00 cron report")
+
+        assert result.success is False
+        assert adapter._send_request.await_count == 1  # no blind retry on a dead session
+        assert "846609" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_dm_redelivery_never_retries(self):
+        """A flushed redelivery failing again must not loop through the retry path."""
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609, "errmsg": "not subscribed"})
+        adapter._await_resubscribe = AsyncMock(return_value=True)
+
+        result = await adapter.send("wohR_KCgAA8YOkA", "report", metadata={"is_redelivery": True})
+
+        assert result.success is False
+        adapter._await_resubscribe.assert_not_awaited()
+        assert adapter._send_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_dm_non_846609_error_skips_retry(self):
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(return_value={"errcode": 40058, "errmsg": "invalid chatid"})
+        adapter._await_resubscribe = AsyncMock(return_value=True)
+
+        result = await adapter.send("wohR_KCgAA8YOkA", "report")
+
+        assert result.success is False
+        adapter._await_resubscribe.assert_not_awaited()
 
 
 class TestInboundMessages:

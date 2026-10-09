@@ -200,6 +200,25 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._group_retry_delays = _parse_group_retry_delays(os.getenv("HERMES_WECOM_GROUP_RETRY_DELAYS", "30,120"))
         self._group_retry_timers: Dict[str, asyncio.TimerHandle] = {}
         self._group_retry_attempts: Dict[str, int] = {}
+        # fork 2026-10-09: official docs allow ONE live WS subscription per bot — a newer
+        # subscribe displaces this one (disconnected_event). Track it to slow our
+        # re-subscribe (avoid mutual kicking) and timestamp connection lifetimes for
+        # close forensics; see _reconnect_delay / _note_ws_established / _ws_close_detail.
+        self._kicked_at_monotonic: Optional[float] = None
+        self._connected_at_monotonic: Optional[float] = None
+        self._kicked_backoff_seconds = max(5.0, env_float("HERMES_WECOM_KICKED_BACKOFF_SECONDS", 60.0))
+        # fork 2026-10-09: pong-verified liveness + subscription recycle, mirroring the
+        # official @wecom/aibot-node-sdk WsConnectionManager (maxMissedPong=2, terminate
+        # on threshold). A subscription-revoked socket still accepts ping frames at the
+        # transport level — production 2026-10-09 08:56 saw 846609 sends on a socket the
+        # app-level pings kept "healthy" for hours. See _dispatch_payload pong routing /
+        # _heartbeat_loop / _schedule_recycle / _await_resubscribe.
+        self._missed_pong_count = 0
+        self._max_missed_pong = 2
+        self._resubscribe_pending = False
+        self._subscribed_gen = 0
+        self._subscribed_event: asyncio.Event = asyncio.Event()
+        self._dm_resubscribe_timeout = max(5.0, env_float("HERMES_WECOM_DM_RESUBSCRIBE_TIMEOUT", 15.0))
         # Stream keep-alive config (see streaming.py STREAM_* constants).
         self._stream_safe_duration_seconds = _extra_float("stream_safe_duration_seconds", STREAM_SAFE_DURATION_SECONDS)
         self._stream_keepalive_enabled = bool(extra.get("stream_keepalive_enabled", STREAM_KEEPALIVE_ENABLED_DEFAULT))
@@ -362,6 +381,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             if errcode not in {0, None}:
                 errmsg = auth_payload.get("errmsg", "authentication failed")
                 raise RuntimeError(f"{errmsg} (errcode={errcode})")
+            self._note_ws_established()  # fork 2026-10-09: uptime stamp + displacement flag clear
         except BaseException:
             # Close the session/ws we just opened so a failed handshake
             # doesn't leak an aiohttp ClientSession (seen as "Unclosed
@@ -398,7 +418,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     return payload
                 logger.debug("[%s] Ignoring pre-auth payload: %s", self.name, payload.get("cmd"))
             elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR}:
-                raise RuntimeError("WeCom websocket closed during authentication")
+                raise RuntimeError(f"WeCom websocket closed during authentication{self._ws_close_detail()}")
         raise TimeoutError("Timed out waiting for WeCom subscribe acknowledgement")
 
     async def _listen_loop(self) -> None:
@@ -414,7 +434,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     return
                 logger.warning("[%s] WebSocket error: %s", self.name, exc)
                 self._fail_all(RuntimeError("WeCom connection interrupted"))
-                await asyncio.sleep(RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)])
+                await asyncio.sleep(self._reconnect_delay(backoff_idx))  # fork 2026-10-09: displacement floors the delay
                 backoff_idx += 1
                 try:
                     await self._open_connection()
@@ -423,6 +443,93 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     logger.info("[%s] Reconnected", self.name)
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
+
+    def _reconnect_delay(self, backoff_idx: int) -> float:
+        """fork 2026-10-09: backoff seconds for the next reconnect; a recent displacement
+        (disconnected_event) floors the delay — an ephemeral competing connection finishes
+        and goes away before we re-subscribe, and each subscribe kicks the other side
+        (official exclusivity rule), so an eager retry would start a mutual-kick war and
+        hammer the aibot_subscribe rate protection."""
+        delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+        if self._kicked_at_monotonic is not None:
+            return max(delay, self._kicked_backoff_seconds)
+        return delay
+
+    def _note_ws_established(self) -> None:
+        """fork 2026-10-09: SUBSCRIBE acked — stamp the connection start (uptime forensics),
+        clear the displacement flag (we hold the subscription again) and reset the
+        per-connection liveness state (pong counter, recycle-pending marker, resubscribe
+        generation for _await_resubscribe waiters)."""
+        self._connected_at_monotonic = time.monotonic()
+        self._kicked_at_monotonic = None
+        self._missed_pong_count = 0
+        self._resubscribe_pending = False
+        self._subscribed_gen += 1
+        self._subscribed_event.set()
+
+    def _schedule_recycle(self, reason: str) -> None:
+        """fork 2026-10-09: the subscription can die while the socket stays transport-alive
+        (app-level pings keep a zombie open — production 2026-10-09 08:56: sends 846609'd
+        four minutes BEFORE the server closed the socket). Close it once per episode; the
+        listen loop's reconnect path then resubscribes (its backoff floors at the kicked
+        backoff when a newer subscription displaced us, so an ephemeral competitor finishes
+        first instead of a mutual-kick war). Closing before re-subscribing also keeps us at
+        ONE connection — the old "never close, second subscribe kicks the first" fear only
+        applies to opening a second connection while the first is still alive."""
+        if self._resubscribe_pending or not self._ws or self._ws.closed:
+            return
+        self._resubscribe_pending = True
+        self._subscribed_event.clear()
+        logger.warning("[%s] Subscription unusable (%s) — recycling connection to resubscribe", self.name, reason)
+        asyncio.ensure_future(self._close_ws_for_recycle())
+
+    async def _close_ws_for_recycle(self) -> None:
+        ws = self._ws
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+    async def _await_resubscribe(self, timeout: float) -> bool:
+        """fork 2026-10-09: wait (bounded) for a fresh SUBSCRIBE ack after scheduling a
+        connection recycle — the DM dead-window retry uses this so a cron push that hit
+        846609 redelivers within seconds instead of being lost outright (groups have the
+        timed-retry queue; DMs had nothing before this)."""
+        target_gen = self._subscribed_gen + 1
+        self._schedule_recycle("errcode 846609 (awaiting resubscribe)")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._subscribed_gen >= target_gen:
+                return True
+            try:
+                await asyncio.wait_for(self._subscribed_event.wait(), timeout=max(0.01, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                break
+            self._subscribed_event.clear()
+        return self._subscribed_gen >= target_gen
+
+    def _ws_close_detail(self, msg: Optional["aiohttp.WSMessage"] = None) -> str:
+        """fork 2026-10-09: forensic suffix for websocket-close errors — close code/reason,
+        transport exception and connection uptime. Without it the close raise sites were
+        indistinguishable: a server-side displacement (4xxx) looked exactly like a network
+        drop (1006)."""
+        code = getattr(self._ws, "close_code", None)
+        reason = ""
+        if msg is not None and isinstance(msg.data, tuple):
+            code = code if code is not None else (msg.data[0] if len(msg.data) > 0 else None)
+            reason = str(msg.data[1]) if len(msg.data) > 1 else ""
+        parts = []
+        if code is not None:
+            parts.append(f"code={code}")
+        if reason:
+            parts.append(f"reason={reason!r}")
+        exc = None
+        with contextlib.suppress(Exception):
+            exc = self._ws.exception() if self._ws else None
+        if exc is not None:
+            parts.append(f"exc={exc!r}")
+        if self._connected_at_monotonic is not None:
+            parts.append(f"uptime={time.monotonic() - self._connected_at_monotonic:.0f}s")
+        return f" ({', '.join(parts)})" if parts else ""
 
     async def _read_events(self) -> None:
         if not self._ws:
@@ -434,14 +541,14 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # Raising here routes the failure back through the listen loop's
         # reconnect path with proper backoff and logging.
         if self._ws.closed:
-            raise RuntimeError("WeCom websocket already closed before read")
+            raise RuntimeError(f"WeCom websocket already closed before read{self._ws_close_detail()}")
 
         while self._running and self._ws and not self._ws.closed:
             msg = await self._ws.receive()
             if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                 await self._handle_frame(msg.data, msg.type == aiohttp.WSMsgType.BINARY)
             elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING}:
-                raise RuntimeError("WeCom websocket closed")
+                raise RuntimeError(f"WeCom websocket closed{self._ws_close_detail(msg)}")
             else:
                 logger.info("[%s] Inbound frame ignored: WSMsgType=%s", self.name, msg.type)
 
@@ -465,7 +572,22 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 try:
                     if self._ws and not self._ws.closed:
-                        await self._send_json({"cmd": APP_CMD_PING, "headers": {"req_id": self._new_req_id("ping")}, "body": {}})
+                        # fork 2026-10-09: verify pong ACKs before the next ping (official
+                        # @wecom/aibot-node-sdk WsConnectionManager semantics, maxMissedPong=2).
+                        # A subscription-revoked socket still accepts ping frames at the
+                        # transport level, so without ACK counting a zombie stays "healthy"
+                        # forever (production 2026-10-09: 846609 at 08:56 on a socket the
+                        # server closed only at 09:00).
+                        if self._missed_pong_count >= self._max_missed_pong:
+                            logger.warning(
+                                "[%s] No heartbeat ack for %d consecutive pings — connection considered dead, recycling",
+                                self.name, self._missed_pong_count,
+                            )
+                            self._schedule_recycle(f"no pong for {self._missed_pong_count} heartbeats")
+                            continue
+                        self._missed_pong_count += 1
+                        # Official SDK/doc ping shape is {cmd, headers} — no body (path/101463).
+                        await self._send_json({"cmd": APP_CMD_PING, "headers": {"req_id": self._new_req_id("ping")}})
                 except Exception as exc:
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
         except asyncio.CancelledError:
@@ -482,6 +604,19 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 "[%s] _dispatch_payload: req_id=%s cmd=%r has_pending_ack=%s errcode=%s in_NON_RESPONSE=%s payload_keys=%s", self.name, req_id, cmd,
                 self._reply_queues[req_id].pending_ack is not None, body_dict.get("errcode", "N/A") if body_dict is not None else "N/A", cmd in NON_RESPONSE_COMMANDS, list(payload.keys()),
             )
+        # fork 2026-10-09: heartbeat acks come back with our "ping-" req_id (the official
+        # aibot-node-sdk keys them by req_id prefix, cmd-less or with a pong cmd) — route
+        # them BEFORE the reply/pending machinery so the heartbeat loop can count ACKs.
+        # errcode!=0 keeps the count (SDK behavior): warn and move on.
+        if req_id.startswith("ping"):
+            if payload.get("errcode", 0) == 0:
+                self._missed_pong_count = 0
+            else:
+                logger.warning(
+                    "[%s] Heartbeat ack error: errcode=%s errmsg=%s",
+                    self.name, payload.get("errcode"), payload.get("errmsg"),
+                )
+            return
         # Reply-queue acks (inbound req_id, no/other cmd) MUST win over _pending_responses.
         if req_id and cmd not in NON_RESPONSE_COMMANDS:
             if self._resolve_reply_ack(req_id, payload):
@@ -506,19 +641,25 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 })
             return
         if cmd == APP_CMD_EVENT_CALLBACK:
-            # Check for "kicked by server" event — WeCom sends this when a new
-            # connection is established elsewhere (another instance). Mirror the
-            # official OpenClaw SDK: suppress reconnect to avoid mutual kicking.
+            # fork 2026-10-09: official schema nests the event type at body.event.eventtype
+            # (the earlier flat body.event_type read NEVER matched — the displacement
+            # warning below was dead code and every kick sailed past as a DEBUG
+            # "Ignoring WeCom event" line). Docs: one live subscription per bot; a newer
+            # subscribe (duplicate instance, or an out-of-process standalone/ephemeral
+            # send) displaces this one and the server closes us right after.
             body = payload.get("body") or {}
-            event_type = str(body.get("event_type") or "")
+            event = body.get("event") if isinstance(body.get("event"), dict) else {}
+            event_type = str(event.get("eventtype") or body.get("event_type") or "")
             if event_type == "disconnected_event":
+                self._kicked_at_monotonic = time.monotonic()
                 logger.warning(
-                    "[%s] Kicked by server (another WS connection established). "
-                    "Suppressing reconnect to avoid mutual kicking. "
-                    "Check for duplicate gateway instances.",
-                    self.name,
+                    "[%s] Displaced by a newer WeCom WS subscription (disconnected_event) — "
+                    "official docs allow ONE live connection per bot; a duplicate gateway "
+                    "instance or an out-of-process standalone/ephemeral send opened a "
+                    "competing connection. Reconnecting no sooner than %.0fs "
+                    "(HERMES_WECOM_KICKED_BACKOFF_SECONDS).",
+                    self.name, self._kicked_backoff_seconds,
                 )
-                self._running = False  # stop _listen_loop from reconnecting
             # Route aibot events (e.g. enter_chat welcome) to the handler.
             await self._on_event(payload)
             return
@@ -928,13 +1069,20 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             pending.pop(chat_id, None)
 
     async def _force_reconnect_on_stale_subscription(self, errcode: int) -> None:
-        """On 846609 (subscription lost) drop req_ids bound to the dead session. Do NOT close the
-        WS: a second connection gets kicked and invalidates the first (infinite kick loop)."""
+        """On 846609 (subscription lost) drop req_ids bound to the dead session AND recycle
+        the connection: the socket can outlive the subscription by hours (app-level pings
+        keep a zombie open — production 2026-10-09 08:56 saw 846609 four minutes before the
+        server closed the socket), so without an explicit close every later send keeps
+        failing until the server acts. The reconnect's subscribe reclaims the session
+        unless a newer connection holds it — that case is the displacement path (warning +
+        elevated backoff, see _reconnect_delay); we close our socket BEFORE subscribing, so
+        we never hold two live connections."""
         if errcode != STREAM_NOT_SUBSCRIBED_ERRCODE:
             return
         logger.warning("[%s] Got errcode %d (subscription lost) — clearing stale state", self.name, errcode)
         self._last_chat_req_ids.clear()
         self._reply_req_ids.clear()
+        self._schedule_recycle(f"errcode {errcode}")
 
     @staticmethod
     def _response_error(response: Dict[str, Any]) -> Optional[str]:
@@ -1057,7 +1205,20 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 # 846609 schedules the stale-req_id purge even when stashed — the cache holds dead req_ids.
                 return self._send_failure(message, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in proactive_error)
             else:
-                response = await self._send_proactive_markdown(chat_id, content)
+                try:
+                    response = await self._send_proactive_markdown(chat_id, content)
+                except Exception as exc:
+                    # fork 2026-10-09: 846609 on a live-but-unsubscribed socket — recycle the
+                    # connection and retry once after the resubscribe (recovery is seconds; the
+                    # cron delivery would otherwise be lost outright — production 2026-10-09
+                    # 08:56, DM target, both live and standalone lanes failed). Redeliveries
+                    # skip this (loop guard); a multi-segment partial may duplicate an already
+                    # delivered head segment — accepted, same tradeoff as the group timed retry.
+                    if str(STREAM_NOT_SUBSCRIBED_ERRCODE) not in str(exc) or is_redelivery:
+                        raise
+                    if not await self._await_resubscribe(timeout=self._dm_resubscribe_timeout):
+                        raise
+                    response = await self._send_proactive_markdown(chat_id, content)
         except asyncio.TimeoutError:
             fb = await self._try_agent_fallback(chat_id, content, "bot send timeout")
             if fb is not None:
