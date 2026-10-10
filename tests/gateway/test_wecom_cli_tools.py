@@ -281,9 +281,8 @@ class TestCuratedTools:
             (("todo",), "create"), (("todo",), "complete"),
             (("mail",), "send"), (("mail",), "search"),
             (("contact",), "search"),
-            (("message",), "send"),
         ]
-        assert len(wecom_tools.CURATED_TOOLS) == 13
+        assert len(wecom_tools.CURATED_TOOLS) == 12
 
     def test_curated_handler_rejects_non_object_args(self):
         import asyncio
@@ -307,7 +306,7 @@ class TestCuratedTools:
         names = sorted(r["name"] for r in registered)
         assert len(names) == 16
         assert set(names) == {
-            "wecom_cli_status", "wecom_cli_schema", "wecom_cli",
+            "wecom_cli_status", "wecom_cli_schema", "wecom_cli", "wecom_message_push",
             *(spec["name"] for spec in wecom_tools.CURATED_TOOLS),
         }
         for r in registered:
@@ -315,6 +314,103 @@ class TestCuratedTools:
             assert r["check_fn"] is wecom_tools.cli_tools_available
             assert r["is_async"] is True
             assert r["handler"] is not None
+
+
+class TestMessageFamilyGuard:
+    """The CLI `message` service displaces the gateway's single bot session — the
+    tool surface must route messaging through the gateway connection instead
+    (production incident 2026-10-10 10:42: CLI-tool group notification kicked
+    the gateway, the in-flight group reply parked, the bot went silent)."""
+
+    def _patch_live_adapter(self, monkeypatch, adapter):
+        import tools.send_message_senders as senders
+
+        monkeypatch.setattr(senders, "_live_adapter", lambda platform: (object(), adapter))
+
+    def test_message_push_routes_through_live_adapter(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        sent = {}
+
+        class FakeAdapter:
+            async def send(self, chat_id, content):
+                sent["chat_id"], sent["content"] = chat_id, content
+                return SimpleNamespace(success=True, message_id="mid-1")
+
+        self._patch_live_adapter(monkeypatch, FakeAdapter())
+        monkeypatch.setattr(wecom_tools, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("message push must never shell out to wecom-cli")))
+        out = asyncio.run(wecom_tools._handler_message_push({
+            "chat_id": "wrhR_KCgAARZ", "content": "# 群通知\n今日 E2E 统计",
+        }))
+        assert sent == {"chat_id": "wrhR_KCgAARZ", "content": "# 群通知\n今日 E2E 统计"}
+        assert "mid-1" in out and "error" not in out
+
+    def test_message_push_refuses_without_live_adapter(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        import tools.send_message_senders as senders
+        monkeypatch.setattr(senders, "_live_adapter", lambda platform: (None, None))
+        monkeypatch.setattr(wecom_tools, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("refusal path must not shell out")))
+        out = asyncio.run(wecom_tools._handler_message_push({
+            "chat_id": "wrhR_KCgAARZ", "content": "x",
+        }))
+        assert "error" in out and "846609" in out
+
+    def test_message_push_requires_chat_id_and_content(self):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        for bad in ({"content": "x"}, {"chat_id": "c"}, {}):
+            out = asyncio.run(wecom_tools._handler_message_push(bad))
+            assert "error" in out
+
+    def test_message_push_surfaces_adapter_failure(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        class FakeAdapter:
+            async def send(self, chat_id, content):
+                return SimpleNamespace(success=False, error="Group send failed (parked)")
+
+        self._patch_live_adapter(monkeypatch, FakeAdapter())
+        out = asyncio.run(wecom_tools._handler_message_push({
+            "chat_id": "wrhR_KCgAARZ", "content": "x",
+        }))
+        assert "error" in out and "parked" in out
+
+    def test_generic_handler_blocks_message_service(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        monkeypatch.setattr(wecom_tools, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("message family must never reach the CLI")))
+        for service_path in (["message"], ["message", "aibot"], ["Message", "aibot", "sessions"]):
+            out = asyncio.run(wecom_tools._handler_generic({
+                "service_path": service_path, "method": "send",
+            }))
+            assert "error" in out and "wecom_message_push" in out
+
+    def test_generic_handler_allows_rest_services(self, monkeypatch):
+        import asyncio
+
+        from plugins.platforms.wecom import tools as wecom_tools
+
+        monkeypatch.setattr(wecom_tools, "run_cli", lambda *a, **k: '{"ok": true}')
+        out = asyncio.run(wecom_tools._handler_generic({
+            "service_path": ["disk", "file"], "method": "search",
+        }))
+        assert "error" not in out
 
 
 class TestRegisterWiring:

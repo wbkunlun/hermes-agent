@@ -10,13 +10,24 @@ zero core edits.
 
 Tool surface (16):
   base    — wecom_cli_status / wecom_cli_schema / wecom_cli (generic passthrough)
-  curated — 13 high-frequency conveniences (docs, sheets, calendar, todo,
-            mail, contact search, message push)
+  push    — wecom_message_push (gateway-connection send; see below)
+  curated — 12 high-frequency conveniences (docs, sheets, calendar, todo,
+            mail, contact search)
 
 Curated tools forward their ``args`` object verbatim as the CLI ``--json``
 payload; exact keys are discovered via ``wecom_cli_schema`` so a changing
 server-side command tree degrades gracefully (model self-corrects using the
 schema tool) instead of rotting typed schemas here.
+
+**Messaging never shells out.**  WeCom allows ONE live bot session; the CLI
+``message`` family (``message aibot send`` / ``sessions list``) makes the
+backend take that session over server-side, displacing the gateway's WS
+subscription with a 60s+ 846609 dead window (production incident 2026-10-10
+10:42: a CLI-tool group notification kicked the gateway, the in-flight group
+reply parked, the bot went silent).  ``wecom_message_push`` therefore routes
+through the gateway's live in-process adapter and the generic passthrough
+refuses the ``message`` service outright; everything else (docs, mail, …) is
+plain REST with no session semantics.
 """
 
 from __future__ import annotations
@@ -104,6 +115,13 @@ async def _run_and_format(
 
 # ---------------------------------------------------------------- base tools
 
+# wecom-cli services whose calls make WeCom's backend take over the bot's ONE
+# live session (server-side subscribe on the CLI's behalf), displacing the
+# gateway's WS subscription — errcode 846609 dead window.  Pure-REST business
+# services (doc/sheet/mail/…) are absent on purpose: no session semantics.
+_SESSION_TAKEOVER_SERVICES = frozenset({"message"})
+
+
 async def _handler_status(args: Dict[str, Any]) -> str:
     version = await _run_and_format((), extra_argv=["--version"], bare=True)
     auth = await _run_and_format(("auth",), "show")
@@ -125,6 +143,12 @@ async def _handler_generic(args: Dict[str, Any]) -> str:
     raw_path = args.get("service_path") or []
     if not isinstance(raw_path, list):
         return tool_error("service_path must be an array of segments")
+    if raw_path and str(raw_path[0]).strip().lower() in _SESSION_TAKEOVER_SERVICES:
+        return tool_error(
+            "wecom_cli refuses the 'message' service: it takes over the bot's single live "
+            "WeCom session and disconnects the serving gateway (846609 dead window). "
+            "Use wecom_message_push (markdown) or send_message (media) instead."
+        )
     method = str(args.get("method") or "").strip() or None
     payload = args.get("args")
     if payload is not None and not isinstance(payload, dict):
@@ -169,8 +193,6 @@ CURATED_TOOLS: List[Dict[str, Any]] = [
      "description": "Search WeCom mail and fetch details (mail search)."},
     {"name": "wecom_contact_search", "cli": ("contact",), "method": "search",
      "description": "Search WeCom members by name/pinyin/alias; basic member info (contact search)."},
-    {"name": "wecom_message_push", "cli": ("message",), "method": "send",
-     "description": "Push a markdown/media message to a chat the bot recently engaged with (message send)."},
 ]
 
 
@@ -207,16 +229,18 @@ _BASE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "wecom_cli": {
         "name": "wecom_cli",
         "description": (
-            "Generic passthrough to the official wecom-cli (13 service domains: "
-            "message mail doc sheet smartsheet smartpage calendar meeting todo disk "
-            "contact media identity). Prefer curated tools; use this for the long tail."
+            "Generic passthrough to the official wecom-cli (12 service domains: "
+            "mail doc sheet smartsheet smartpage calendar meeting todo disk "
+            "contact media identity). Prefer curated tools; use this for the long tail. "
+            "The 'message' service is refused — it would take over the bot's single "
+            "live session and disconnect the gateway; use wecom_message_push instead."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "service_path": {
                     "type": "array", "items": {"type": "string"},
-                    "description": "CLI path segments, e.g. ['message','aibot','sessions']",
+                    "description": "CLI path segments, e.g. ['disk','file','search']",
                 },
                 "method": {"type": "string", "description": "Final method segment, e.g. 'list'"},
                 "args": _ARGS_OBJECT_SCHEMA,
@@ -226,6 +250,66 @@ _BASE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
     },
 }
+
+
+# ---------------------------------------------------------------- gateway-connection push
+
+_MESSAGE_PUSH_SCHEMA = {
+    "name": "wecom_message_push",
+    "description": (
+        "Push a markdown message to a WeCom chat (group notification, scheduled "
+        "push, cross-chat ping) over the gateway's live smart-robot connection. "
+        "Groups get the full reliability chain (passive reply → proactive "
+        "aibot_send_msg → park-and-retry on the next group message). Media "
+        "messages: use the send_message tool with a file path instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {"type": "string", "description": "Target chat id (group chatid or DM userid)"},
+            "content": {"type": "string", "description": "Markdown message body"},
+        },
+        "required": ["chat_id", "content"],
+        "additionalProperties": False,
+    },
+}
+
+
+async def _handler_message_push(args: Dict[str, Any]) -> str:
+    """Send over the gateway's in-process WeCom adapter — never via wecom-cli.
+
+    The CLI ``message`` family opens a competing bot session server-side and
+    displaces the gateway's WS subscription (single live session per bot,
+    errcode 846609 dead window — production 2026-10-10 10:42).  Without a
+    reachable in-process adapter we refuse rather than displace whatever
+    gateway is serving that bot elsewhere."""
+    chat_id = str(args.get("chat_id") or "").strip()
+    content = str(args.get("content") or "").strip()
+    if not chat_id or not content:
+        return tool_error("wecom_message_push requires 'chat_id' and 'content' (markdown)")
+    try:
+        from gateway.config import Platform
+        from tools.send_message_senders import _live_adapter
+        _runner, live = _live_adapter(Platform.WECOM)
+    except Exception:  # noqa: BLE001 — no gateway in this process (CLI/TUI agent)
+        live = None
+    if live is None:
+        return tool_error(
+            "wecom_message_push: no in-process WeCom gateway connection. A CLI-side "
+            "send would take over the bot's single live session and disconnect the "
+            "serving gateway (846609 dead window) — refusing. Send from the gateway "
+            "deployment, or deliver media via the send_message tool."
+        )
+    try:
+        result = await live.send(chat_id, content)
+    except Exception as exc:  # noqa: BLE001 — surface every failure to the model
+        return tool_error(f"wecom_message_push failed: {exc}")
+    if getattr(result, "success", False):
+        return tool_result({
+            "ok": True, "platform": "wecom", "chat_id": chat_id,
+            "message_id": getattr(result, "message_id", None),
+        })
+    return tool_error(f"wecom_message_push failed: {getattr(result, 'error', None)}")
 
 
 def register_tools(ctx) -> None:
@@ -256,6 +340,16 @@ def register_tools(ctx) -> None:
         schema=_BASE_TOOL_SCHEMAS["wecom_cli"],
         handler=_handler_generic,
         description=_BASE_TOOL_SCHEMAS["wecom_cli"]["description"],
+        emoji="💼",
+        check_fn=cli_tools_available,
+        is_async=True,
+    )
+    ctx.register_tool(
+        name="wecom_message_push",
+        toolset="wecom",
+        schema=_MESSAGE_PUSH_SCHEMA,
+        handler=_handler_message_push,
+        description=_MESSAGE_PUSH_SCHEMA["description"],
         emoji="💼",
         check_fn=cli_tools_available,
         is_async=True,

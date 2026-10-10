@@ -7,8 +7,10 @@ description: >
   platforms: ``wecom`` (Smart Robot over WebSocket) and ``wecom_callback``
   (self-built apps over an HTTP callback endpoint with AES message crypto).
   Relays messages between WeCom chats and the Hermes agent. Also registers 16
-  wecom-cli business tools (docs / sheets / calendar / todo / mail / contacts /
-  WeDrive / messaging) when the official wecom-cli is installed and authorized.
+  business tools (docs / sheets / calendar / todo / mail / contacts / WeDrive
+  via the official wecom-cli; messaging via the gateway's own connection —
+  the CLI message family would displace the bot's single live session) when
+  the official wecom-cli is installed and authorized.
 author: NousResearch
 # The wecom-cli business client tools. Declaring them here asks discovery to
 # import `tools.py` in CLI/TUI processes (same contract as the a2a plugin).
