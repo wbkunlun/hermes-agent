@@ -67,7 +67,6 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "weixin": _TIER_LOW,
     # Non-editable, but its native "stream" msgtype gives a typing animation + cumulative updates.
     "wecom": {**_TIER_LOW, "streaming": True},
-    "wecom_callback": _TIER_LOW,
     "dingtalk": _TIER_LOW,
     "email": _TIER_MINIMAL,
     "sms": _TIER_MINIMAL,

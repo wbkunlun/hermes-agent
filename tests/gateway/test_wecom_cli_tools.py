@@ -311,7 +311,9 @@ class TestCuratedTools:
         }
         for r in registered:
             assert r["toolset"] == "wecom"
-            assert r["check_fn"] is wecom_tools.cli_tools_available
+            expected_check = (wecom_tools.wecom_platform_configured if r["name"] == "wecom_message_push"
+                              else wecom_tools.cli_tools_available)
+            assert r["check_fn"] is expected_check
             assert r["is_async"] is True
             assert r["handler"] is not None
 
@@ -433,7 +435,7 @@ class TestRegisterWiring:
 
         wecom_adapter.register(FakeCtx())
         assert called.get("yes") is True
-        assert platforms == ["wecom", "wecom_callback"]
+        assert platforms == ["wecom"]
 
     def test_plugin_manifest_declares_provides_tools(self):
         from pathlib import Path
@@ -443,8 +445,8 @@ class TestRegisterWiring:
         manifest = yaml.safe_load(
             (Path(__file__).resolve().parents[2] / "plugins" / "platforms" / "wecom" / "plugin.yaml").read_text()
         )
-        assert manifest["version"] == "1.1.0"
+        assert manifest["version"] == "1.2.0"
         assert len(manifest["provides_tools"]) == 16
         assert "wecom_cli" in manifest["provides_tools"]
         optional_names = {e["name"] for e in manifest["optional_env"]}
-        assert {"WECOM_CLI_BIN", "HERMES_WECOM_CLI_TIMEOUT", "WECOM_AGENT_FALLBACK"} <= optional_names
+        assert {"WECOM_CLI_BIN", "HERMES_WECOM_CLI_TIMEOUT"} <= optional_names

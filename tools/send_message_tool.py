@@ -771,8 +771,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 # solely to feed the registration at the bottom of this block.
 #
 # ``send_message`` is registered as an agent-callable tool, scoped narrowly to
-# the WeCom platform toolsets (hermes-wecom / hermes-wecom-callback in
-# toolsets.py) so the agent can notify a specific WeCom user on request. Other
+# the WeCom platform toolset (hermes-wecom in toolsets.py) so the agent can
+# notify a specific WeCom user on request. Other
 # platforms are unchanged: the send engine above remains the shared transport
 # for cron delivery (cron/scheduler.py), the ``hermes send`` CLI command
 # (hermes_cli/send_cmd.py), the gateway kanban notifier (dashboard-toggled,

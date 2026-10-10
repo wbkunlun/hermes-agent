@@ -119,7 +119,7 @@ hermes-agent/
 │   ├── builtin_hooks/        # 始终注册的 hook 扩展点（当前无内置）
 │   └── platforms/            # 20 个适配器：telegram、discord、slack、whatsapp、
 │                             #   signal、matrix、mattermost、email、sms、
-│                             #   dingtalk、feishu、wecom、wecom_callback、weixin、
+│                             #   dingtalk、feishu、wecom、weixin、
 │                             #   bluebubbles、qqbot、webhook、api_server、
 │                             #   yuanbao
 │

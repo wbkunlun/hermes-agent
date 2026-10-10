@@ -655,7 +655,7 @@ class TestMigratedPlatformWiring:
 
     _LAZY_INSTALLABLE = (
         "teams", "telegram", "discord", "slack",
-        "matrix", "dingtalk", "feishu", "wecom_callback",
+        "matrix", "dingtalk", "feishu",
         "google_chat",
     )
 
@@ -665,8 +665,8 @@ class TestMigratedPlatformWiring:
         discover_plugins()
         from gateway.platform_registry import platform_registry
 
-        # Materialize deferred loaders (wecom_callback is registered by the
-        # "wecom" manifest's loader; a cold get() by its own name misses).
+        # Materialize deferred loaders (a bundled platform registered by a
+        # manifest's loader; a cold get() by its own name misses).
         platform_registry.plugin_entries()
         for platform_name in self._LAZY_INSTALLABLE:
             entry = platform_registry.get(platform_name)

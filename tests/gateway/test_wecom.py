@@ -688,57 +688,6 @@ class TestGroupPendingRedelivery:
         assert adapter._pending_group_sends.get("g1") in (None, [])
         await self._drain_workers(adapter)
 
-    @pytest.mark.asyncio
-    async def test_dm_chatid_userid_mapping_learned(self):
-        adapter = self._adapter()
-        adapter._text_batch_delay_seconds = 0
-        adapter.handle_message = AsyncMock()
-        adapter._extract_media = AsyncMock(return_value=([], []))
-        adapter._admit_inbound = lambda is_group, chat_id, sender_id: True
-
-        dm_payload = {
-            "cmd": "aibot_msg_callback",
-            "headers": {"req_id": "req-dm"},
-            "body": {"msgid": "msg-dm", "chatid": "wohR123", "chattype": "single", "msgtype": "text",
-                     "from": {"userid": "zhangsan"}, "text": {"content": "hi"}},
-        }
-        await adapter._on_message(dm_payload)
-        assert adapter._dm_userid_by_chat.get("wohR123") == "zhangsan"
-
-        group_payload = {
-            "cmd": "aibot_msg_callback",
-            "headers": {"req_id": "req-grp"},
-            "body": {"msgid": "msg-grp", "chatid": "wrhR9", "chattype": "group", "msgtype": "text",
-                     "from": {"userid": "lisi"}, "text": {"content": "hi"}},
-        }
-        await adapter._on_message(group_payload)
-        assert "wrhR9" not in adapter._dm_userid_by_chat  # groups never map
-
-    @pytest.mark.asyncio
-    async def test_agent_fallback_resolves_userid_from_dm_mapping(self, monkeypatch):
-        import plugins.platforms.wecom.adapter as wecom_adapter
-        from gateway.config import Platform
-
-        adapter = wecom_adapter.WeComAdapter.__new__(wecom_adapter.WeComAdapter)
-        adapter.platform = Platform.WECOM
-        adapter._group_chat_ids = set()
-        adapter._dm_userid_by_chat = {"wohR123": "zhangsan"}
-        sent = []
-
-        class FakeClient:
-            async def send_markdown(self, touser, content):
-                sent.append((touser, content))
-                return True, None
-
-        monkeypatch.setattr(wecom_adapter, "_agent_fallback_client", lambda: FakeClient())
-        result = await adapter._try_agent_fallback("wohR123", "hello", "bot send failed")
-        assert result is not None and result.success is True
-        assert sent == [("zhangsan", "hello")]  # wohR chat id resolved to the corp userid
-
-        result2 = await adapter._try_agent_fallback("sarihuang", "hello", "bot send failed")
-        assert result2 is not None and result2.success is True
-        assert sent[-1] == ("sarihuang", "hello")  # username-style id passes through unchanged
-
 
 class TestGroupDeadWindowRetry:
     """fork 2026-10-08: a group send parked in the 846609 dead window (socket dead →

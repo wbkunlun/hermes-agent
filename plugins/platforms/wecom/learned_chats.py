@@ -1,13 +1,17 @@
 """Persistence for inbound-learned chat classification.
 
-fork 2026-10-08: ``_group_chat_ids`` / ``_dm_userid_by_chat`` are rebuilt from inbound
-traffic; before this mixin they were wiped on every restart (the 2026-09-29 module audit,
-M1.7, left them in-memory by design). A restart between a group's last inbound and a
-scheduled push misclassified the group as a DM — the send took the DM branch (no ⏰
-redelivery parking) and the notification was lost outright (production 2026-10-08 17:31:
-the 09:56 restart cleared the learned set; the 17:31 cron push hit the 846609 dead window
-in the DM branch and vanished). Mirrors gateway/channel_directory.py conventions: lazy
-``get_hermes_home()``, module-level test override, ``atomic_json_write`` via to_thread.
+fork 2026-10-08: ``_group_chat_ids`` is rebuilt from inbound traffic; before this mixin it
+was wiped on every restart (the 2026-09-29 module audit, M1.7, left it in-memory by
+design). A restart between a group's last inbound and a scheduled push misclassified the
+group as a DM — the send took the DM branch (no ⏰ redelivery parking) and the
+notification was lost outright (production 2026-10-08 17:31: the 09:56 restart cleared
+the learned set; the 17:31 cron push hit the 846609 dead window in the DM branch and
+vanished). Mirrors gateway/channel_directory.py conventions: lazy ``get_hermes_home()``,
+module-level test override, ``atomic_json_write`` via to_thread.
+
+fork 2026-10-10: the ``dm_userid`` map (learned touser for the WECOM_CALLBACK_ agent
+fallback) was removed along with the fallback itself; legacy sidecar ``dm_userid``
+entries are ignored on load.
 """
 
 from __future__ import annotations
@@ -17,20 +21,18 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from gateway.platforms.helpers import bounded_put
-
 logger = logging.getLogger(__name__)
 
 # Explicit test override (tests patch this); None = current hermes home.
 LEARNED_CHATS_PATH: Optional[Path] = None
 
 _LEARNED_SAVE_DEBOUNCE_SECONDS = 5.0
-_LEARNED_CAP = 1000  # same magnitude as DEDUP_MAX_SIZE; the maps are small in practice
+_LEARNED_CAP = 1000  # same magnitude as DEDUP_MAX_SIZE; the set is small in practice
 _PERSIST_OFF_VALUES = {"0", "false", "off", "no"}
 
 
 class LearnedChatsMixin:
-    """Persist learned group ids + the DM chatid→userid map to HERMES_HOME (debounced)."""
+    """Persist learned group ids to HERMES_HOME (debounced)."""
 
     _learned_save_delay = _LEARNED_SAVE_DEBOUNCE_SECONDS
 
@@ -47,10 +49,9 @@ class LearnedChatsMixin:
         return get_hermes_home() / "wecom_learned_chats.json"
 
     def _load_learned_chats(self) -> None:
-        """Seed the in-memory maps from disk; corrupt/missing files degrade to empty."""
+        """Seed the in-memory set from disk; corrupt/missing files degrade to empty."""
         groups = getattr(self, "_group_chat_ids", None)
-        dm_map = getattr(self, "_dm_userid_by_chat", None)
-        if groups is None or dm_map is None or not self._learned_persist_enabled():
+        if groups is None or not self._learned_persist_enabled():
             return  # bare __new__ test stubs skip persistence
         path = self._learned_chats_path()
         if not path.exists():
@@ -69,14 +70,10 @@ class LearnedChatsMixin:
             return
         for chat_id in [g for g in data.get("groups", []) if isinstance(g, str) and g.strip()][-_LEARNED_CAP:]:
             groups.add(chat_id.strip())
-        dm_entries = data.get("dm_userid")
-        if isinstance(dm_entries, dict):
-            pairs = [(str(k), str(v)) for k, v in dm_entries.items() if str(k).strip() and str(v).strip()]
-            dm_map.update(dict(pairs[-_LEARNED_CAP:]))
-        if groups or dm_map:
+        if groups:
             logger.info(
-                "[%s] Restored %d learned group chat(s) and %d DM userid mapping(s) from %s",
-                getattr(self, "name", "wecom"), len(groups), len(dm_map), path.name,
+                "[%s] Restored %d learned group chat(s) from %s",
+                getattr(self, "name", "wecom"), len(groups), path.name,
             )
 
     def _note_learned_group(self, chat_id: str) -> None:
@@ -85,15 +82,6 @@ class LearnedChatsMixin:
         groups = getattr(self, "_group_chat_ids", None)
         if groups is not None and chat_id not in groups:
             groups.add(chat_id)
-            self._schedule_learned_save()
-
-    def _remember_dm_userid(self, chat_id: str, userid: str) -> None:
-        dm_map = getattr(self, "_dm_userid_by_chat", None)
-        if dm_map is None:
-            return
-        changed = dm_map.get(chat_id) != userid
-        bounded_put(dm_map, chat_id, userid, _LEARNED_CAP)
-        if changed:
             self._schedule_learned_save()
 
     def _schedule_learned_save(self) -> None:
@@ -108,7 +96,6 @@ class LearnedChatsMixin:
         self._learned_save_handle = None
         payload = {
             "groups": sorted(getattr(self, "_group_chat_ids", None) or ()),
-            "dm_userid": dict(getattr(self, "_dm_userid_by_chat", None) or {}),
         }
         asyncio.ensure_future(self._write_learned_chats(payload, self._learned_chats_path()))
 

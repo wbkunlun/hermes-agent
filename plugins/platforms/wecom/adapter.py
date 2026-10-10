@@ -43,7 +43,6 @@ from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, s
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.learned_chats import LearnedChatsMixin
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
-from plugins.platforms.wecom.callback_adapter import _split_markdown_bytes
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
     STREAM_NOT_SUBSCRIBED_ERRCODE, MAX_STREAM_CONTENT_LENGTH,
@@ -76,7 +75,6 @@ MAX_MESSAGE_LENGTH = 4000
 # BYTES (server-side), like stream frames — the old [:4000] CHAR slice shipped
 # 12KB CJK frames whole and the server rejected them. 4000 chars of ASCII stays
 # one segment; CJK splits at ≤4096 bytes.
-# 与 callback 渠道 MARKDOWN_MAX_BYTES=4096 同值——两渠道上限独立演进，改一处勿忘另一处。
 AIBOT_MARKDOWN_MAX_BYTES = 4096
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
@@ -236,13 +234,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
         self._stream_turns: Dict[str, StreamTurn] = {}
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups: passive reply first, proactive aibot_send_msg fallback (fork 2026-10-06)
-        # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id; and the
-        # DM chatid→userid map (wohR-style chat ids learned from inbound senders) so agent-fallback
-        # can resolve a self-built-app touser. The learned classification persists to
-        # wecom_learned_chats.json (fork 2026-10-08, see learned_chats.py); the pending queue stays
-        # in-memory by design (TTL/时效语义).
+        # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id.
+        # The learned classification persists to wecom_learned_chats.json (fork 2026-10-08, see
+        # learned_chats.py); the pending queue stays in-memory by design (TTL/时效语义).
         self._pending_group_sends: Dict[str, List[Tuple[float, str]]] = {}
-        self._dm_userid_by_chat: Dict[str, str] = {}
         # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
         # their group semantics and scheduled pushes take the DM branch — 2026-10-08 incident).
         self._learned_save_handle = None
@@ -273,7 +268,6 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             self._listen_task, self._heartbeat_task = asyncio.create_task(self._listen_loop()), asyncio.create_task(self._heartbeat_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             self._wire_plugin_handlers(None)  # ctx.register_platform_handler hooks
-            _warn_if_agent_fallback_unconfigured()
             return True
         except Exception as exc:
             self._set_fatal_error("wecom_connect_error", f"WeCom startup failed: {exc}", retryable=True)
@@ -818,12 +812,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return
         # Post-policy: cache req_id so sends can fall back to passive reply (required in groups).
         self._remember_chat_req_id(chat_id, req_id)
-        # fork: learn the DM touser (wohR-style chat ids carry the userid only on the sender), then
-        # flush any pending group redeliveries — pre-turn reply frames on a fresh req_id are legal
-        # (welcome + approval-prompt precedents), and this runs before the text-batch/turn so the
-        # redelivery is ordered ahead of the reply on the same per-chat normal lane.
-        if not is_group and sender_id and sender_id != chat_id:
-            self._remember_dm_userid(chat_id, sender_id)  # fork 2026-10-08: learn AND persist the fallback touser
+        # fork: flush any pending group redeliveries — pre-turn reply frames on a fresh req_id are
+        # legal (welcome + approval-prompt precedents), and this runs before the text-batch/turn so
+        # the redelivery is ordered ahead of the reply on the same per-chat normal lane.
         if self._pending_group_sends.get(chat_id):
             self._flush_group_pending(chat_id)
         text, reply_text = self._extract_text(body)
@@ -1244,71 +1235,19 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                         raise
                     response = await self._send_proactive_markdown(chat_id, content)
         except asyncio.TimeoutError:
-            fb = await self._try_agent_fallback(chat_id, content, "bot send timeout")
-            if fb is not None:
-                return fb
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
             logger.error("[%s] Send failed: %s", self.name, exc)
-            return await self._fail_or_fallback(chat_id, content, str(exc), str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(exc))
+            return self._send_failure(str(exc), str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(exc))
         if error := self._response_error(response):
-            return await self._fail_or_fallback(chat_id, content, error, response.get("errcode", 0) == STREAM_NOT_SUBSCRIBED_ERRCODE)
+            return self._send_failure(error, response.get("errcode", 0) == STREAM_NOT_SUBSCRIBED_ERRCODE)
         return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
-
-
-    async def _fail_or_fallback(self, chat_id: str, content: str, error: str, subscription_lost: bool) -> SendResult:
-        """fork: on a bot-delivery failure try the self-built-app agent channel (DM only)
-        before failing; otherwise the upstream failure path (846609 schedules the
-        stale-req_id purge so later sends recover)."""
-        fb = await self._try_agent_fallback(chat_id, content, f"bot send failed: {error}")
-        if fb is not None:
-            return fb
-        return self._send_failure(error, subscription_lost)
 
     def _send_failure(self, error: str, subscription_lost: bool) -> SendResult:
         """Failed SendResult; on 846609 schedule the stale-req_id purge so later sends recover."""
         if subscription_lost:
             asyncio.ensure_future(self._force_reconnect_on_stale_subscription(STREAM_NOT_SUBSCRIBED_ERRCODE))
         return SendResult(success=False, error=error)
-
-    async def _try_agent_fallback(
-        self, chat_id: str, content: str, reason: str,
-    ) -> Optional[SendResult]:
-        """Bot delivery failed → try the self-built-app channel (DM only).
-
-        Enabled iff WECOM_CALLBACK_{CORP_ID,CORP_SECRET,AGENT_ID} are set and
-        WECOM_AGENT_FALLBACK is not an explicit off value (see
-        ``_agent_fallback_client``).  Group chats never fall back — the aibot
-        group chat_id is not a valid self-built-app touser (documented
-        limitation; groups fall back to proactive aibot_send_msg instead,
-        fork 2026-10-06).  DM chat ids that ARE
-        the corp userid go through unchanged; wohR-style DM room ids resolve
-        via ``_dm_userid_by_chat`` (in-memory, learned from inbound senders —
-        an unknown id after a restart falls back to the raw chat_id).
-        """
-        if self._is_group_chat(chat_id):
-            return None
-        client = _agent_fallback_client()
-        if client is None:
-            return None
-        touser = (getattr(self, "_dm_userid_by_chat", None) or {}).get(chat_id, chat_id)
-        try:
-            ok, err = await client.send_markdown(touser, content)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] agent fallback raised after bot failure (%s): %s",
-                           self.name, reason, exc)
-            return None
-        if not ok:
-            logger.warning("[%s] agent fallback failed after bot failure (%s): %s",
-                           self.name, reason, err)
-            return None
-        logger.info("[%s] delivered via agent fallback (bot failure: %s)", self.name, reason)
-        return SendResult(
-            success=True,
-            message_id=f"agent-fallback:{uuid.uuid4().hex[:8]}",
-            raw_response={"agent_fallback": True, "reason": reason},
-        )
-
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm"}
@@ -1393,66 +1332,43 @@ async def _send_via(adapter, chat_id, message, *, live: bool):
     return send_error(f"WeCom send failed: {result.error}")
 
 
-_AGENT_FALLBACK_OFF_VALUES = {"0", "false", "off", "no"}
-_agent_fallback_client_cache: Dict[str, Any] = {"env": None, "client": None}
-
-
-def _warn_if_agent_fallback_unconfigured() -> None:
-    """fork (audit 2026-09-29 module-1 M1.5): a WARNING on each successful connect
-    (startup, reconnects, ephemeral standalone connects) when the DM fallback channel
-    is missing its env — the 846609 DM-loss incident had this as its silent half."""
-    import os as _os
-
-    if _os.getenv("WECOM_AGENT_FALLBACK", "").strip().lower() in _AGENT_FALLBACK_OFF_VALUES:
-        return
-    missing = [
-        name
-        for name, value in (
-            ("WECOM_CALLBACK_CORP_ID", _os.getenv("WECOM_CALLBACK_CORP_ID", "").strip()),
-            ("WECOM_CALLBACK_CORP_SECRET", _os.getenv("WECOM_CALLBACK_CORP_SECRET", "").strip()),
-            ("WECOM_CALLBACK_AGENT_ID", _os.getenv("WECOM_CALLBACK_AGENT_ID", "").strip()),
-        )
-        if not value
-    ]
-    if missing:
-        logger.warning(
-            "[wecom] agent-fallback disabled: missing env %s — if the bot channel fails "
-            "(846609) DMs have no self-built-app fallback and will be lost. Set "
-            "WECOM_AGENT_FALLBACK=off to silence this when intentional.",
-            ", ".join(missing),
-        )
-
-
 def _markdown_segments(content: str) -> list:
     """Byte-accurate markdown segments for aibot reply/proactive frames."""
     return _split_markdown_bytes(str(content or ""), max_bytes=AIBOT_MARKDOWN_MAX_BYTES)
 
 
-def _agent_fallback_client() -> Optional[Any]:
-    """Build (and memoise per env tuple) the Bot→Agent fallback client.
+def _split_markdown_bytes(content: str, max_bytes: int) -> List[str]:
+    """Split markdown into ≤max_bytes UTF-8 segments, preferring line breaks.
 
-    Enabled iff WECOM_CALLBACK_{CORP_ID,CORP_SECRET,AGENT_ID} are all set and
-    WECOM_AGENT_FALLBACK is not an explicit off value.  Mirrors the official
-    wecom-openclaw-plugin's Bot-first / Agent-fallback delivery: when the
-    Smart-Robot channel cannot deliver, route markdown through the
-    self-built-app message/send API instead.
+    Kept for the aibot stream/proactive frames path (adapter._markdown_segments,
+    v2026.10.6-fork1 生产观察线 — errcode 6000 归因不混入新分段实现);
+    send()/send_markdown() 已换轨上游 truncate_message+send_chunks (resync 2026-10-07).
+    Moved here from the deleted callback_adapter (fork 2026-10-10: WECOM_CALLBACK_
+    capability removed — no self-built-app fallback/channel in this deployment family).
     """
-    import os as _os
-
-    if _os.getenv("WECOM_AGENT_FALLBACK", "").strip().lower() in _AGENT_FALLBACK_OFF_VALUES:
-        return None
-    env = (
-        _os.getenv("WECOM_CALLBACK_CORP_ID", "").strip(),
-        _os.getenv("WECOM_CALLBACK_CORP_SECRET", "").strip(),
-        _os.getenv("WECOM_CALLBACK_AGENT_ID", "").strip(),
-    )
-    if not all(env):
-        return None
-    if _agent_fallback_client_cache["env"] != env:
-        from plugins.platforms.wecom.callback_adapter import WecomAgentFallbackClient
-        _agent_fallback_client_cache["env"] = env
-        _agent_fallback_client_cache["client"] = WecomAgentFallbackClient(*env)
-    return _agent_fallback_client_cache["client"]
+    if not content:
+        return []
+    if len(content.encode("utf-8")) <= max_bytes:
+        return [content]
+    segments: List[str] = []
+    current = ""
+    for line in content.splitlines(keepends=True):
+        while len(line.encode("utf-8")) > max_bytes:  # pathological no-newline line
+            if current:  # 硬切前先冲刷已累积行，保住内容顺序（audit 2026-09-29 module-1 H1 addendum）
+                segments.append(current)
+                current = ""
+            cut = max_bytes
+            while len(line[:cut].encode("utf-8")) > max_bytes:
+                cut -= 1
+            segments.append(line[:cut])
+            line = line[cut:]
+        if current and len((current + line).encode("utf-8")) > max_bytes:
+            segments.append(current)
+            current = ""
+        current += line
+    if current:
+        segments.append(current)
+    return segments
 
 
 def _consume_cross_loop_result(future) -> None:
@@ -1589,30 +1505,6 @@ async def _standalone_send(
             # original error; the caller may retry.
             return {"error": _live_error or "WeCom send failed: no reachable gateway loop"}
 
-    # Agent-channel fallback BEFORE any ephemeral WebSocket: an ephemeral
-    # subscribe displaces the gateway's sole WS session (errcode 846609),
-    # while the self-built-app message/send API has no such constraint.
-    # DM-only in practice — group chat ids are not valid touser values and
-    # fail server-side, falling through to the ephemeral path below.
-    _fb = _agent_fallback_client()
-    if _fb is not None:
-        try:
-            _fb_ok, _fb_err = await _fb.send_markdown(chat_id, message)
-        except Exception as _fb_exc:  # noqa: BLE001
-            _fb_ok, _fb_err = False, str(_fb_exc)
-        if _fb_ok:
-            return {
-                "success": True,
-                "platform": "wecom",
-                "chat_id": chat_id,
-                "message_id": None,
-                "via": "agent_fallback",
-            }
-        logger.debug(
-            "[wecom] standalone_send: agent fallback failed (%s), trying ephemeral WS",
-            _fb_err,
-        )
-
     if not check_wecom_requirements():
         return send_error("WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET.")
     try:
@@ -1706,20 +1598,12 @@ def _is_connected(config) -> bool:
     return bool((getattr(config, "extra", {}) or {}).get("bot_id"))
 
 
-def _callback_is_connected(config) -> bool:
-    """Callback mode: corp_id or a multi-app `apps` block."""
-    extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("corp_id") or extra.get("apps"))
-
-
-
-def _build_callback_adapter(config):
-    from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
-    return WecomCallbackAdapter(config)
-
-
 def register(ctx) -> None:
-    """Plugin entry point — registers both WeCom platforms."""
+    """Plugin entry point — registers the WeCom Smart-Robot platform.
+
+    (fork 2026-10-10: the wecom_callback self-built-app platform and the Bot→Agent
+    WECOM_CALLBACK_* fallback were removed — this deployment family has no fallback
+    interface; dead surface only produced misleading setup prompts and warnings.)"""
     # wecom-cli business tools (docs/sheets/calendar/todo/mail/contact/…).
     # Registered first so they exist even when the WS platform never
     # materialises; discovery also pre-registers them via provides_tools.
@@ -1735,12 +1619,4 @@ def register(ctx) -> None:
         is_connected=_is_connected, validate_config=_is_connected, required_env=["WECOM_BOT_ID", "WECOM_SECRET"],
         setup_fn=interactive_setup, allowed_users_env="WECOM_ALLOWED_USERS", allow_all_env="WECOM_ALLOW_ALL_USERS",
         cron_deliver_env_var="WECOM_HOME_CHANNEL", standalone_sender_fn=_standalone_send, max_message_length=4000, **common,
-    )
-    from plugins.platforms.wecom.callback_adapter import check_wecom_callback_requirements, ensure_wecom_callback_requirements
-    ctx.register_platform(
-        name="wecom_callback", label="WeCom Callback (self-built apps)", adapter_factory=_build_callback_adapter,
-        check_fn=check_wecom_callback_requirements, ensure_deps_fn=ensure_wecom_callback_requirements,
-        is_connected=_callback_is_connected, validate_config=_callback_is_connected,
-        required_env=["WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET"],
-        allowed_users_env="WECOM_CALLBACK_ALLOWED_USERS", allow_all_env="WECOM_CALLBACK_ALLOW_ALL_USERS", **common,
     )

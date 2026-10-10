@@ -234,7 +234,6 @@ class Platform(Enum):
     MSGRAPH_WEBHOOK = "msgraph_webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
-    WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
@@ -305,7 +304,7 @@ _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.value
 # profile's port-binder is built in shared-listener mode and served at /p/<profile>/<path> on the
 # default's listener (gateway/platforms/shared_ingress.py); api_server/webhook are mirrored there.
 PORT_BINDING_PLATFORM_VALUES = frozenset({
-    "webhook", "api_server", "msgraph_webhook", "feishu", "wecom_callback",
+    "webhook", "api_server", "msgraph_webhook", "feishu",
     "bluebubbles", "sms", "whatsapp_cloud", "line", "teams",
 })
 # Platforms that only bind in one connection mode (Feishu's default websocket mode is outbound).

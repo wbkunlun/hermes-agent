@@ -365,7 +365,6 @@ def test_send_message_registered_and_narrow_to_wecom() -> None:
 
     assert registry.get_entry("send_message") is not None, "send_message must be registered"
     assert "send_message" in resolve_toolset("hermes-wecom")
-    assert "send_message" in resolve_toolset("hermes-wecom-callback")
     # narrow scope: not bolted onto every platform
     assert "send_message" not in resolve_toolset("hermes-telegram")
 

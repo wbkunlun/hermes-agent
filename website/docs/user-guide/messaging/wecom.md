@@ -276,10 +276,6 @@ docker exec -it <gateway> wecom-cli auth show
 
 `--manual` (Bot ID + Secret) is also supported but only unlocks bot-messaging capability, not docs/calendar/mail — prefer the QR member authorization.
 
-### Bot → self-built-app delivery fallback
-
-When `WECOM_CALLBACK_CORP_ID` / `WECOM_CALLBACK_CORP_SECRET` / `WECOM_CALLBACK_AGENT_ID` are set (i.e. the `wecom_callback` platform is configured) and `WECOM_AGENT_FALLBACK` is not `0`, delivery failures on the Smart-Robot channel — expired req_id, rate limits, standalone cron with no reachable gateway loop — fall back to the self-built-app `message/send` API (markdown). DM only; group replies still require the passive req_id path. This also removes the ephemeral-WebSocket kick risk (errcode 846609) for out-of-process cron sends.
-
 ## Reply-Mode Responses
 
 When the bot receives a message via the WeCom callback, the adapter remembers the inbound request ID. If a response is sent while the request context is still active, the adapter uses WeCom's reply-mode (`aibot_respond_msg`) to correlate the response directly to the inbound message. This provides a more natural conversation experience in the WeCom client.
@@ -329,7 +325,6 @@ Inbound messages are deduplicated using message IDs with a 5-minute window and a
 | `WECOM_GROUP_POLICY` | — | `pairing` | Group access policy |
 | `WECOM_CLI_BIN` | — | `wecom-cli` | Path to the wecom-cli binary (business tools) |
 | `HERMES_WECOM_CLI_TIMEOUT` | — | `60` | Per-call wecom-cli subprocess timeout (seconds) |
-| `WECOM_AGENT_FALLBACK` | — | _(enabled)_ | Set `0`/`false`/`off` to disable Bot→self-built-app delivery fallback |
 
 ## Troubleshooting
 

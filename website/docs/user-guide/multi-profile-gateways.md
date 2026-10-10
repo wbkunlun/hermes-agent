@@ -492,7 +492,6 @@ profile that has no adapter for a path gets `404`, never another profile's bot.
 | BlueBubbles (`bluebubbles`) | `http://<host>/p/<profile>/bluebubbles-webhook` (registered with the server automatically) | `BLUEBUBBLES_PASSWORD` |
 | Microsoft Graph (`msgraph_webhook`) | `https://<host>/p/<profile>/msgraph/webhook` | `extra.client_state` |
 | WhatsApp Cloud (`whatsapp_cloud`) | `https://<host>/p/<profile>/whatsapp/webhook` | `WHATSAPP_CLOUD_APP_SECRET` / verify token |
-| WeCom callback (`wecom_callback`) | `https://<host>/p/<profile>/wecom/callback` | the app's callback token / AES key |
 | Feishu webhook mode (`feishu`) | `https://<host>/p/<profile>/feishu/webhook` | `FEISHU_VERIFICATION_TOKEN` / `FEISHU_ENCRYPT_KEY` |
 
 `<host>` is the public hostname (tunnel, reverse proxy) in front of the default

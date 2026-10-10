@@ -840,5 +840,4 @@ async def disconnect(self):
 |---------|---------|------------|-------------------|
 | `bluebubbles.py` | REST + webhook | Medium | Simple REST API integration |
 | `weixin.py` | Long-poll + CDN | High | Media handling, encryption |
-| `plugins/platforms/wecom/callback_adapter.py` | Callback/webhook | Medium | HTTP server, AES crypto, multi-app |
 | `plugins/platforms/irc/adapter.py` | Long-poll + IRC protocol | High | Full-featured plugin adapter with scoped token lock |

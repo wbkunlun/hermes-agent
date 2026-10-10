@@ -30,7 +30,7 @@ logger = logging.getLogger("cron.scheduler")
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "dingtalk", "feishu",
-    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
+    "wecom", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao"})
 
 # Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response

@@ -233,7 +233,6 @@ TOOLSETS = {
     # fork: extras=["send_message"] — the agent may notify a specific WeCom user
     # on request (tool registered in tools/send_message_tool.py, WeCom-scoped).
     "hermes-wecom": _bundle("WeCom bot toolset - enterprise WeChat messaging (full access)", ["send_message"]),
-    "hermes-wecom-callback": _bundle("WeCom callback toolset - enterprise self-built app messaging (full access)", ["send_message"]),
     "hermes-yuanbao": {
         "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
         "tools": _HERMES_CORE_TOOLS + _YUANBAO_TOOLS,
@@ -249,7 +248,7 @@ TOOLSETS = {
             "hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack",
             "hermes-signal", "hermes-bluebubbles", "hermes-email",
             "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk",
-            "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin",
+            "hermes-feishu", "hermes-wecom", "hermes-weixin",
             "hermes-qqbot", "hermes-webhook", "hermes-yuanbao",
         ],
     ),

@@ -4,9 +4,8 @@ Mirrors the a2a deferred client-tools pattern: ``plugin.yaml`` declares
 ``provides_tools`` so PluginManager imports this module and calls
 ``register_tools(ctx)``; the wecom ``register(ctx)`` in ``adapter.py`` calls
 it too when the platform materialises.  Every tool lands in toolset
-``"wecom"`` and therefore auto-joins the ``hermes-wecom`` /
-``hermes-wecom-callback`` toolsets (tools/toolsets.py ``resolve_toolset``) —
-zero core edits.
+``"wecom"`` and therefore auto-joins the ``hermes-wecom`` toolset
+(tools/toolsets.py ``resolve_toolset``) — zero core edits.
 
 Tool surface (16):
   base    — wecom_cli_status / wecom_cli_schema / wecom_cli (generic passthrough)
@@ -81,6 +80,18 @@ def cli_tools_available() -> bool:
             ok = False
     _probe_state["ok"] = ok
     return ok
+
+
+def wecom_platform_configured() -> bool:
+    """``check_fn`` for ``wecom_message_push`` — the push tool sends over the
+    gateway's live connection and never touches the CLI, so its gate is the
+    WeCom platform env (fork 2026-10-10: the image no longer ships wecom-cli;
+    the 15 CLI-gated tools stay hidden, the push tool must not hide with them)."""
+    try:
+        from plugins.platforms.wecom.adapter import check_wecom_requirements
+        return check_wecom_requirements()
+    except Exception:  # noqa: BLE001 — probe must never raise
+        return False
 
 
 # ---------------------------------------------------------------- helpers
@@ -351,7 +362,7 @@ def register_tools(ctx) -> None:
         handler=_handler_message_push,
         description=_MESSAGE_PUSH_SCHEMA["description"],
         emoji="💼",
-        check_fn=cli_tools_available,
+        check_fn=wecom_platform_configured,
         is_async=True,
     )
     for spec in CURATED_TOOLS:

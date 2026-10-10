@@ -115,7 +115,7 @@ _TERMINAL_ENV_ROWS = {
 # Labels for built-in adapters without a platform-registry entry; registry entries bring their own.
 _PLATFORM_LABELS = {"telegram": "Telegram", "discord": "Discord", "whatsapp": "WhatsApp", "signal": "Signal",
                     "slack": "Slack", "email": "Email", "sms": "SMS", "dingtalk": "DingTalk", "feishu": "Feishu",
-                    "wecom": "WeCom", "wecom_callback": "WeCom Callback", "weixin": "Weixin",
+                    "wecom": "WeCom", "weixin": "Weixin",
                     "bluebubbles": "BlueBubbles", "qqbot": "QQBot", "yuanbao": "Yuanbao"}
 
 # Gateway manager label when the runtime snapshot is unavailable, keyed by platform.

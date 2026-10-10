@@ -363,7 +363,6 @@ MATRIX_ALLOWED_USERS=@alice:matrix.org
 DINGTALK_ALLOWED_USERS=user-id-1
 FEISHU_ALLOWED_USERS=ou_xxxxxxxx,ou_yyyyyyyy
 WECOM_ALLOWED_USERS=user-id-1,user-id-2
-WECOM_CALLBACK_ALLOWED_USERS=user-id-1,user-id-2
 TEAMS_ALLOWED_USERS=aad-object-id-1,aad-object-id-2
 
 # Or allow
@@ -739,7 +738,6 @@ Each platform has its own toolset:
 | DingTalk | `hermes-dingtalk` | Full tools including terminal |
 | Feishu/Lark | `hermes-feishu` | Full tools including terminal |
 | WeCom | `hermes-wecom` | Full tools including terminal |
-| WeCom Callback | `hermes-wecom-callback` | Full tools including terminal |
 | Weixin | `hermes-weixin` | Full tools including terminal |
 | BlueBubbles | `hermes-bluebubbles` | Full tools including terminal |
 | QQBot | `hermes-qqbot` | Full tools including terminal |

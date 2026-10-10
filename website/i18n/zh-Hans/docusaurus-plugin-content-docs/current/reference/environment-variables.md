@@ -345,15 +345,6 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `WECOM_WEBSOCKET_URL` | 自定义 WebSocket URL（默认：`wss://openws.work.weixin.qq.com`） |
 | `WECOM_ALLOWED_USERS` | 允许向 bot 发送消息的逗号分隔企业微信用户 ID |
 | `WECOM_HOME_CHANNEL` | cron 投递和通知的企业微信聊天 ID |
-| `WECOM_CALLBACK_CORP_ID` | 企业微信回调自建应用的企业 Corp ID |
-| `WECOM_CALLBACK_CORP_SECRET` | 自建应用的企业密钥 |
-| `WECOM_CALLBACK_AGENT_ID` | 自建应用的 Agent ID |
-| `WECOM_CALLBACK_TOKEN` | 回调验证 token |
-| `WECOM_CALLBACK_ENCODING_AES_KEY` | 回调加密的 AES 密钥 |
-| `WECOM_CALLBACK_HOST` | 回调服务器绑定地址（默认：`0.0.0.0`） |
-| `WECOM_CALLBACK_PORT` | 回调服务器端口（默认：`8645`） |
-| `WECOM_CALLBACK_ALLOWED_USERS` | 白名单的逗号分隔用户 ID |
-| `WECOM_CALLBACK_ALLOW_ALL_USERS` | 设为 `true` 可无需白名单允许所有用户 |
 | `WEIXIN_ACCOUNT_ID` | 通过 iLink Bot API 扫码登录获取的微信账号 ID |
 | `WEIXIN_TOKEN` | 通过 iLink Bot API 扫码登录获取的微信认证 token |
 | `WEIXIN_BASE_URL` | 覆盖微信 iLink Bot API base URL（默认：`https://ilinkai.weixin.qq.com`） |

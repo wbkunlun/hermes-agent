@@ -114,7 +114,6 @@ Platform toolsets define the complete tool configuration for a deployment target
 | `hermes-feishu` | Adds the five `feishu_doc_*` / `feishu_drive_*` tools (only used by the document-comment handler, not the regular chat adapter). |
 | `hermes-qqbot` | Same as `hermes-cli`. |
 | `hermes-wecom` | Same as `hermes-cli`. |
-| `hermes-wecom-callback` | Same as `hermes-cli`. |
 | `hermes-weixin` | Same as `hermes-cli`. |
 | `hermes-yuanbao` | Adds the five `yb_*` tools (DM/group/sticker) on top of `hermes-cli`. |
 | `hermes-webhook` | Restricted safe subset — only `web_search`, `web_extract`, `vision_analyze`, and `clarify`. Webhook-triggered runs get no terminal, file, or browser access. |

@@ -49,7 +49,6 @@ _ENV_ENABLE_CREDENTIALS: dict = {
     Platform.DINGTALK: ("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"),
     Platform.FEISHU: ("FEISHU_APP_ID", "FEISHU_APP_SECRET"),
     Platform.WECOM: ("WECOM_BOT_ID", "WECOM_SECRET"),
-    Platform.WECOM_CALLBACK: ("WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET"),
     Platform.WEIXIN: ("WEIXIN_TOKEN", "WEIXIN_ACCOUNT_ID"),
     Platform.BLUEBUBBLES: ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD"),
     Platform.QQBOT: ("QQ_APP_ID", "QQ_CLIENT_SECRET"),
@@ -583,16 +582,6 @@ _ENV_STEPS: tuple = (
         fixed=(("bot_id", "WECOM_BOT_ID"), ("secret", "WECOM_SECRET")),
         optional=(("websocket_url", "WECOM_WEBSOCKET_URL"),),
         home="WECOM_HOME_CHANNEL",
-    ),
-    _Cred(
-        Platform.WECOM_CALLBACK, ("WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET"),
-        fixed=(
-            ("corp_id", "WECOM_CALLBACK_CORP_ID"), ("corp_secret", "WECOM_CALLBACK_CORP_SECRET"),
-            ("agent_id", "WECOM_CALLBACK_AGENT_ID"), ("token", "WECOM_CALLBACK_TOKEN"),
-            ("encoding_aes_key", "WECOM_CALLBACK_ENCODING_AES_KEY"),
-            # No host default: falsy extra.host lets the adapter's dual-stack DEFAULT_HOST=None bind v4+v6.
-            ("host", "WECOM_CALLBACK_HOST"), ("port", "WECOM_CALLBACK_PORT", "", _int_or(8645)),
-        ),
     ),
     # Weixin (personal WeChat via iLink Bot API)
     _Cred(

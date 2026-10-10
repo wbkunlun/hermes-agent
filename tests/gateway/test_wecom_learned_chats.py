@@ -82,22 +82,6 @@ class TestLearnedChatsPersistence:
             assert fresh._is_group_chat("wrhR9") is True
 
     @pytest.mark.asyncio
-    async def test_dm_userid_map_persists(self, tmp_path):
-        import plugins.platforms.wecom.learned_chats as learned_chats
-
-        cache = tmp_path / "wecom_learned_chats.json"
-        with patch.object(learned_chats, "LEARNED_CHATS_PATH", cache):
-            adapter = _adapter()
-            adapter._is_dm_intake_allowed = lambda sender_id: True
-            await adapter._on_message(_dm_payload("wohR123"))
-            assert adapter._dm_userid_by_chat.get("wohR123") == "zhangsan"
-            await _settle_debounce()
-            assert cache.exists()
-
-            fresh = _adapter()
-            assert fresh._dm_userid_by_chat.get("wohR123") == "zhangsan"
-
-    @pytest.mark.asyncio
     async def test_corrupt_file_degrades_to_empty(self, tmp_path):
         import plugins.platforms.wecom.learned_chats as learned_chats
 
@@ -106,7 +90,6 @@ class TestLearnedChatsPersistence:
         with patch.object(learned_chats, "LEARNED_CHATS_PATH", cache):
             adapter = _adapter()  # must not raise
         assert adapter._group_chat_ids == set()
-        assert adapter._dm_userid_by_chat == {}
 
     @pytest.mark.asyncio
     async def test_env_off_writes_nothing(self, tmp_path, monkeypatch):

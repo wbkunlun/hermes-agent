@@ -201,7 +201,6 @@ MATRIX_ALLOWED_USERS=@alice:matrix.org
 DINGTALK_ALLOWED_USERS=user-id-1
 FEISHU_ALLOWED_USERS=ou_xxxxxxxx,ou_yyyyyyyy
 WECOM_ALLOWED_USERS=user-id-1,user-id-2
-WECOM_CALLBACK_ALLOWED_USERS=user-id-1,user-id-2
 TEAMS_ALLOWED_USERS=aad-object-id-1,aad-object-id-2
 
 # 或允许
@@ -440,7 +439,6 @@ launchd plist 是静态的——如果你在配置网关后安装了新工具（
 | DingTalk | `hermes-dingtalk` | 完整工具，包括终端 |
 | Feishu/Lark | `hermes-feishu` | 完整工具，包括终端 |
 | WeCom | `hermes-wecom` | 完整工具，包括终端 |
-| WeCom Callback | `hermes-wecom-callback` | 完整工具，包括终端 |
 | Weixin | `hermes-weixin` | 完整工具，包括终端 |
 | BlueBubbles | `hermes-bluebubbles` | 完整工具，包括终端 |
 | QQBot | `hermes-qqbot` | 完整工具，包括终端 |

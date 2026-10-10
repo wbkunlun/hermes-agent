@@ -106,17 +106,6 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         "docs_url": "https://developer.work.weixin.qq.com/document/path/91770",
         "env_vars": ("WECOM_BOT_ID", "WECOM_SECRET"), "required_env": ("WECOM_BOT_ID",),
     },
-    "wecom_callback": {
-        "name": "WeCom (app)", "description": "Two-way WeCom integration via callback app.",
-        "docs_url": "https://developer.work.weixin.qq.com/document/path/90930",
-        "env_vars": (
-            "WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET", "WECOM_CALLBACK_AGENT_ID",
-            "WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_ENCODING_AES_KEY",
-        ),
-        "required_env": (
-            "WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET", "WECOM_CALLBACK_AGENT_ID",
-        ),
-    },
     "weixin": {
         "name": "Weixin / WeChat (Personal)",
         "description": "Connect a personal WeChat account through Tencent's iLink Bot API.",
@@ -215,7 +204,7 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
 # the end alphabetically.
 _PLATFORM_ORDER: tuple[str, ...] = (
     "telegram", "discord", "slack", "mattermost", "matrix", "whatsapp", "signal", "bluebubbles",
-    "email", "sms", "dingtalk", "feishu", "google_chat", "wecom", "wecom_callback",
+    "email", "sms", "dingtalk", "feishu", "google_chat", "wecom",
     "weixin", "qqbot", "yuanbao", "api_server", "webhook",
 )
 

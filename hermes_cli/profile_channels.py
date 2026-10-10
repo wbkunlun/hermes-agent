@@ -300,7 +300,7 @@ class ChannelKeyIndex:
         self._prefixes: List[Tuple[str, str]] = sorted(
             ((prefix, pid) for pid in self.platforms
              for prefix in dict.fromkeys((*platform_env_prefixes(pid), *self.shared.get(pid, ())))),
-            key=lambda item: -len(item[0]),  # longest prefix wins: WECOM_CALLBACK_ before WECOM_
+            key=lambda item: -len(item[0]),  # longest prefix wins: WHATSAPP_CLOUD_ before WHATSAPP_
         )
 
     def platform_for(self, key: str) -> Optional[str]:

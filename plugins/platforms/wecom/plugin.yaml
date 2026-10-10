@@ -1,16 +1,17 @@
 name: wecom-platform
 label: WeCom (Enterprise WeChat)
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
-  WeCom / Enterprise WeChat gateway adapter for Hermes Agent. Registers two
-  platforms: ``wecom`` (Smart Robot over WebSocket) and ``wecom_callback``
-  (self-built apps over an HTTP callback endpoint with AES message crypto).
-  Relays messages between WeCom chats and the Hermes agent. Also registers 16
-  business tools (docs / sheets / calendar / todo / mail / contacts / WeDrive
-  via the official wecom-cli; messaging via the gateway's own connection —
-  the CLI message family would displace the bot's single live session) when
-  the official wecom-cli is installed and authorized.
+  WeCom / Enterprise WeChat gateway adapter for Hermes Agent. Registers the
+  ``wecom`` platform (Smart Robot over WebSocket) and relays messages between
+  WeCom chats and the Hermes agent. Also registers 16 business tools (docs /
+  sheets / calendar / todo / mail / contacts / WeDrive via the official
+  wecom-cli when installed and authorized; messaging via the gateway's own
+  connection — the CLI message family would displace the bot's single live
+  session). Fork 2026-10-10: the ``wecom_callback`` self-built-app platform
+  and the WECOM_CALLBACK_* Bot→Agent fallback were removed (no fallback
+  interface in this deployment family).
 author: NousResearch
 # The wecom-cli business client tools. Declaring them here asks discovery to
 # import `tools.py` in CLI/TUI processes (same contract as the a2a plugin).
@@ -53,26 +54,6 @@ optional_env:
     description: "Comma-separated WeCom user IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
     password: false
-  - name: WECOM_CALLBACK_CORP_ID
-    description: "WeCom callback-mode corp ID (self-built apps)"
-    prompt: "WeCom callback corp ID"
-    password: false
-  - name: WECOM_CALLBACK_CORP_SECRET
-    description: "WeCom callback-mode corp secret"
-    prompt: "WeCom callback corp secret"
-    password: true
-  - name: WECOM_CALLBACK_AGENT_ID
-    description: "WeCom callback-mode agent ID"
-    prompt: "WeCom callback agent ID"
-    password: false
-  - name: WECOM_CALLBACK_TOKEN
-    description: "WeCom callback verification token"
-    prompt: "WeCom callback token"
-    password: true
-  - name: WECOM_CALLBACK_ENCODING_AES_KEY
-    description: "WeCom callback EncodingAESKey for message crypto"
-    prompt: "WeCom callback EncodingAESKey"
-    password: true
   - name: WECOM_CLI_BIN
     description: "Path to the wecom-cli binary (default: wecom-cli on PATH)"
     prompt: "wecom-cli binary path"
@@ -80,10 +61,6 @@ optional_env:
   - name: HERMES_WECOM_CLI_TIMEOUT
     description: "Per-call wecom-cli subprocess timeout in seconds (default 60)"
     prompt: "wecom-cli timeout seconds"
-    password: false
-  - name: WECOM_AGENT_FALLBACK
-    description: "Set 0/false/off to disable Bot→self-built-app delivery fallback"
-    prompt: "Disable agent fallback? (default enabled when callback env set)"
     password: false
   - name: HERMES_WECOM_GROUP_PENDING_TTL_SECONDS
     description: "TTL seconds for the group pending-redelivery queue (scheduled sends stashed until the group's next inbound message); 0 disables"

@@ -315,12 +315,6 @@ class TestAdapterWiring:
 
         assert WeComAdapter.WECOM_STREAM_DELIVERY is Cls
 
-    def test_callback_adapter_does_not_expose_delivery_class(self):
-        """The callback (self-built app) channel has no stream protocol."""
-        from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
-
-        assert getattr(WecomCallbackAdapter, "WECOM_STREAM_DELIVERY", None) is None
-
 
 class TestFinalizeDeliveryFlag:
     """The gateway suppresses its normal final send when ``final_response_sent``
