@@ -44,7 +44,7 @@ from tools.registry import tool_error, tool_result
 # ---------------------------------------------------------------- probe
 
 _PROBE_TTL_SECONDS = 60.0
-_probe_state: Dict[str, Any] = {"ts": -1e9, "ok": False}
+_probe_state: dict[str, Any] = {"ts": -1e9, "ok": False}
 
 
 def reset_cli_probe_cache() -> None:
@@ -73,10 +73,10 @@ def cli_tools_available() -> bool:
             proc = subprocess.run(
                 [cli_bin(), "auth", "show", "--status"],
                 capture_output=True, text=True, timeout=15,
-                env=subprocess_env(),
+                env=subprocess_env(), check=False,
             )
             ok = proc.returncode == 0 and (proc.stdout or "").strip() == "authorized"
-        except Exception:  # noqa: BLE001 — probe must never raise
+        except Exception:
             ok = False
     _probe_state["ok"] = ok
     return ok
@@ -90,17 +90,17 @@ def wecom_platform_configured() -> bool:
     try:
         from plugins.platforms.wecom.adapter import check_wecom_requirements
         return check_wecom_requirements()
-    except Exception:  # noqa: BLE001 — probe must never raise
+    except Exception:
         return False
 
 
 # ---------------------------------------------------------------- helpers
 
 async def _run_and_format(
-    service_path: Tuple[str, ...],
+    service_path: tuple[str, ...],
     method: Optional[str] = None,
-    args: Optional[Dict[str, Any]] = None,
-    extra_argv: Optional[List[str]] = None,
+    args: Optional[dict[str, Any]] = None,
+    extra_argv: Optional[list[str]] = None,
     bare: bool = False,
 ) -> str:
     """Run wecom-cli off the event loop; format result for the model."""
@@ -133,7 +133,7 @@ async def _run_and_format(
 _SESSION_TAKEOVER_SERVICES = frozenset({"message"})
 
 
-async def _handler_status(args: Dict[str, Any]) -> str:
+async def _handler_status(args: dict[str, Any]) -> str:
     version = await _run_and_format((), extra_argv=["--version"], bare=True)
     auth = await _run_and_format(("auth",), "show")
     return tool_result({
@@ -143,14 +143,14 @@ async def _handler_status(args: Dict[str, Any]) -> str:
     })
 
 
-async def _handler_schema(args: Dict[str, Any]) -> str:
+async def _handler_schema(args: dict[str, Any]) -> str:
     target = str(args.get("target") or "").strip()
     if target:
         return await _run_and_format(("schema",), "get", extra_argv=[target])
     return await _run_and_format(("schema",), "list")
 
 
-async def _handler_generic(args: Dict[str, Any]) -> str:
+async def _handler_generic(args: dict[str, Any]) -> str:
     raw_path = args.get("service_path") or []
     if not isinstance(raw_path, list):
         return tool_error("service_path must be an array of segments")
@@ -179,7 +179,7 @@ _ARGS_OBJECT_SCHEMA = {
     "additionalProperties": True,
 }
 
-CURATED_TOOLS: List[Dict[str, Any]] = [
+CURATED_TOOLS: list[dict[str, Any]] = [
     {"name": "wecom_doc_create", "cli": ("doc",), "method": "create",
      "description": "Create a WeCom online document (doc create)."},
     {"name": "wecom_doc_read", "cli": ("doc",), "method": "get",
@@ -207,8 +207,8 @@ CURATED_TOOLS: List[Dict[str, Any]] = [
 ]
 
 
-def _curated_handler(cli_path: Tuple[str, ...], method: str):
-    async def _handler(args: Dict[str, Any], **kwargs) -> str:
+def _curated_handler(cli_path: tuple[str, ...], method: str):
+    async def _handler(args: dict[str, Any], **kwargs) -> str:
         payload = args.get("args")
         if payload is not None and not isinstance(payload, dict):
             return tool_error("args must be an object")
@@ -216,7 +216,7 @@ def _curated_handler(cli_path: Tuple[str, ...], method: str):
     return _handler
 
 
-_BASE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+_BASE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "wecom_cli_status": {
         "name": "wecom_cli_status",
         "description": "WeCom CLI health check: binary version and auth status (authorized/unauthorized).",
@@ -286,7 +286,7 @@ _MESSAGE_PUSH_SCHEMA = {
 }
 
 
-async def _handler_message_push(args: Dict[str, Any]) -> str:
+async def _handler_message_push(args: dict[str, Any]) -> str:
     """Send over the gateway's in-process WeCom adapter — never via wecom-cli.
 
     The CLI ``message`` family opens a competing bot session server-side and
@@ -302,7 +302,7 @@ async def _handler_message_push(args: Dict[str, Any]) -> str:
         from gateway.config import Platform
         from tools.send_message_senders import _live_adapter
         _runner, live = _live_adapter(Platform.WECOM)
-    except Exception:  # noqa: BLE001 — no gateway in this process (CLI/TUI agent)
+    except Exception:
         live = None
     if live is None:
         return tool_error(
@@ -313,7 +313,7 @@ async def _handler_message_push(args: Dict[str, Any]) -> str:
         )
     try:
         result = await live.send(chat_id, content)
-    except Exception as exc:  # noqa: BLE001 — surface every failure to the model
+    except Exception as exc:
         return tool_error(f"wecom_message_push failed: {exc}")
     if getattr(result, "success", False):
         return tool_result({

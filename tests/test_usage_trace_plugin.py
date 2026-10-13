@@ -231,7 +231,7 @@ class TestApiRequest:
         )
         plugin._drain_now()
         evs = _lines(plugin, tmp_path, "s1")
-        api = [e for e in evs if e["event"] == "api_request"][0]
+        api = next(e for e in evs if e["event"] == "api_request")
         assert api["model"] == "glm-5.3"          # response_model wins
         assert api["duration_ms"] == 1500.0
         assert api["usage"]["input_tokens"] == 10
@@ -248,8 +248,8 @@ class TestApiRequest:
             assistant_message=_Msg("final answer"), assistant_content_chars=12,
         )
         plugin._drain_now()
-        resp = [e for e in _lines(plugin, tmp_path, "s1")
-                if e["event"] == "assistant_response"][0]
+        resp = next(e for e in _lines(plugin, tmp_path, "s1")
+                    if e["event"] == "assistant_response")
         assert resp["text"] == "final answer"
         assert resp["turn_id"] == "turn1" and resp["api_request_id"] == "req1"
 

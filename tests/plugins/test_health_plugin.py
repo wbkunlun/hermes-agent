@@ -12,7 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -43,7 +43,7 @@ def home(tmp_path, monkeypatch):
 
 
 def _iso_ago(seconds: float) -> str:
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
 
 
 def _write_heartbeat(home: Path, *, age_s: float = 0.0, start_age_s: float | None = None) -> None:
@@ -497,10 +497,10 @@ class TestHttpServer:
 
     def test_bind_failure_returns_none(self, lib):
         mod = _load(_SRV_PATH, "health_server_bind_under_test")
-        first = mod.start_server(build_detail=lambda: {}, host="127.0.0.1", port=0)
+        first = mod.start_server(build_detail=dict, host="127.0.0.1", port=0)
         assert first is not None
         try:
-            second = mod.start_server(build_detail=lambda: {}, host="127.0.0.1",
+            second = mod.start_server(build_detail=dict, host="127.0.0.1",
                                       port=first.server_address[1])
             assert second is None
         finally:

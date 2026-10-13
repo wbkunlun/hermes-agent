@@ -275,7 +275,6 @@ class TestRobustness:
         assert len(client.calls) == 3
 
     def test_post_with_retry_no_retry_on_4xx(self, plugin):
-        client = _FakeClient()
         # _FakeClient returns 201 by default; simulate 4xx via a tailored client
         client4 = type("C", (), {
             "calls": [],
@@ -879,7 +878,6 @@ class TestPostBatch:
             _FakeResp(200),
         ])
         # Make the first call raise ConnectError, the next 2 attempts succeed.
-        original_post = client.post
         calls = {"n": 0}
         def flaky_post(self, url, content=None, headers=None):
             calls["n"] += 1

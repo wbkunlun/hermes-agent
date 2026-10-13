@@ -17,7 +17,7 @@ import os
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -55,7 +55,7 @@ def env_int(name: str, default: int) -> int:
 def utc_now_iso(now_epoch: Optional[float] = None) -> Optional[str]:
     if now_epoch is None:
         return None
-    return datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(now_epoch, tz=UTC).isoformat()
 
 
 def _iso_to_epoch(value: Any) -> Optional[float]:
@@ -66,7 +66,7 @@ def _iso_to_epoch(value: Any) -> Optional[float]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
 
 
@@ -90,7 +90,7 @@ class HealthCounters:
         self._last_inbound: Optional[float] = None
         self._last_tool: Optional[float] = None
         self._consecutive = 0
-        self._last_error_info: Optional[Dict[str, Any]] = None
+        self._last_error_info: Optional[dict[str, Any]] = None
         self._in_flight_since: Optional[float] = None
         self._in_flight_model: Optional[str] = None
 
@@ -146,7 +146,7 @@ class HealthCounters:
             self._events.popleft()
 
     # -- reader (health thread) ---------------------------------------------------
-    def snapshot(self, *, now: Optional[float] = None) -> Dict[str, Any]:
+    def snapshot(self, *, now: Optional[float] = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
             self._prune(now)
@@ -176,16 +176,15 @@ class HealthCounters:
 # Status derivations from a HealthCounters snapshot
 # ---------------------------------------------------------------------------
 
-def model_check(snapshot: Dict[str, Any], *, now_epoch: Optional[float] = None,
-                consecutive_down: int = 3, inflight_stale_s: float = 600.0) -> Dict[str, Any]:
+def model_check(snapshot: dict[str, Any], *, now_epoch: Optional[float] = None,
+                consecutive_down: int = 3, inflight_stale_s: float = 600.0) -> dict[str, Any]:
     """Passive model health. ``down`` needs ``consecutive_down`` failures with no
     interleaved success (the streak counter resets on success, so the streak
     alone proves it). ``degraded`` covers error/success mixes (≈ serving via
     fallback) and a call stuck in flight past ``inflight_stale_s`` (default
     tolerates long-thinking reasoning models). An idle window is ``no_data`` —
     silence is not sickness."""
-    now = time.time() if now_epoch is None else now_epoch
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "status": "ok",
         "last_success_at": snapshot.get("last_success_at"),
         "last_error_at": snapshot.get("last_error_at"),
@@ -228,15 +227,15 @@ def model_check(snapshot: Dict[str, Any], *, now_epoch: Optional[float] = None,
     return out
 
 
-def stuck_check(snapshot: Dict[str, Any], *, now_epoch: Optional[float] = None,
-                stuck_minutes: float = 10.0) -> Dict[str, Any]:
+def stuck_check(snapshot: dict[str, Any], *, now_epoch: Optional[float] = None,
+                stuck_minutes: float = 10.0) -> dict[str, Any]:
     """Global silent-stall detector: inbound seen, nothing progressed since,
     nothing in flight. Mirrors gateway/session_stall semantics (pending inbound
     + no progress) without replicating session-key derivation. Per-session
     precision is traded for key-format independence."""
     now = time.time() if now_epoch is None else now_epoch
     last_inbound = snapshot.get("last_inbound_ts")
-    out: Dict[str, Any] = {"status": "ok"}
+    out: dict[str, Any] = {"status": "ok"}
     if last_inbound is None:
         out["detail"] = "no inbound yet"
         return out
@@ -264,17 +263,17 @@ def stuck_check(snapshot: Dict[str, Any], *, now_epoch: Optional[float] = None,
 # Read-only probes over the gateway file contract
 # ---------------------------------------------------------------------------
 
-def _read_gateway_state(home: Path) -> Optional[Dict[str, Any]]:
+def _read_gateway_state(home: Path) -> Optional[dict[str, Any]]:
     from gateway.status import read_runtime_status
     record = read_runtime_status(Path(home) / "gateway_state.json")
     return record if isinstance(record, dict) else None
 
 
-def probe_process(home: Path) -> Dict[str, Any]:
+def probe_process(home: Path) -> dict[str, Any]:
     """Liveness by construction: an HTTP response proves this process serves.
     The state file adds ownership — a dead writer means a stale file, a live
     foreign PID means two gateways share one HERMES_HOME."""
-    out: Dict[str, Any] = {"status": "ok", "pid": os.getpid()}
+    out: dict[str, Any] = {"status": "ok", "pid": os.getpid()}
     try:
         record = _read_gateway_state(home)
     except Exception as exc:
@@ -306,7 +305,7 @@ def probe_process(home: Path) -> Dict[str, Any]:
 
 
 def probe_loop(home: Path, *, now_epoch: Optional[float] = None,
-               ttl_s: float = LOOP_HEARTBEAT_TTL_S) -> Dict[str, Any]:
+               ttl_s: float = LOOP_HEARTBEAT_TTL_S) -> dict[str, Any]:
     """Main-loop liveness from the unconditionally-written 30s heartbeat file.
     Stale past the TTL means the asyncio loop stopped dispatching — the exact
     'stuck' case this endpoint exists to report while it still can."""
@@ -321,7 +320,7 @@ def probe_loop(home: Path, *, now_epoch: Optional[float] = None,
     if ts is None:
         return {"status": "unknown", "detail": "heartbeat timestamp unparseable"}
     age = max(0.0, now - ts)
-    out: Dict[str, Any] = {"status": "ok" if age <= ttl_s else "down",
+    out: dict[str, Any] = {"status": "ok" if age <= ttl_s else "down",
                            "heartbeat_age_s": round(age, 1), "ttl_s": ttl_s}
     start = raw.get("start_time")
     if isinstance(start, (int, float)) and not isinstance(start, bool):
@@ -333,7 +332,7 @@ def probe_loop(home: Path, *, now_epoch: Optional[float] = None,
 
 
 def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: str = "wecom",
-                   platform_down_minutes: float = 10.0) -> Dict[str, Any]:
+                   platform_down_minutes: float = 10.0) -> dict[str, Any]:
     """Chat-platform connection state from gateway_state.json (adapters persist
     state/needs_attention/retrying_since via _mark_* helpers)."""
     now = time.time() if now_epoch is None else now_epoch
@@ -349,7 +348,7 @@ def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: s
     label = _PLATFORM_LABELS.get(platform, platform)
     state = str(entry.get("state") or "unknown").lower()
     needs_attention = bool(entry.get("needs_attention"))
-    out: Dict[str, Any] = {"status": "ok", "platform": platform, "state": state,
+    out: dict[str, Any] = {"status": "ok", "platform": platform, "state": state,
                            "needs_attention": needs_attention,
                            "retrying_since": entry.get("retrying_since")}
     if state in _CONNECTED_STATES and not needs_attention:
@@ -370,7 +369,7 @@ def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: s
 
 
 def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
-                    platform_down_minutes: float = 10.0) -> Dict[str, Any]:
+                    platform_down_minutes: float = 10.0) -> dict[str, Any]:
     """Every started chat platform in gateway_state.json (this deployment runs
     wecom + wework), each probed individually; worst status wins. With no
     platform entries yet the block falls back to a single wecom probe (which
@@ -385,7 +384,7 @@ def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
     if not names:
         return probe_platform(home, now_epoch=now_epoch, platform="wecom",
                               platform_down_minutes=platform_down_minutes)
-    entries: Dict[str, Any] = {}
+    entries: dict[str, Any] = {}
     statuses = []
     remediations = []
     for name in names:
@@ -395,7 +394,7 @@ def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
         statuses.append(block["status"])
         if block.get("remediation"):
             remediations.append(f"[{name}] {block['remediation']}")
-    out: Dict[str, Any] = {"status": aggregate(*statuses), "platforms": entries}
+    out: dict[str, Any] = {"status": aggregate(*statuses), "platforms": entries}
     if remediations:
         out["remediation"] = "；".join(remediations)
     return out
@@ -417,7 +416,7 @@ def _configured_model(home: Path) -> str:
     return ""
 
 
-def _system_remediation(readiness: Dict[str, Any]) -> str:
+def _system_remediation(readiness: dict[str, Any]) -> str:
     checks = readiness.get("checks") if isinstance(readiness.get("checks"), dict) else {}
 
     def bad(name: str) -> bool:
@@ -435,10 +434,10 @@ def _system_remediation(readiness: Dict[str, Any]) -> str:
     return "系统检查异常：查看 /health/detail 的 system.checks 明细"
 
 
-def probe_system(home: Path, *, runtime_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Shared readiness rollup (state.db ro-probe / config / disk / gateway /
     queues) plus memory pressure from the heartbeat file. Never raises."""
-    out: Dict[str, Any] = {"status": "ok"}
+    out: dict[str, Any] = {"status": "ok"}
     try:
         from gateway.readiness import collect_runtime_readiness
         record = runtime_status if runtime_status is not None else _read_gateway_state(home)
@@ -476,10 +475,10 @@ def aggregate(*statuses: str) -> str:
     return worst if worst in _AGG_ORDER else "ok"
 
 
-def build_health_detail(snapshot: Dict[str, Any], *, home: Path, now_epoch: Optional[float] = None,
+def build_health_detail(snapshot: dict[str, Any], *, home: Path, now_epoch: Optional[float] = None,
                         consecutive_down: int = 3, inflight_stale_s: float = 600.0,
                         stuck_minutes: float = 10.0, platform_down_minutes: float = 10.0,
-                        ) -> Dict[str, Any]:
+                        ) -> dict[str, Any]:
     """Full /health/detail payload: every check plus aggregated status and the
     collected Chinese remediation hints. All constituent probes never raise."""
     home = Path(home)
@@ -494,7 +493,7 @@ def build_health_detail(snapshot: Dict[str, Any], *, home: Path, now_epoch: Opti
                        system["status"], model["status"], stuck["status"])
     remediation = [block["remediation"] for block in (process, loop, platform, system, model, stuck)
                    if block.get("remediation")]
-    detail: Dict[str, Any] = {
+    detail: dict[str, Any] = {
         "status": status, "checked_at": utc_now_iso(now_epoch if now_epoch is not None else time.time()),
         "process": process, "loop": loop, "platform": platform,
         "model": model, "stuck": stuck, "system": system, "remediation": remediation}
@@ -503,6 +502,6 @@ def build_health_detail(snapshot: Dict[str, Any], *, home: Path, now_epoch: Opti
     return detail
 
 
-def summarize(detail: Dict[str, Any]) -> Dict[str, Any]:
+def summarize(detail: dict[str, Any]) -> dict[str, Any]:
     """The /health minimal body: what a monitor needs and nothing else."""
     return {"status": detail.get("status"), "checked_at": detail.get("checked_at")}

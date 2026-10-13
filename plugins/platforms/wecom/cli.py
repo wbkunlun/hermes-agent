@@ -61,7 +61,7 @@ def config_dir() -> Path:
     return Path(home) / "wecom-cli"
 
 
-def subprocess_env() -> Dict[str, str]:
+def subprocess_env() -> dict[str, str]:
     try:
         config_dir().mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -73,7 +73,7 @@ def subprocess_env() -> Dict[str, str]:
     }
 
 
-def validate_segments(service_path: Sequence[str]) -> List[str]:
+def validate_segments(service_path: Sequence[str]) -> list[str]:
     if not service_path:
         raise ValueError("service_path must not be empty")
     segments = [str(s).strip() for s in service_path]
@@ -88,10 +88,10 @@ def validate_segments(service_path: Sequence[str]) -> List[str]:
 def run_cli(
     service_path: Sequence[str],
     method: Optional[str] = None,
-    args: Optional[Dict[str, Any]] = None,
+    args: Optional[dict[str, Any]] = None,
     *,
     timeout: Optional[float] = None,
-    extra_argv: Optional[List[str]] = None,
+    extra_argv: Optional[list[str]] = None,
     bare: bool = False,
 ) -> str:
     """Run ``wecom-cli <service...> [method] [--json ARGS]``; return stdout.
@@ -112,9 +112,9 @@ def run_cli(
     if timeout is None:
         timeout = float(os.getenv("HERMES_WECOM_CLI_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))
     try:
-        proc = subprocess.run(  # noqa: S603 — argv list, no shell
+        proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout,
-            env=subprocess_env(),
+            env=subprocess_env(), check=False,
         )
     except FileNotFoundError as exc:
         raise WecomCliError(f"wecom-cli binary not found: {cli_bin()}", stderr=str(exc)) from exc

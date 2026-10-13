@@ -56,13 +56,13 @@ _AUTH_ALERT_INTERVAL_S = 300.0
 class WhitelistSnapshot:
     """Immutable decision snapshot; swapped atomically by refresh()."""
 
-    commands: Tuple[str, ...]
-    users: Tuple[str, ...]
+    commands: tuple[str, ...]
+    users: tuple[str, ...]
     updated_at: Optional[str]
     fetched_at: float
 
 
-def _clean_list(raw) -> Optional[Tuple[str, ...]]:
+def _clean_list(raw) -> Optional[tuple[str, ...]]:
     """Validate/normalize a platform list field. None = payload invalid."""
     if not isinstance(raw, list):
         return None
@@ -352,7 +352,7 @@ class WhitelistClient:
         )
 
 
-def _platform_segment_allowed(segment: str, commands: Tuple[str, ...], tokenizer) -> bool:
+def _platform_segment_allowed(segment: str, commands: tuple[str, ...], tokenizer) -> bool:
     """Contract semantics: fnmatch (case-sensitive) over the whole segment.
 
     Unlike the env allowlist, a bare name matches ONLY itself (write
@@ -399,7 +399,7 @@ def _reset_for_tests() -> None:
 
 # ---- background poll -----------------------------------------------------
 
-_poll_task: Optional["asyncio.Task[None]"] = None
+_poll_task: Optional[asyncio.Task[None]] = None
 
 
 def _jittered(base: float) -> float:
@@ -460,7 +460,7 @@ async def ensure_startup_fetch(
     return False
 
 
-def start_poll_task() -> Optional["asyncio.Task[None]"]:
+def start_poll_task() -> Optional[asyncio.Task[None]]:
     """Start the shared poll task (idempotent). None when disabled.
 
     Call once from gateway startup; the returned task can be registered

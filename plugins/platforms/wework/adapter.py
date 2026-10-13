@@ -106,7 +106,7 @@ def _wework_env_enabled() -> bool:
     return _truthy(os.getenv("WEWORK_ENABLED"), False)
 
 
-def _coerce_list(value: Any) -> List[str]:
+def _coerce_list(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
@@ -116,12 +116,12 @@ def _coerce_list(value: Any) -> List[str]:
     return [str(value).strip()] if str(value).strip() else []
 
 
-def _chunk_text(text: str, limit: int) -> List[str]:
+def _chunk_text(text: str, limit: int) -> list[str]:
     if not text:
         return [""]
     if limit <= 0 or len(text) <= limit:
         return [text]
-    chunks: List[str] = []
+    chunks: list[str] = []
     remaining = text
     while remaining:
         if len(remaining) <= limit:
@@ -168,7 +168,7 @@ class _Inbound:
 
 class _DedupCache:
     def __init__(self) -> None:
-        self._seen: Dict[str, float] = {}
+        self._seen: dict[str, float] = {}
 
     def add_if_new(self, key: str) -> bool:
         now = time.time()
@@ -230,11 +230,11 @@ class WeWorkAdapter(BasePlatformAdapter):
             DEFAULT_REQUIRE_MENTION,
         )
 
-        self._app: Optional["web.Application"] = None
-        self._runner: Optional["web.AppRunner"] = None
-        self._site: Optional["web.TCPSite"] = None
-        self._http_client: Optional["httpx.AsyncClient"] = None
-        self._queue: "asyncio.Queue[_Inbound]" = asyncio.Queue()
+        self._app: Optional[web.Application] = None
+        self._runner: Optional[web.AppRunner] = None
+        self._site: Optional[web.TCPSite] = None
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._queue: asyncio.Queue[_Inbound] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = _DedupCache()
 
@@ -318,10 +318,10 @@ class WeWorkAdapter(BasePlatformAdapter):
                 pass
             self._http_client = None
 
-    async def _handle_health(self, request: "web.Request") -> "web.Response":
+    async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "platform": "wework"})
 
-    async def _handle_webhook(self, request: "web.Request") -> "web.Response":
+    async def _handle_webhook(self, request: web.Request) -> web.Response:
         try:
             body = await request.json()
         except Exception:
@@ -340,7 +340,7 @@ class WeWorkAdapter(BasePlatformAdapter):
 
         return web.json_response({"ok": True})
 
-    def _parse_inbound(self, payload: Dict[str, Any]) -> Optional[_Inbound]:
+    def _parse_inbound(self, payload: dict[str, Any]) -> Optional[_Inbound]:
         cmd = str(payload.get("cmd") or "").strip()
         sender_user = str(payload.get("user") or "").strip()
         sender_full_name = str(payload.get("userFullName") or "").strip()
@@ -468,7 +468,7 @@ class WeWorkAdapter(BasePlatformAdapter):
     def _is_group_allowed(self, *, chat_id: str, chat_name: str) -> bool:
         allow = [v.strip() for v in self._group_allow_from if str(v).strip()]
         if not allow:
-            return True if self._group_policy != "allowlist" else False
+            return self._group_policy != "allowlist"
         lowered = {v.lower() for v in allow}
         if "*" in allow:
             return True
@@ -523,7 +523,7 @@ class WeWorkAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         del reply_to, metadata
 
@@ -540,7 +540,7 @@ class WeWorkAdapter(BasePlatformAdapter):
         chunks = _chunk_text(text, self._text_chunk_limit)
 
         for idx, chunk in enumerate(chunks):
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "keyid": self._keyid,
                 "serviceName": self._service_name,
                 "type": "text",
@@ -579,7 +579,7 @@ class WeWorkAdapter(BasePlatformAdapter):
 
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": chat_id, "type": "group" if _looks_like_wechat_id(chat_id) else "dm"}
 
 

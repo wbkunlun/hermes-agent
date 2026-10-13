@@ -60,7 +60,7 @@ class LearnedChatsMixin:
             import json
 
             data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception as exc:  # noqa: BLE001 — a bad sidecar degrades to defaults
+        except Exception as exc:
             logger.warning(
                 "[%s] learned-chats file unreadable — starting empty (%s): %s",
                 getattr(self, "name", "wecom"), path, exc,
@@ -104,7 +104,7 @@ class LearnedChatsMixin:
             from utils import atomic_json_write
 
             await asyncio.to_thread(atomic_json_write, path, payload)
-        except Exception as exc:  # noqa: BLE001 — observation only, the next learn retries
+        except Exception as exc:
             logger.warning("[%s] learned-chats write failed: %s", getattr(self, "name", "wecom"), exc)
 
     def _cancel_learned_save(self) -> None:

@@ -89,7 +89,7 @@ class TestUserAllowed:
         assert asyncio.run(cp_enabled.refresh()) is False
         with caplog.at_level(logging.WARNING, logger=_CPWL_LOGGER):
             assert cp_enabled.user_allowed("lisi", "") is True
-        msg = [r for r in caplog.records if "fail-open" in r.getMessage()][0].getMessage()
+        msg = next(r for r in caplog.records if "fail-open" in r.getMessage()).getMessage()
         assert "503" in msg
 
     def test_empty_users_allows_all(self, cp_enabled):
@@ -639,7 +639,6 @@ def test_gateway_poll_starter_awaits_startup_fetch_first(monkeypatch):
 
     def fake_start():
         order.append("start")
-        return None
 
     monkeypatch.setattr(cpwl_mod, "ensure_startup_fetch", fake_ensure)
     monkeypatch.setattr(cpwl_mod, "start_poll_task", fake_start)

@@ -15,7 +15,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse  # FORK(wbkunlun): explicit — the deleted PLUGIN-COMPAT
 # shim (#126164) used to re-export this name; _open_connection needs it for proxy resolution.
@@ -84,7 +84,7 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 DEDUP_MAX_SIZE = 1000
 
 
-def _parse_group_retry_delays(raw: str) -> Tuple[float, ...]:
+def _parse_group_retry_delays(raw: str) -> tuple[float, ...]:
     """fork 2026-10-08: timed-retry schedule for group sends parked in the 846609 dead
     window (socket dead → subscribe-ack pending; a send landing there gets a REAL 846609
     response because _open_connection sets self._ws before the SUBSCRIBE ack). Reconnect
@@ -102,7 +102,7 @@ def check_wecom_requirements() -> bool:
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
 
 
-def _coerce_list(value: Any) -> List[str]:
+def _coerce_list(value: Any) -> list[str]:
     """Coerce config values (None | "a, b" | iterable | scalar) into a trimmed, non-empty string list."""
     if isinstance(value, str):
         value = value.split(",")
@@ -117,17 +117,17 @@ def _normalize_entry(raw: str) -> str:
     return re.sub(r"^(user|group):", "", value, flags=re.IGNORECASE).strip()
 
 
-def _entry_matches(entries: List[str], target: str) -> bool:
+def _entry_matches(entries: list[str], target: str) -> bool:
     """Case-insensitive allowlist match with ``*`` support."""
     normalized_target = str(target).strip().lower()
     return any(_normalize_entry(e).lower() in ("*", normalized_target) for e in entries)
 
 
-def _dict_or_empty(container: Dict[str, Any], key: str) -> Dict[str, Any]:
+def _dict_or_empty(container: dict[str, Any], key: str) -> dict[str, Any]:
     return container.get(key) if isinstance(container.get(key), dict) else {}
 
 
-def _content_of(container: Dict[str, Any], key: str) -> str:
+def _content_of(container: dict[str, Any], key: str) -> str:
     return str(_dict_or_empty(container, key).get("content") or "").strip()
 
 
@@ -187,8 +187,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         )
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
         self._session = self._ws = self._http_client = self._listen_task = self._heartbeat_task = None
-        self._pending_responses: Dict[str, asyncio.Future] = {}
-        self._reply_queues: Dict[str, ReplyQueue] = {}
+        self._pending_responses: dict[str, asyncio.Future] = {}
+        self._reply_queues: dict[str, ReplyQueue] = {}
         self._dedup, self._reply_req_ids = MessageDeduplicator(max_size=DEDUP_MAX_SIZE), {}
         # Text batching (clients split long messages ~4000 chars); attachment-only frames are held
         # for the merge window so the trailing text callback joins the same event (official: 800ms).
@@ -202,8 +202,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._group_pending_max = env_int("HERMES_WECOM_GROUP_PENDING_MAX", 5)
         # fork 2026-10-08: dead-window timed retry schedule for parked group sends.
         self._group_retry_delays = _parse_group_retry_delays(os.getenv("HERMES_WECOM_GROUP_RETRY_DELAYS", "30,120"))
-        self._group_retry_timers: Dict[str, asyncio.TimerHandle] = {}
-        self._group_retry_attempts: Dict[str, int] = {}
+        self._group_retry_timers: dict[str, asyncio.TimerHandle] = {}
+        self._group_retry_attempts: dict[str, int] = {}
         # fork 2026-10-09: official docs allow ONE live WS subscription per bot — a newer
         # subscribe displaces this one (disconnected_event). Track it to slow our
         # re-subscribe (avoid mutual kicking) and timestamp connection lifetimes for
@@ -230,14 +230,14 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # fork: stable device id across restarts (WECOM_DEVICE_ID) keeps the subscription
         # identity — a fresh random hex per boot can trigger server-side session churn.
         self._device_id = os.getenv("WECOM_DEVICE_ID") or uuid.uuid4().hex
-        self._last_chat_req_ids: Dict[str, str] = {}
+        self._last_chat_req_ids: dict[str, str] = {}
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
-        self._stream_turns: Dict[str, StreamTurn] = {}
+        self._stream_turns: dict[str, StreamTurn] = {}
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups: passive reply first, proactive aibot_send_msg fallback (fork 2026-10-06)
         # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id.
         # The learned classification persists to wecom_learned_chats.json (fork 2026-10-08, see
         # learned_chats.py); the pending queue stays in-memory by design (TTL/时效语义).
-        self._pending_group_sends: Dict[str, List[Tuple[float, str]]] = {}
+        self._pending_group_sends: dict[str, list[tuple[float, str]]] = {}
         # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
         # their group semantics and scheduled pushes take the DM branch — 2026-10-08 incident).
         self._learned_save_handle = None
@@ -403,7 +403,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             self._session = None
             raise
 
-    async def _wait_for_handshake(self, req_id: str) -> Dict[str, Any]:
+    async def _wait_for_handshake(self, req_id: str) -> dict[str, Any]:
         if not self._ws:
             raise RuntimeError("WebSocket not initialized")
         loop = asyncio.get_running_loop()
@@ -517,12 +517,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 return True
             try:
                 await asyncio.wait_for(self._subscribed_event.wait(), timeout=max(0.01, deadline - time.monotonic()))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
             self._subscribed_event.clear()
         return self._subscribed_gen >= target_gen
 
-    def _ws_close_detail(self, msg: Optional["aiohttp.WSMessage"] = None) -> str:
+    def _ws_close_detail(self, msg: Optional[aiohttp.WSMessage] = None) -> str:
         """fork 2026-10-09: forensic suffix for websocket-close errors — close code/reason,
         transport exception and connection uptime. Without it the close raise sites were
         indistinguishable: a server-side displacement (4xxx) looked exactly like a network
@@ -608,7 +608,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         except asyncio.CancelledError:
             pass
 
-    async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
+    async def _dispatch_payload(self, payload: dict[str, Any]) -> None:
         req_id = self._payload_req_id(payload)
         cmd = str(payload.get("cmd") or "")
         body_dict = payload.get("body") if isinstance(payload.get("body"), dict) else None
@@ -699,11 +699,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
 
-    async def _send_json(self, payload: Dict[str, Any]) -> None:
+    async def _send_json(self, payload: dict[str, Any]) -> None:
         self._require_ws()
         await self._ws.send_json(payload)
 
-    async def _request(self, cmd: str, req_id: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    async def _request(self, cmd: str, req_id: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
         future = self._pending_responses[req_id] = asyncio.get_running_loop().create_future()
         try:
             await self._send_json({"cmd": cmd, "headers": {"req_id": req_id}, "body": body})
@@ -722,7 +722,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         except Exception as exc:
             logger.debug("[%s] welcome send failed: %s", self.name, exc)
 
-    async def _on_event(self, payload: Dict[str, Any]) -> None:
+    async def _on_event(self, payload: dict[str, Any]) -> None:
         """Handle ``aibot_event_callback`` events (e.g. enter_chat welcome)."""
         body = payload.get("body") or {}
         event = body.get("event") or {}
@@ -737,11 +737,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
 
         logger.debug("[%s] Ignoring WeCom event: %s", self.name, eventtype)
 
-    async def _send_request(self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    async def _send_request(self, cmd: str, body: dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
         self._require_ws()
         return await self._request(cmd, self._new_req_id(cmd), body, timeout)
 
-    async def _send_reply_request(self, reply_req_id: str, body: Dict[str, Any], cmd: str = APP_CMD_RESPONSE, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    async def _send_reply_request(self, reply_req_id: str, body: dict[str, Any], cmd: str = APP_CMD_RESPONSE, timeout: float = REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
         """Send a reply frame correlated to an inbound callback req_id."""
         self._require_ws()
         normalized = self._require_reply_req_id(reply_req_id)
@@ -764,12 +764,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         return f"{prefix}-{uuid.uuid4().hex}"
 
     @staticmethod
-    def _payload_req_id(payload: Dict[str, Any]) -> str:
+    def _payload_req_id(payload: dict[str, Any]) -> str:
         headers = payload.get("headers")
         return str(headers.get("req_id") or "") if isinstance(headers, dict) else ""
 
     @staticmethod
-    def _parse_json(raw: Any) -> Optional[Dict[str, Any]]:
+    def _parse_json(raw: Any) -> Optional[dict[str, Any]]:
         raw_len = len(raw) if isinstance(raw, (str, bytes)) else -1
         try:
             payload = json.loads(raw)
@@ -788,7 +788,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return None
         return payload if isinstance(payload, dict) else None
 
-    async def _on_message(self, payload: Dict[str, Any]) -> None:
+    async def _on_message(self, payload: dict[str, Any]) -> None:
         body = payload.get("body")
         if not isinstance(body, dict):
             return
@@ -832,7 +832,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                                    message_id=msg_id)
         event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=payload, message_id=msg_id, media_urls=media_urls, media_types=media_types,
-            reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None, reply_to_text=reply_text if has_reply_context else None, timestamp=datetime.now(tz=timezone.utc),
+            reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None, reply_to_text=reply_text if has_reply_context else None, timestamp=datetime.now(tz=UTC),
         )
         # Only plain text is batched, EXCEPT attachment-only messages, which are held so the
         # trailing text callback merges instead of "interrupting" a run the attachment spawned.
@@ -894,7 +894,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         return super()._text_batch_delay_for(pending)
 
     @staticmethod
-    def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    def _extract_text(body: dict[str, Any]) -> tuple[str, Optional[str]]:
         msgtype = str(body.get("msgtype") or "").lower()
         if msgtype == "mixed":
             items = _dict_or_empty(body, "mixed").get("msg_item")
@@ -910,7 +910,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         return "\n".join(part for part in text_parts if part).strip(), reply_text
 
     @staticmethod
-    def _derive_message_type(body: Dict[str, Any], text: str, media_types: List[str]) -> MessageType:
+    def _derive_message_type(body: dict[str, Any], text: str, media_types: list[str]) -> MessageType:
         if any(mtype.startswith(("application/", "text/")) for mtype in media_types):
             return MessageType.DOCUMENT
         if any(mtype.startswith("image/") for mtype in media_types):
@@ -919,7 +919,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return MessageType.VOICE
         return MessageType.TEXT
 
-    def _entry_matches(self, entries: List[str], target: str) -> bool:
+    def _entry_matches(self, entries: list[str], target: str) -> bool:
         return _entry_matches(entries, target)
 
     def _is_group_allowed(self, chat_id: str, sender_id: str) -> bool:
@@ -930,7 +930,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         sender_allow = _coerce_list(group_cfg.get("allow_from") or group_cfg.get("allowFrom"))
         return _entry_matches(sender_allow, sender_id) if sender_allow else True
 
-    def _resolve_group_cfg(self, chat_id: str) -> Dict[str, Any]:
+    def _resolve_group_cfg(self, chat_id: str) -> dict[str, Any]:
         """Exact key, then case-insensitive key, then ``"*"``; only dict values count."""
         if not isinstance(self._groups, dict):
             return {}
@@ -1011,7 +1011,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         """One flushed entry; never raises into the event loop (fire-and-forget owner)."""
         try:
             result = await self.send(chat_id, composed, metadata={"is_redelivery": True})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] Group redelivery raised and was dropped (chat=%s): %s", self.name, chat_id, exc)
             return
         if not getattr(result, "success", False):
@@ -1100,17 +1100,17 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._schedule_recycle(f"errcode {errcode}")
 
     @staticmethod
-    def _response_error(response: Dict[str, Any]) -> Optional[str]:
+    def _response_error(response: dict[str, Any]) -> Optional[str]:
         errcode = response.get("errcode", 0)
         return None if errcode in {0, None} else f"WeCom errcode {errcode}: {response.get('errmsg') or 'unknown error'}"
 
     @classmethod
-    def _raise_for_wecom_error(cls, response: Dict[str, Any], operation: str) -> None:
+    def _raise_for_wecom_error(cls, response: dict[str, Any], operation: str) -> None:
         error = cls._response_error(response)
         if error:
             raise RuntimeError(f"{operation} failed: {error}")
 
-    async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
+    async def _send_reply_markdown(self, reply_req_id: str, content: str) -> dict[str, Any]:
         # fork 2026-09-30: sequential segments on one req_id — same multi-frame
         # precedent the stream path set (APP_CMD_RESPONSE frames are versioned per
         # req_id). NOTE production watchpoint: if WeCom ever replaces (errcode 6000)
@@ -1120,22 +1120,22 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         if not segments:
             # 注意：不要用 "send reply markdown failed:" 前缀——那是生产旧镜像的判别指纹
             raise RuntimeError("send reply markdown: empty content")
-        response: Dict[str, Any] = {}
+        response: dict[str, Any] = {}
         for segment in segments:
             response = await self._send_reply_request(reply_req_id, {"msgtype": "markdown", "markdown": {"content": segment}})
             # "segment" 措辞同样是反指纹：错误串前缀绝不能是 "send reply markdown failed:"
             self._raise_for_wecom_error(response, "send reply markdown segment")
         return response
 
-    async def _send_proactive_markdown(self, chat_id: str, content: str, chat_type: Optional[int] = None) -> Dict[str, Any]:
+    async def _send_proactive_markdown(self, chat_id: str, content: str, chat_type: Optional[int] = None) -> dict[str, Any]:
         segments = _markdown_segments(content)
         if not segments:
             raise RuntimeError("send proactive markdown: empty content")
-        response: Dict[str, Any] = {}
+        response: dict[str, Any] = {}
         for segment in segments:
             # fork 2026-10-06: chat_type only sent when explicit — DMs keep the historical unset
             # body (0/absent = compat mode); groups pass 2 per official aibot_send_msg docs.
-            body: Dict[str, Any] = {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": segment}}
+            body: dict[str, Any] = {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": segment}}
             if chat_type is not None:
                 body["chat_type"] = chat_type
             response = await self._send_request(APP_CMD_SEND, body)
@@ -1143,19 +1143,19 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             self._raise_for_wecom_error(response, "send proactive markdown segment")
         return response
 
-    async def _group_proactive_send(self, chat_id: str, content: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    async def _group_proactive_send(self, chat_id: str, content: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         """fork 2026-10-06: official aibot_send_msg accepts group chatids (chat_type=2; docs:
         群聊填回调事件中获取的 chatid, prerequisite = the chat has messaged the bot before).
         Passive reply stays first choice; this is the fallback when no live req_id exists
         (scheduled pushes, post-846609 purge). Returns (response, None) or (None, error)."""
         try:
             response = await self._send_proactive_markdown(chat_id, content, chat_type=2)
-        except (asyncio.TimeoutError, RuntimeError) as exc:
+        except (TimeoutError, RuntimeError) as exc:
             return None, str(exc)
         error = self._response_error(response)
         return (response, None) if error is None else (None, error)
 
-    async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+    async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send standalone markdown (never touches active streams); serialized per chat for the 30 msgs/min
         limit (846607). ``metadata["is_approval_prompt"]`` uses the control lane."""
         if not chat_id:
@@ -1188,7 +1188,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             if reply_req_id:
                 try:
                     response = await self._send_reply_markdown(reply_req_id, content)
-                except (asyncio.TimeoutError, RuntimeError) as passive_err:
+                except (TimeoutError, RuntimeError) as passive_err:
                     if is_group_chat:
                         # fork 2026-10-06: passive reply died (stale req_id after a resubscribe) — the
                         # official aibot_send_msg delivers to groups too (chat_type=2); try it, then park.
@@ -1234,7 +1234,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     if not await self._await_resubscribe(timeout=self._dm_resubscribe_timeout):
                         raise
                     response = await self._send_proactive_markdown(chat_id, content)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
             logger.error("[%s] Send failed: %s", self.name, exc)
@@ -1249,7 +1249,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             asyncio.ensure_future(self._force_reconnect_on_stale_subscription(STREAM_NOT_SUBSCRIBED_ERRCODE))
         return SendResult(success=False, error=error)
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": chat_id, "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm"}
 
 
@@ -1259,13 +1259,13 @@ _QR_CODE_PAGE = "https://work.weixin.qq.com/ai/qc/gen?source=hermes&scode="
 _QR_POLL_INTERVAL, _QR_POLL_TIMEOUT = 3, 300  # seconds (poll every 3s, give up after 5 minutes)
 
 
-def qr_scan_for_bot_info(*, timeout_seconds: int = _QR_POLL_TIMEOUT) -> Optional[Dict[str, str]]:
+def qr_scan_for_bot_info(*, timeout_seconds: int = _QR_POLL_TIMEOUT) -> Optional[dict[str, str]]:
     """Fetch a WeCom QR code, render it, poll until scanned or timeout; ``{"bot_id", "secret"}`` or None.
     The ``ai/qc/*`` endpoints back the admin console, not the public API, and may change."""
     import urllib.request
     import urllib.parse
 
-    def _get_json(url: str, timeout: int) -> Dict[str, Any]:
+    def _get_json(url: str, timeout: int) -> dict[str, Any]:
         req = urllib.request.Request(url, headers={"User-Agent": "HermesAgent/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -1337,7 +1337,7 @@ def _markdown_segments(content: str) -> list:
     return _split_markdown_bytes(str(content or ""), max_bytes=AIBOT_MARKDOWN_MAX_BYTES)
 
 
-def _split_markdown_bytes(content: str, max_bytes: int) -> List[str]:
+def _split_markdown_bytes(content: str, max_bytes: int) -> list[str]:
     """Split markdown into ≤max_bytes UTF-8 segments, preferring line breaks.
 
     Kept for the aibot stream/proactive frames path (adapter._markdown_segments,
@@ -1350,7 +1350,7 @@ def _split_markdown_bytes(content: str, max_bytes: int) -> List[str]:
         return []
     if len(content.encode("utf-8")) <= max_bytes:
         return [content]
-    segments: List[str] = []
+    segments: list[str] = []
     current = ""
     for line in content.splitlines(keepends=True):
         while len(line.encode("utf-8")) > max_bytes:  # pathological no-newline line
@@ -1377,7 +1377,7 @@ def _consume_cross_loop_result(future) -> None:
     pattern; without this the executor logs "exception was never retrieved"."""
     try:
         future.result()
-    except Exception:  # noqa: BLE001 — observation only, the owner already gave up
+    except Exception:
         pass
 
 
@@ -1481,7 +1481,7 @@ async def _standalone_send(
                         # un-cancelled on timeout (#115469; mirrors _dispatch_on_gateway_loop).
                         _cross_result = await asyncio.wait_for(
                             asyncio.shield(asyncio.wrap_future(_future)), timeout=30)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         _future.add_done_callback(_consume_cross_loop_result)
                         return {"error": "WeCom cross-loop send failed: timeout"}
                     except Exception as _cross_err:

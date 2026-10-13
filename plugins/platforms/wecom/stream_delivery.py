@@ -162,7 +162,7 @@ class WeComStreamDelivery:
         self._disabled = False
 
         # Thread-safe signal queue + loop binding.
-        self._queue: "queue.Queue" = queue.Queue()
+        self._queue: queue.Queue = queue.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._wakeup: Optional[asyncio.Event] = None
 
@@ -328,7 +328,7 @@ class WeComStreamDelivery:
                 await asyncio.wait_for(
                     self._wakeup.wait(), timeout=STREAM_THROTTLE_INTERVAL
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             except asyncio.CancelledError:
                 return

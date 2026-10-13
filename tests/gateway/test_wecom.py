@@ -1819,7 +1819,7 @@ class TestSendStreamFrame:
         assert adapter._send_json.await_count == 1
 
         # accumulated_text still updated in StreamTurn despite skip.
-        turn = list(adapter._stream_turns.values())[0]
+        turn = next(iter(adapter._stream_turns.values()))
         assert turn.accumulated_text == "alpha beta"
 
 
@@ -2238,7 +2238,6 @@ class TestListenLoopReconnectFix:
                 # Flip to closed after SUBSCRIBE is sent, mirroring the
                 # race where the server closes mid-handshake.
                 self.closed = True
-                return None
 
             async def close(self):
                 return None

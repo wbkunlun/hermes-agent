@@ -63,7 +63,7 @@ _USAGE_KEYS = (
     "request_count",
 )
 
-_queue: "Queue[Dict[str, Any]]" = Queue(maxsize=_QUEUE_MAX)
+_queue: Queue[dict[str, Any]] = Queue(maxsize=_QUEUE_MAX)
 _dropped = 0
 _worker: Optional[threading.Thread] = None
 _worker_lock = threading.Lock()
@@ -133,7 +133,7 @@ def _sanitize(text: str) -> Optional[str]:
         return None
 
 
-def _capture_text(value: Any, *, text_key: str = "text") -> Dict[str, Any]:
+def _capture_text(value: Any, *, text_key: str = "text") -> dict[str, Any]:
     """Render a text payload under the active capture mode.
 
     metadata -> {"chars": N}; sanitized/full add ``text_key`` (when sanitized:
@@ -150,7 +150,7 @@ def _capture_text(value: Any, *, text_key: str = "text") -> Dict[str, Any]:
             text = json.dumps(value, ensure_ascii=False, default=str)
         except Exception:
             text = str(value)
-    out: Dict[str, Any] = {"chars": len(text)}
+    out: dict[str, Any] = {"chars": len(text)}
     mode = _capture_mode()
     if mode == "metadata":
         return out
@@ -163,7 +163,7 @@ def _capture_text(value: Any, *, text_key: str = "text") -> Dict[str, Any]:
     return out
 
 
-def _capture_obj(value: Any) -> Dict[str, Any]:
+def _capture_obj(value: Any) -> dict[str, Any]:
     """Render a structured (dict/list) payload under the active capture mode."""
     if value is None:
         return {"bytes": 0}
@@ -171,7 +171,7 @@ def _capture_obj(value: Any) -> Dict[str, Any]:
         text = json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         text = str(value)
-    out: Dict[str, Any] = {"bytes": len(text.encode("utf-8", "replace"))}
+    out: dict[str, Any] = {"bytes": len(text.encode("utf-8", "replace"))}
     mode = _capture_mode()
     if mode == "metadata":
         return out
@@ -198,7 +198,7 @@ def _session_file(session_id: str) -> Path:
 # Queue + writer
 # ---------------------------------------------------------------------------
 
-def _enqueue(event: Dict[str, Any]) -> None:
+def _enqueue(event: dict[str, Any]) -> None:
     """Non-blocking enqueue; bounded queue drops the oldest event on full."""
     global _dropped
     try:
@@ -218,16 +218,16 @@ def _enqueue(event: Dict[str, Any]) -> None:
             logger.warning("usage-trace: queue full; dropped %d events", _dropped)
 
 
-def _append_lines(path: Path, lines: List[str]) -> None:
+def _append_lines(path: Path, lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
-def _write_batch(batch: List[Dict[str, Any]]) -> None:
+def _write_batch(batch: list[dict[str, Any]]) -> None:
     """Group a batch by session file and append. Failures drop + count."""
     global _dropped
-    by_file: Dict[Path, List[str]] = {}
+    by_file: dict[Path, list[str]] = {}
     for ev in batch:
         line = json.dumps(ev, ensure_ascii=False, default=str)
         by_file.setdefault(_session_file(str(ev.get("session_id") or "")), []).append(line)
@@ -296,7 +296,7 @@ def _ensure_worker() -> None:
 
 def _drain_now() -> None:
     """Synchronously flush pending events (tests / admin helper)."""
-    batch: List[Dict[str, Any]] = []
+    batch: list[dict[str, Any]] = []
     while True:
         try:
             batch.append(_queue.get_nowait())
@@ -326,7 +326,7 @@ def _guard(fn):
             if not _enabled():
                 return
             fn(**kw)
-        except Exception as exc:  # noqa: BLE001 — never break the agent loop
+        except Exception as exc:
             logger.debug("usage-trace: %s handler error (%s)", fn.__name__, exc)
 
     return wrapped
@@ -339,8 +339,8 @@ def _base(
     task_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
-) -> Dict[str, Any]:
-    ev: Dict[str, Any] = {
+) -> dict[str, Any]:
+    ev: dict[str, Any] = {
         "ts": round(time.time(), 3),
         "event": event,
         "schema": _SCHEMA,

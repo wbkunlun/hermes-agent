@@ -359,7 +359,7 @@ def test_wecom_empty_target_is_not_explicit() -> None:
 def test_send_message_registered_and_narrow_to_wecom() -> None:
     """Fix #3: send_message is registered as an agent tool and added to the
     WeCom toolsets (narrow scope), but not to other platforms' toolsets."""
-    import tools.send_message_tool  # noqa: F401  (triggers registry.register at import)
+    import tools.send_message_tool
     from tools.registry import registry
     from toolsets import resolve_toolset
 

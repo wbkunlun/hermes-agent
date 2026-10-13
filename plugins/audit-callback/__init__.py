@@ -82,7 +82,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -171,7 +171,7 @@ def _audit_env() -> str:
 # Bounded queue + single daemon worker
 # ---------------------------------------------------------------------------
 
-_QUEUE: "queue.Queue[Any]" = queue.Queue(maxsize=1000)
+_QUEUE: queue.Queue[Any] = queue.Queue(maxsize=1000)
 _WORKER_LOCK = threading.Lock()
 _WORKER_STARTED = False
 _DROPPED = 0  # best-effort overflow counter
@@ -201,7 +201,7 @@ def _ensure_worker() -> None:
         logger.debug("audit-callback: worker thread started")
 
 
-def _enqueue(body: Dict[str, Any]) -> None:
+def _enqueue(body: dict[str, Any]) -> None:
     global _DROPPED
     try:
         _QUEUE.put(body, block=False)
@@ -210,12 +210,12 @@ def _enqueue(body: Dict[str, Any]) -> None:
         logger.warning("audit-callback: queue full (%d dropped), discarding event", _DROPPED)
 
 
-def _post_one(client, url: str, headers: Dict[str, str], body: Dict[str, Any]):
+def _post_one(client, url: str, headers: dict[str, str], body: dict[str, Any]):
     """Single POST. Returns the httpx Response; raises on network error."""
     return client.post(url, content=json.dumps(body, default=str), headers=headers)
 
 
-def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, Any]) -> None:
+def _post_with_retry(client, url: str, headers: dict[str, str], body: dict[str, Any]) -> None:
     """POST a single event with a couple of transient-error retries. Never raises.
 
     Retries only on connect/timeout/5xx. 2xx and 4xx are terminal — the
@@ -235,7 +235,7 @@ def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, 
                 continue
             logger.debug("audit-callback: giving up on %s after transient errors: %s", event_id, exc)
             return
-        except Exception as exc:  # noqa: BLE001 — non-transient; don't retry
+        except Exception as exc:
             logger.debug("audit-callback: POST error for %s (no retry): %s", event_id, exc)
             return
         code = resp.status_code
@@ -251,7 +251,7 @@ def _post_with_retry(client, url: str, headers: Dict[str, str], body: Dict[str, 
 
 
 def _post_batch_with_retry(
-    client, url: str, headers: Dict[str, str], events: list,
+    client, url: str, headers: dict[str, str], events: list,
 ) -> None:
     """POST a batch of events (or one wrapped in items) with retries. Never raises.
 
@@ -281,7 +281,7 @@ def _post_batch_with_retry(
                 len(events), f"{type(exc).__name__}: {exc}", url,
             )
             return
-        except Exception as exc:  # noqa: BLE001 — non-transient; don't retry
+        except Exception as exc:
             logger.warning(
                 "audit-callback: dropped %d events (unretriable POST error, last status=%s, url=%s)",
                 len(events), f"{type(exc).__name__}: {exc}", url,
@@ -384,7 +384,7 @@ def _drain() -> None:
             headers["X-Trace-ID"] = trace_id
         try:
             _post_batch_with_retry(client, url, headers, events)
-        except Exception as exc:  # noqa: BLE001 — never break the loop
+        except Exception as exc:
             logger.debug("audit-callback: drain error: %s", exc)
 
 
@@ -392,7 +392,7 @@ def _drain() -> None:
 # Classification + payload building
 # ---------------------------------------------------------------------------
 
-def _classify_terminal(command: str) -> Tuple[str, str, list]:
+def _classify_terminal(command: str) -> tuple[str, str, list]:
     """Return (severity, reason, matched_rules) using the guard's own detectors.
 
     severity ∈ {"hardline", "dangerous", "info"}; reason is a human description;
@@ -415,7 +415,7 @@ def _classify_terminal(command: str) -> Tuple[str, str, list]:
     return ("info", "", [])
 
 
-def _parse_terminal_result(result: Any) -> Tuple[Optional[int], str, str, str, bool]:
+def _parse_terminal_result(result: Any) -> tuple[Optional[int], str, str, str, bool]:
     """Best-effort (exit_code, stdout, stderr, cwd, blocked) from a tool result.
 
     ``blocked`` is the machine-readable refusal flag: the terminal tool
@@ -442,7 +442,7 @@ def _parse_terminal_result(result: Any) -> Tuple[Optional[int], str, str, str, b
     return (exit_code, stdout, stderr, cwd, blocked)
 
 
-def _sha_and_preview(text: str, limit: int = 2048) -> Tuple[str, str]:
+def _sha_and_preview(text: str, limit: int = 2048) -> tuple[str, str]:
     if not text:
         return ("", "")
     data = text.encode("utf-8", errors="ignore")
@@ -450,7 +450,7 @@ def _sha_and_preview(text: str, limit: int = 2048) -> Tuple[str, str]:
 
 
 def _decide(status: str, result_text: Any, exit_code: Optional[int],
-            blocked_flag: bool = False) -> Tuple[str, str]:
+            blocked_flag: bool = False) -> tuple[str, str]:
     """Infer (decision, result_enum) from post-hook signals.
 
     decision ∈ {"allowed", "blocked"}; result ∈ {"success", "error", "timeout"}.
@@ -472,10 +472,10 @@ def _decide(status: str, result_text: Any, exit_code: Optional[int],
     return ("allowed", "success")
 
 
-def _summarize_skill_args(args: Any) -> Dict[str, Any]:
+def _summarize_skill_args(args: Any) -> dict[str, Any]:
     if not isinstance(args, dict):
         return {}
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for key in ("action", "name", "skill_name", "skill", "source", "version", "force"):
         val = args.get(key)
         if val is None:
@@ -497,12 +497,12 @@ def _current_username() -> str:
     """
     try:
         from gateway.session_context import get_session_env
-    except Exception:  # noqa: BLE001 — plugin must stay loadable standalone
+    except Exception:
         return ""
     return str(get_session_env("HERMES_SESSION_USER_NAME", "") or "").strip()[:128]
 
 
-def _common_fields(tool_call_id: str, trace_id: str) -> Dict[str, Any]:
+def _common_fields(tool_call_id: str, trace_id: str) -> dict[str, Any]:
     """Fields attached to every event: identity, timing, sandbox.
 
     Note: ``actor`` is intentionally NOT sent. The spec marks it as
@@ -510,9 +510,9 @@ def _common_fields(tool_call_id: str, trace_id: str) -> Dict[str, Any]:
     reports); client self-report is ignored. ``username`` is the real
     triggering user and is the only client-attested identity.
     """
-    body: Dict[str, Any] = {
+    body: dict[str, Any] = {
         "event_id": uuid.uuid4().hex,
-        "event_time": datetime.now(timezone.utc).isoformat(),
+        "event_time": datetime.now(UTC).isoformat(),
         "execution_id": tool_call_id or "",
         "trace_id": trace_id,
         "actor_type": "agent",
@@ -542,14 +542,14 @@ def _build_command_body(
     matched_rules: list,
     tool_call_id: str,
     trace_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     exit_code, stdout, stderr, result_cwd, blocked = _parse_terminal_result(result)
     decision, result_enum = _decide(status, result, exit_code, blocked)
     stdout_sha, stdout_preview = _sha_and_preview(stdout)
     stderr_sha, stderr_preview = _sha_and_preview(stderr)
     cwd = result_cwd or (str(args.get("workdir") or "") if isinstance(args, dict) else "")
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "command": command,
         "cwd": cwd,
         "matched_rules": matched_rules,
@@ -587,7 +587,7 @@ def _build_skill_body(
     duration_ms: int,
     tool_call_id: str,
     trace_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     summary = _summarize_skill_args(args)
     exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
     decision, result_enum = _decide(status, result, exit_code, blocked)
@@ -596,7 +596,7 @@ def _build_skill_body(
     version = str(summary.get("version") or "")
     destructive = bool(summary.get("force")) or action.lower() in {"delete", "uninstall", "remove", "update"}
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "summary": f"{action} {name}".strip(),
         "destructive": destructive,
         "caller_type": "agent",
@@ -628,13 +628,13 @@ def _build_skill_view_body(
     duration_ms: int,
     tool_call_id: str,
     trace_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """skill_view loads a skill's content into the conversation; the model
     then executes it. Execution itself is prompt-driven (no separate tool
     call), so reporting the load is the only auditable signal that a skill
     ran — reported on every invocation (fork, 2026-09-03)."""
     summary_args = args if isinstance(args, dict) else {}
-    data: Dict[str, Any] = {}
+    data: dict[str, Any] = {}
     if isinstance(result, str):
         try:
             parsed = json.loads(result)
@@ -653,7 +653,7 @@ def _build_skill_view_body(
     ok = bool(data.get("success", True)) and status != "error"
     decision, result_enum = _decide(status, result, None, False)
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "summary": f"load {name}".strip(),
         "skill_name": name,
         "file_path": str(summary_args.get("file_path") or ""),
@@ -684,7 +684,7 @@ def _build_file_write_body(
     duration_ms: int,
     tool_call_id: str,
     trace_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """write_file/patch mutate file content — the only remaining data-
     destructive channel when deletion is whitelisted out (an agent blocked
     on ``rm`` can still blank/overwrite files). Reported on every call
@@ -707,7 +707,7 @@ def _build_file_write_body(
     exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
     decision, result_enum = _decide(status, result, exit_code, blocked)
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "summary": f"{tool_name} {path}".strip(),
         "path": path,
         "tool": tool_name,
@@ -742,16 +742,16 @@ def _build_code_body(
     duration_ms: int,
     tool_call_id: str,
     trace_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """execute_code runs arbitrary local Python — subprocess/os.system never
     pass through the terminal guard, so every call is reported (HIGH when the
     code matches process-spawn / dynamic-exec indicators, else MEDIUM)."""
-    exit_code, stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
+    exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
     decision, result_enum = _decide(status, result, exit_code, blocked)
     code_sha, code_preview = _sha_and_preview(code)
     risky = _CODE_RISKY_RE.search(code) is not None
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "code_sha256": code_sha,
         "code_preview": code_preview,
         "spawned_process_hint": risky,
@@ -783,12 +783,12 @@ def _build_computer_use_body(
     duration_ms: int,
     tool_call_id: str,
     trace_id: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     exit_code, _stdout, _stderr, _cwd, blocked = _parse_terminal_result(result)
     decision, result_enum = _decide(status, result, exit_code, blocked)
     action = str(args.get("action") or "") if isinstance(args, dict) else ""
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "summary": action,
         "caller_type": "agent",
     }
@@ -836,7 +836,7 @@ def _on_post_tool_call(
     try:
         url = _intake_url()
         if not url:
-            return None  # feature off — no-op, no worker
+            return  # feature off — no-op, no worker
         global _HTTP_WARNED
         if not _HTTP_WARNED and url.lower().startswith("http://"):
             _HTTP_WARNED = True
@@ -846,7 +846,7 @@ def _on_post_tool_call(
             )
 
         trace_id = api_request_id or turn_id or ""
-        body: Optional[Dict[str, Any]] = None
+        body: Optional[dict[str, Any]] = None
 
         if tool_name == "terminal" and isinstance(args, dict):
             command = str(args.get("command") or "")
@@ -887,13 +887,13 @@ def _on_post_tool_call(
             )
 
         if body is None:
-            return None
+            return
 
         _ensure_worker()
         _enqueue(body)
-    except Exception as exc:  # noqa: BLE001 — never break the agent loop
+    except Exception as exc:
         logger.debug("audit-callback: post_tool_call handler error (%s)", exc)
-    return None
+    return
 
 
 def register(ctx) -> None:

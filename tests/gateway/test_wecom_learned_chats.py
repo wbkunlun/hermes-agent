@@ -65,7 +65,7 @@ class TestLearnedChatsPersistence:
 
     @pytest.mark.asyncio
     async def test_group_learn_survives_restart(self, tmp_path):
-        import plugins.platforms.wecom.learned_chats as learned_chats
+        from plugins.platforms.wecom import learned_chats
 
         cache = tmp_path / "wecom_learned_chats.json"
         with patch.object(learned_chats, "LEARNED_CHATS_PATH", cache):
@@ -83,7 +83,7 @@ class TestLearnedChatsPersistence:
 
     @pytest.mark.asyncio
     async def test_corrupt_file_degrades_to_empty(self, tmp_path):
-        import plugins.platforms.wecom.learned_chats as learned_chats
+        from plugins.platforms.wecom import learned_chats
 
         cache = tmp_path / "wecom_learned_chats.json"
         cache.write_text("{not json")
@@ -103,7 +103,7 @@ class TestLearnedChatsPersistence:
     async def test_persisted_group_routes_sends_as_group(self, tmp_path):
         """The point of persistence: a fresh instance must take the GROUP send branch
         (proactive chat_type=2), not the DM branch that lost the 17:31 notification."""
-        import plugins.platforms.wecom.learned_chats as learned_chats
+        from plugins.platforms.wecom import learned_chats
 
         cache = tmp_path / "wecom_learned_chats.json"
         cache.write_text(json.dumps({"groups": ["wrhR9"], "dm_userid": {}}))

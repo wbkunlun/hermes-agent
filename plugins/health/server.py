@@ -16,7 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional
 
-Builder = Callable[[], Dict[str, Any]]
+Builder = Callable[[], dict[str, Any]]
 _KNOWN_PATHS = ("/health", "/health/detail")
 
 
@@ -24,7 +24,7 @@ def make_handler(*, build_detail: Builder, logger: logging.Logger) -> type:
     class HealthHandler(BaseHTTPRequestHandler):
         server_version = "hermes-health/0.1"
 
-        def _respond(self, code: int, body: Dict[str, Any], head_only: bool = False) -> None:
+        def _respond(self, code: int, body: dict[str, Any], head_only: bool = False) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")

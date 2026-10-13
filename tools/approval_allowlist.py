@@ -365,9 +365,7 @@ class _DangerousOpCollector(ast.NodeVisitor):
     def _handle_os_call(self, node, attr: str) -> None:
         if attr in self._OS_FILE_OPS:
             self._map_file_op(node, self._OS_FILE_OPS[attr])
-        elif attr in self._OS_SHELL_OPS:
-            self._handle_process_call(node, f"os.{attr}")
-        elif attr.startswith(self._OS_EXEC_OPS_PREFIX):
+        elif attr in self._OS_SHELL_OPS or attr.startswith(self._OS_EXEC_OPS_PREFIX):
             self._handle_process_call(node, f"os.{attr}")
 
     def _handle_process_call(self, node, description: str) -> None:

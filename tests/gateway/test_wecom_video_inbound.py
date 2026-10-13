@@ -22,7 +22,6 @@ class TestExtractVideoRef:
 
         async def fake_cache(kind, media):
             seen.append(kind)
-            return None
 
         monkeypatch.setattr(adapter, "_cache_media", fake_cache)
         await adapter._extract_media({
@@ -38,7 +37,6 @@ class TestExtractVideoRef:
 
         async def fake_cache(kind, media):
             seen.append(kind)
-            return None
 
         monkeypatch.setattr(adapter, "_cache_media", fake_cache)
         await adapter._extract_media({

@@ -59,7 +59,7 @@ def test_short_turn_unchanged():
     d.thinking_lines = ["🤔 正在思考中..."]
     d.accumulated_text = "答案是 42"
     asyncio.run(d._finalize())
-    (finalize, text), = [c for c in d.adapter.calls if c[0]]
+    (_finalize_flag, text), = [c for c in d.adapter.calls if c[0]]
     assert "🤔 正在思考中..." in text and "答案是 42" in text  # small turns keep full think block
     assert d._final_response_sent is True
 
