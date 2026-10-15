@@ -127,7 +127,11 @@ async def test_follow_session_runs_the_profiles_current_toolsets_and_a_frozen_on
         # The toolsets the turn's agent is built with (``_run_agent_display_settings``).
         assert set(policy.current_toolsets(policy.config(authority))) == before['follow'] - {'web'}
         with policy_scope(policy_for_source(runner, pinned.source), authority=authority):
-            assert set(active_policy().toolsets) == before['pinned'] == {'web'}
+            # FORK(wbkunlun): the wecom plugin's 16 business tools register the default-on
+            # "wecom" toolset (unlike a2a we have not flipped it to opt-in — that would strip
+            # the tools from every unpinned production session), so the pinned exact-set
+            # assertion includes it. Upstream pinned semantics otherwise identical.
+            assert set(active_policy().toolsets) == before['pinned'] == {'web'} | {'wecom'}
     finally:
         await owner.close()
         store.close_all_db_handles()

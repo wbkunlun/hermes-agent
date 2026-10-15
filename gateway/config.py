@@ -485,7 +485,11 @@ DEFAULT_STREAMING_CURSOR: str = " ▉"
 @dataclass
 class StreamingConfig:
     """Real-time token streaming to messaging platforms."""
-    enabled: bool = True  # fork: default-on (upstream defaults to False)
+    enabled: bool = False  # FORK(wbkunlun): keep the upstream default — the runner's WeCom gate
+    # (gateway/run_turn_runner.py) and the _proxy_stream_consumer WeCom exemptions force wecom
+    # streaming on regardless, and a global default-on here materializes a stream consumer for
+    # LOCAL/native sessions, whose confirmed "delivery" then suppresses the message.complete
+    # final text (native viewers hang on a null completion).
     # "auto" prefers native drafts (Telegram sendMessageDraft) with edit fallback (adapters without
     # draft support use the edit path unchanged); "draft" / "edit" force one; "off" disables.
     transport: str = "auto"

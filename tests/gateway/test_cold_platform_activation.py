@@ -64,9 +64,11 @@ def test_configured_platform_still_enabled_and_only_it_is_imported(tmp_path, cas
         # sms is enabled by TWILIO_* (its manifest requires_env), not an SMS_ prefix.
         "manifest_env": ({"env": {"TWILIO_ACCOUNT_SID": "ACfake", "TWILIO_AUTH_TOKEN": "x",
                                   "TWILIO_PHONE_NUMBER": "+15550000000"}}, "sms", "sms"),
-        # wecom_callback is registered by the wecom plugin.
-        "yaml_sibling": ({"config_yaml": "platforms:\n  wecom_callback:\n    enabled: true\n    extra:\n"
-                                         "      corp_id: c\n      corp_secret: s\n"}, "wecom_callback", "wecom"),
+        # FORK(wbkunlun): the wecom_callback platform was removed in v2026.10.10-fork2
+        # (self-built-app callback family dropped from this deployment); the yaml-sibling
+        # case exercises the fork's own wecom platform instead.
+        "yaml_sibling": ({"config_yaml": "platforms:\n  wecom:\n    enabled: true\n    extra:\n"
+                                         "      corp_id: c\n      corp_secret: s\n"}, "wecom", "wecom"),
     }[case]
     result = _load(tmp_path, **kwargs)
     assert want in result["enabled"]
