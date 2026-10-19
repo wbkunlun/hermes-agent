@@ -478,8 +478,11 @@ def _system_remediation(readiness: dict[str, Any]) -> str:
 
 def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Shared readiness rollup (state.db ro-probe / config / disk / gateway /
-    queues) plus memory pressure from the heartbeat file. Never raises."""
+    queues) plus memory pressure from the heartbeat file. Never raises. Multiple
+    concurrent problems collect into one '；'-joined remediation instead of
+    overwriting each other."""
     out: dict[str, Any] = {"status": "ok"}
+    hints: list[str] = []
     try:
         from gateway.readiness import collect_runtime_readiness
         record = runtime_status if runtime_status is not None else _read_gateway_state(home)
@@ -488,7 +491,7 @@ def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None)
         out["checks"] = readiness.get("checks", {})
         if readiness.get("status") != "ok":
             out["status"] = "degraded"
-            out["remediation"] = _system_remediation(readiness)
+            hints.append(_system_remediation(readiness))
     except Exception as exc:
         out.update({"status": "unknown", "detail": f"readiness failed: {type(exc).__name__}"})
         return out
@@ -498,9 +501,11 @@ def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None)
         out["memory"] = memory
         if memory.get("pressure") == "critical":
             out["status"] = "degraded"
-            out["remediation"] = "内存水位 critical：重启容器释放内存"
+            hints.append("内存水位 critical：重启容器释放内存")
     except Exception:
         out["memory"] = {"pressure": "unknown"}
+    if hints:
+        out["remediation"] = "；".join(hints)
     return out
 
 

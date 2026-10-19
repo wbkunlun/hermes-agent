@@ -446,6 +446,14 @@ class TestSystemProbe:
         out = lib.probe_system(home, runtime_status={})
         assert out["status"] == "degraded" and "内存" in out["remediation"]
 
+    def test_readiness_and_critical_memory_both_reported(self, lib, home, monkeypatch):
+        import gateway.memory_status as gw_mem
+        monkeypatch.setattr(gw_mem, "collect_memory_status",
+                            lambda home=None, **kw: {"pressure": "critical"})
+        out = lib.probe_system(home, runtime_status={})  # 无 model 配置 → readiness degraded
+        assert out["status"] == "degraded"
+        assert "未配置模型" in out["remediation"] and "内存水位 critical" in out["remediation"]
+
 
 # ---------------------------------------------------------------------------
 # Aggregate + payload build (Task 4)
