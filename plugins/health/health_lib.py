@@ -348,22 +348,36 @@ def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: s
     label = _PLATFORM_LABELS.get(platform, platform)
     state = str(entry.get("state") or "unknown").lower()
     needs_attention = bool(entry.get("needs_attention"))
+    error_code = entry.get("error_code")
+    error_message = entry.get("error_message")
+    if isinstance(error_message, str) and len(error_message) > 200:
+        error_message = error_message[:200] + "…"
+    err_suffix = ""
+    if error_code is not None or error_message:
+        err_suffix = f"; last error: code={error_code}, msg={error_message or ''}"
     out: dict[str, Any] = {"status": "ok", "platform": platform, "state": state,
                            "needs_attention": needs_attention,
-                           "retrying_since": entry.get("retrying_since")}
+                           "retrying_since": entry.get("retrying_since"),
+                           "error_code": error_code, "error_message": error_message}
     if state in _CONNECTED_STATES and not needs_attention:
         return out
+    if state == "fatal":
+        out.update({"status": "down",
+                    "detail": f"adapter fatal: code={error_code}, msg={error_message or 'unknown'}",
+                    "remediation": f"{label} 适配器致命错误：按 error_message 定位"
+                                   f"（凭证失效/协议变更/token 缺失），处理后重启容器"})
+        return out
     if needs_attention:
-        out.update({"status": "down", "detail": "reconnect loop escalated (needs_attention)",
+        out.update({"status": "down", "detail": "reconnect loop escalated (needs_attention)" + err_suffix,
                     "remediation": f"{label} 持续重连失败：检查平台凭证与网络出口"})
         return out
     retrying_since = _iso_to_epoch(entry.get("retrying_since"))
     if retrying_since is not None and (now - retrying_since) > platform_down_minutes * 60.0:
         minutes = int((now - retrying_since) // 60)
-        out.update({"status": "down", "detail": f"disconnected and retrying for {minutes} min",
+        out.update({"status": "down", "detail": f"disconnected and retrying for {minutes} min" + err_suffix,
                     "remediation": f"{label} 断连超过阈值：检查平台凭证与网络出口"})
         return out
-    out.update({"status": "degraded", "detail": f"state={state} (reconnecting)",
+    out.update({"status": "degraded", "detail": f"state={state} (reconnecting)" + err_suffix,
                 "remediation": f"{label} 连接异常重连中；持续断连检查平台凭证与网络"})
     return out
 

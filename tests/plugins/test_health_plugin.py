@@ -313,6 +313,32 @@ class TestPlatformProbe:
         _write_gateway_state(home, self._record(state="connected", needs_attention=True))
         assert lib.probe_platform(home)["status"] == "down"
 
+    def test_fatal_is_down_with_reason(self, lib, home):
+        _write_gateway_state(home, self._record(
+            state="fatal", error_code="weixin_missing_token",
+            error_message="Weixin startup failed: WEIXIN_TOKEN is required"))
+        out = lib.probe_platform(home)
+        assert out["status"] == "down"
+        assert "adapter fatal" in out["detail"] and "weixin_missing_token" in out["detail"]
+        assert out["error_code"] == "weixin_missing_token"
+        assert out["error_message"].startswith("Weixin startup failed")
+        assert "致命" in out["remediation"]
+
+    def test_down_detail_appends_last_error(self, lib, home):
+        _write_gateway_state(home, self._record(
+            state="disconnected", retrying_since=_iso_ago(900),
+            error_code=846609, error_message="send proactive markdown failed"))
+        out = lib.probe_platform(home, platform_down_minutes=10.0)
+        assert out["status"] == "down"
+        assert "846609" in out["detail"] and "send proactive markdown failed" in out["detail"]
+
+    def test_long_error_message_truncated(self, lib, home):
+        _write_gateway_state(home, self._record(state="fatal", error_code="boom",
+                                                 error_message="x" * 500))
+        out = lib.probe_platform(home)
+        assert len(out["error_message"]) == 201  # 200 + 省略号
+        assert out["error_message"].endswith("…")
+
 
 class TestStalePlatformEntries:
     """gateway_state.json 里的残留条目（上个进程所写）不得拉低聚合（2026-10-15 weixin 假阳性）。"""
