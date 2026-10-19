@@ -177,13 +177,16 @@ class HealthCounters:
 # ---------------------------------------------------------------------------
 
 def model_check(snapshot: dict[str, Any], *, now_epoch: Optional[float] = None,
-                consecutive_down: int = 3, inflight_stale_s: float = 600.0) -> dict[str, Any]:
+                consecutive_down: int = 3, inflight_stale_s: float = 600.0,
+                idle_stale_s: Optional[float] = None) -> dict[str, Any]:
     """Passive model health. ``down`` needs ``consecutive_down`` failures with no
     interleaved success (the streak counter resets on success, so the streak
     alone proves it). ``degraded`` covers error/success mixes (≈ serving via
     fallback) and a call stuck in flight past ``inflight_stale_s`` (default
     tolerates long-thinking reasoning models). An idle window is ``no_data`` —
-    silence is not sickness."""
+    silence is not sickness; the same principle demotes a ``down`` streak to
+    ``degraded`` (stale verdict) once no traffic crossed ``idle_stale_s``
+    (default = the snapshot window) since the last failure."""
     out: dict[str, Any] = {
         "status": "ok",
         "last_success_at": snapshot.get("last_success_at"),
@@ -204,6 +207,17 @@ def model_check(snapshot: dict[str, Any], *, now_epoch: Optional[float] = None,
         out["remediation"] = "模型调用长时间无返回：查代理出口/provider 状态；持续超时可在 WeCom 发 /stop 重置会话"
         return out
     if streak >= consecutive_down:
+        now = time.time() if now_epoch is None else now_epoch
+        last_error_ts = snapshot.get("last_error_ts")
+        idle_stale = (float(snapshot.get("window_s") or 0) if idle_stale_s is None
+                      else float(idle_stale_s))
+        if (out["calls"] == 0 and out["errors"] == 0 and last_error_ts is not None
+                and (now - float(last_error_ts)) > idle_stale):
+            out["status"] = "degraded"
+            out["detail"] = (f"{streak} consecutive failures earlier; no traffic for "
+                             f"{int((now - float(last_error_ts)) // 60)} min (stale verdict)")
+            out["remediation"] = "此前模型连续失败但已长时间无流量：发一条消息探测恢复情况"
+            return out
         reason = (out["last_error"] or {}).get("reason") or ""
         out["status"] = "down"
         out["detail"] = f"{streak} consecutive API failures"

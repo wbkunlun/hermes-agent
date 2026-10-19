@@ -203,6 +203,26 @@ class TestModelCheck:
         snap = _snap(lib, in_flight=True, in_flight_age=30.0, calls=1, last_success=990.0)
         assert lib.model_check(snap, now_epoch=1000.0)["status"] == "ok"
 
+    def test_idle_window_downgrades_to_stale_degraded(self, lib):
+        # 3 连败发生在窗口外（events 已剪光），之后零流量：down 判定已陈旧
+        snap = _snap(lib, calls=0, errors=0, consecutive=3, last_error=90.0,
+                     last_error_info={"reason": "auth"})
+        out = lib.model_check(snap, now_epoch=1000.0, consecutive_down=3, idle_stale_s=900.0)
+        assert out["status"] == "degraded"
+        assert "stale verdict" in out["detail"]
+        assert "探测" in out["remediation"]
+
+    def test_idle_window_uses_window_s_by_default(self, lib):
+        snap = _snap(lib, calls=0, errors=0, consecutive=3, last_error=90.0, window_s=900)
+        out = lib.model_check(snap, now_epoch=1000.0, consecutive_down=3)  # 910s > 900s 窗口
+        assert out["status"] == "degraded" and "stale verdict" in out["detail"]
+
+    def test_recent_error_keeps_down(self, lib):
+        snap = _snap(lib, calls=3, errors=3, consecutive=3, last_error=995.0,
+                     last_error_info={"reason": "auth"})
+        out = lib.model_check(snap, now_epoch=1000.0, consecutive_down=3, idle_stale_s=900.0)
+        assert out["status"] == "down" and "API key" in out["remediation"]
+
 
 class TestStuckCheck:
     def test_ok_when_no_inbound(self, lib):
