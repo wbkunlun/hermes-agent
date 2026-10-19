@@ -425,6 +425,21 @@ class TestPlatformsProbe:
         assert "WeCom" in out["remediation"]
 
 
+class TestCpuProbe:
+    def test_loadavg_available(self, lib, monkeypatch):
+        monkeypatch.setattr(lib.os, "getloadavg", lambda: (1.5, 1.2, 0.9), raising=False)
+        monkeypatch.setattr(lib.os, "process_cpu_count", lambda: 4, raising=False)
+        out = lib.probe_cpu()
+        assert out == {"available": True, "loadavg_1m": 1.5, "loadavg_5m": 1.2,
+                       "loadavg_15m": 0.9, "cores": 4, "load1_per_core": 0.38}
+
+    def test_unavailable_when_getloadavg_raises(self, lib, monkeypatch):
+        def _boom():
+            raise OSError("no loadavg")
+        monkeypatch.setattr(lib.os, "getloadavg", _boom, raising=False)
+        assert lib.probe_cpu() == {"available": False}
+
+
 class TestSystemProbe:
     def test_all_ok_with_model_config(self, lib, home):
         (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
@@ -432,6 +447,7 @@ class TestSystemProbe:
         assert out["status"] == "ok"
         assert out["checks"]["model"]["status"] == "ok"
         assert "memory" in out
+        assert out["cpu"]["available"] is True
 
     def test_missing_model_config_degraded(self, lib, home):
         out = lib.probe_system(home, runtime_status={})

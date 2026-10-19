@@ -476,6 +476,35 @@ def _system_remediation(readiness: dict[str, Any]) -> str:
     return "系统检查异常：查看 /health/detail 的 system.checks 明细"
 
 
+def _cpu_cores() -> Optional[int]:
+    try:
+        return max(1, int(os.process_cpu_count()))  # 3.13+
+    except AttributeError:
+        pass
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        pass
+    try:
+        return max(1, int(os.cpu_count() or 1))
+    except Exception:
+        return None
+
+
+def probe_cpu() -> dict[str, Any]:
+    """Load-average info block, deliberately status-neutral: inside Docker ``/proc/loadavg``
+    is the host's unless lxcfs remounts it, so thresholds here would page on host noise.
+    The real 'CPU starved the gateway' signal is the loop heartbeat (probe_loop → down)."""
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cores = _cpu_cores()
+        return {"available": True, "loadavg_1m": round(load1, 2), "loadavg_5m": round(load5, 2),
+                "loadavg_15m": round(load15, 2), "cores": cores,
+                "load1_per_core": round(load1 / cores, 2) if cores else None}
+    except Exception:
+        return {"available": False}
+
+
 def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Shared readiness rollup (state.db ro-probe / config / disk / gateway /
     queues) plus memory pressure from the heartbeat file. Never raises. Multiple
@@ -509,6 +538,7 @@ def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None)
         out["memory"] = {"pressure": "unknown"}
     if hints:
         out["remediation"] = "；".join(hints)
+    out["cpu"] = probe_cpu()
     return out
 
 
