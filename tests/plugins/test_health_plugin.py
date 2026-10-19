@@ -60,6 +60,14 @@ def _write_gateway_state(home: Path, payload: dict) -> None:
     (home / "gateway_state.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _own_start_time() -> int:
+    """Real per-process start fingerprint so probe_process's (pid, start_time) liveness
+    guard passes and platform entries stamped with it count as current-process-owned."""
+    import os
+    import gateway.status as gw_status
+    return gw_status._get_process_start_time(os.getpid())
+
+
 # ---------------------------------------------------------------------------
 # HealthCounters (Task 1)
 # ---------------------------------------------------------------------------
@@ -306,6 +314,54 @@ class TestPlatformProbe:
         assert lib.probe_platform(home)["status"] == "down"
 
 
+class TestStalePlatformEntries:
+    """gateway_state.json 里的残留条目（上个进程所写）不得拉低聚合（2026-10-15 weixin 假阳性）。"""
+
+    def _state(self, platforms, start_time=7):
+        return {"pid": 999, "gateway_state": "running", "start_time": start_time,
+                "platforms": platforms}
+
+    def test_stale_entry_unknown_with_leftover_detail(self, lib, home):
+        _write_gateway_state(home, self._state({
+            "weixin": {"state": "fatal", "error_code": "weixin_missing_token",
+                       "error_message": "Weixin startup failed: WEIXIN_TOKEN is required",
+                       "writer_start_time": 42, "updated_at": _iso_ago(62 * 86400)}}))
+        out = lib.probe_platforms(home)
+        entry = out["platforms"]["weixin"]
+        assert entry["status"] == "unknown"
+        assert "残留" in entry["detail"] and "62" in entry["detail"]
+        assert "remediation" not in entry
+        assert entry["error_code"] == "weixin_missing_token"
+        assert out["status"] == "unknown"  # 中性，不是 degraded
+
+    def test_missing_writer_start_time_is_stale(self, lib, home):
+        _write_gateway_state(home, self._state({
+            "weixin": {"state": "fatal", "error_code": "weixin_missing_token",
+                       "updated_at": "2026-08-14T01:02:02"}}))
+        out = lib.probe_platforms(home)
+        assert out["platforms"]["weixin"]["status"] == "unknown"
+        assert "残留" in out["platforms"]["weixin"]["detail"]
+
+    def test_owned_entry_not_stale(self, lib, home):
+        _write_gateway_state(home, self._state({
+            "wecom": {"state": "connected", "writer_start_time": 7,
+                      "updated_at": _iso_ago(30)}}))
+        out = lib.probe_platforms(home)
+        assert out["platforms"]["wecom"]["status"] == "ok"
+        assert out["status"] == "ok"
+
+    def test_mixed_owned_and_stale_aggregates_ok(self, lib, home):
+        _write_gateway_state(home, self._state({
+            "wecom": {"state": "connected", "writer_start_time": 7,
+                      "updated_at": _iso_ago(30)},
+            "weixin": {"state": "fatal", "error_code": "weixin_missing_token",
+                       "writer_start_time": 42, "updated_at": _iso_ago(62 * 86400)}}))
+        out = lib.probe_platforms(home)
+        assert out["status"] == "ok"
+        assert out["platforms"]["wecom"]["status"] == "ok"
+        assert out["platforms"]["weixin"]["status"] == "unknown"
+
+
 class TestPlatformsProbe:
     def test_missing_state_falls_back_to_wecom_unknown(self, lib, home):
         out = lib.probe_platforms(home)
@@ -313,8 +369,9 @@ class TestPlatformsProbe:
         assert out["platform"] == "wecom"  # single-probe fallback shape
 
     def test_both_connected_ok(self, lib, home):
-        _write_gateway_state(home, {"pid": 1, "platforms": {
-            "wecom": {"state": "connected"}, "wework": {"state": "connected"}}})
+        _write_gateway_state(home, {"pid": 1, "start_time": 7, "platforms": {
+            "wecom": {"state": "connected", "writer_start_time": 7},
+            "wework": {"state": "connected", "writer_start_time": 7}}})
         out = lib.probe_platforms(home)
         assert out["status"] == "ok"
         assert set(out["platforms"]) == {"wecom", "wework"}
@@ -322,9 +379,10 @@ class TestPlatformsProbe:
         assert "remediation" not in out
 
     def test_wework_down_worst_wins_with_label(self, lib, home):
-        _write_gateway_state(home, {"pid": 1, "platforms": {
-            "wecom": {"state": "connected"},
-            "wework": {"state": "disconnected", "retrying_since": _iso_ago(1200)}}})
+        _write_gateway_state(home, {"pid": 1, "start_time": 7, "platforms": {
+            "wecom": {"state": "connected", "writer_start_time": 7},
+            "wework": {"state": "disconnected", "retrying_since": _iso_ago(1200),
+                        "writer_start_time": 7}}})
         out = lib.probe_platforms(home, platform_down_minutes=10.0)
         assert out["status"] == "down"
         assert out["platforms"]["wework"]["status"] == "down"
@@ -332,9 +390,10 @@ class TestPlatformsProbe:
         assert "[wework]" in out["remediation"] and "WeWork" in out["remediation"]
 
     def test_wecom_degraded_only(self, lib, home):
-        _write_gateway_state(home, {"pid": 1, "platforms": {
-            "wecom": {"state": "disconnected", "retrying_since": _iso_ago(30)},
-            "wework": {"state": "connected"}}})
+        _write_gateway_state(home, {"pid": 1, "start_time": 7, "platforms": {
+            "wecom": {"state": "disconnected", "retrying_since": _iso_ago(30),
+                      "writer_start_time": 7},
+            "wework": {"state": "connected", "writer_start_time": 7}}})
         out = lib.probe_platforms(home)
         assert out["status"] == "degraded"
         assert "WeCom" in out["remediation"]
@@ -380,9 +439,11 @@ class TestBuildDetail:
     def _home_fresh(self, home):
         import os
         _write_heartbeat(home, age_s=5.0, start_age_s=100.0)
-        # own PID so the process probe sees the state file as ours (not a foreign gateway)
+        # own PID + real start fingerprint so the process probe sees the state file as ours
         _write_gateway_state(home, {"pid": os.getpid(), "gateway_state": "running",
-                                    "platforms": {"wecom": {"state": "connected"}}})
+                                    "start_time": _own_start_time(),
+                                    "platforms": {"wecom": {"state": "connected",
+                                                             "writer_start_time": _own_start_time()}}})
 
     def test_shape_and_ok(self, lib, home):
         self._home_fresh(home)
@@ -406,8 +467,10 @@ class TestBuildDetail:
         import os
         _write_heartbeat(home, age_s=5.0)
         _write_gateway_state(home, {"pid": os.getpid(), "gateway_state": "running",
+                                    "start_time": _own_start_time(),
                                     "platforms": {"wecom": {"state": "disconnected",
-                                                            "retrying_since": _iso_ago(1200)}}})
+                                                            "retrying_since": _iso_ago(1200),
+                                                            "writer_start_time": _own_start_time()}}})
         detail = lib.build_health_detail(
             lib.HealthCounters().snapshot(), home=home)
         assert detail["platform"]["status"] == "down"

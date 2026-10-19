@@ -368,11 +368,32 @@ def probe_platform(home: Path, *, now_epoch: Optional[float] = None, platform: s
     return out
 
 
+def _entry_is_stale(entry: dict[str, Any], record_start_time: Any) -> bool:
+    """A platform entry is a leftover when THIS process did not write it. Every write stamps
+    ``writer_start_time`` from the writer's own fingerprint (``gateway/status.py``); the
+    fingerprint is opaque (clock ticks on Linux), so only equality is meaningful — never
+    ordering. An entry without the field predates the field itself, hence predates us."""
+    if "writer_start_time" not in entry:
+        return True
+    return entry.get("writer_start_time") != record_start_time
+
+
+def _stale_platform_block(entry: dict[str, Any], now: float) -> dict[str, Any]:
+    """Leftover from a previous gateway process: neutral ``unknown``, excluded from any
+    remediation — the current config not starting the platform IS the healthy state."""
+    written = _iso_to_epoch(entry.get("updated_at"))
+    age = f"（上次写入 {max(0, int((now - written) // 86400))} 天前）" if written is not None else ""
+    return {"status": "unknown", "state": entry.get("state"),
+            "error_code": entry.get("error_code"), "error_message": entry.get("error_message"),
+            "detail": f"残留记录：当前进程从未写入该平台{age}；当前配置未启用即无害残留"}
+
+
 def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
                     platform_down_minutes: float = 10.0) -> dict[str, Any]:
-    """Every started chat platform in gateway_state.json (this deployment runs
-    wecom + wework), each probed individually; worst status wins. With no
-    platform entries yet the block falls back to a single wecom probe (which
+    """Every started chat platform in gateway_state.json, each probed individually; worst
+    status wins. Entries written by a previous gateway process (``_entry_is_stale``) are
+    reported as neutral ``unknown`` leftovers so a frozen record cannot page as degraded.
+    With no platform entries yet the block falls back to a single wecom probe (which
     reports ``unknown / not started``) so the shape stays stable."""
     try:
         record = _read_gateway_state(home)
@@ -384,10 +405,17 @@ def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
     if not names:
         return probe_platform(home, now_epoch=now_epoch, platform="wecom",
                               platform_down_minutes=platform_down_minutes)
+    record_start_time = record.get("start_time") if isinstance(record, dict) else None
+    now = time.time() if now_epoch is None else now_epoch
     entries: dict[str, Any] = {}
     statuses = []
     remediations = []
     for name in names:
+        raw = platforms[name]
+        if _entry_is_stale(raw, record_start_time):
+            entries[name] = _stale_platform_block(raw, now)
+            statuses.append("unknown")
+            continue
         block = probe_platform(home, now_epoch=now_epoch, platform=name,
                                platform_down_minutes=platform_down_minutes)
         entries[name] = block
