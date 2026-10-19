@@ -502,6 +502,9 @@ def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None)
         if memory.get("pressure") == "critical":
             out["status"] = "degraded"
             hints.append("内存水位 critical：重启容器释放内存")
+        elif memory.get("pressure") == "elevated":
+            out["detail"] = (f"内存水位 elevated（可用 {memory.get('system_available_mb')} MB / "
+                             f"总 {memory.get('system_total_mb')} MB）")
     except Exception:
         out["memory"] = {"pressure": "unknown"}
     if hints:

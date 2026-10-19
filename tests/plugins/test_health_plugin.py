@@ -454,6 +454,18 @@ class TestSystemProbe:
         assert out["status"] == "degraded"
         assert "未配置模型" in out["remediation"] and "内存水位 critical" in out["remediation"]
 
+    def test_elevated_memory_hinted_not_degraded(self, lib, home, monkeypatch):
+        (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
+        import gateway.memory_status as gw_mem
+        monkeypatch.setattr(gw_mem, "collect_memory_status",
+                            lambda home=None, **kw: {"pressure": "elevated",
+                                                     "system_available_mb": 100,
+                                                     "system_total_mb": 8000})
+        out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
+        assert out["status"] == "ok"
+        assert "elevated" in out["detail"] and "100" in out["detail"]
+        assert "remediation" not in out
+
 
 # ---------------------------------------------------------------------------
 # Aggregate + payload build (Task 4)
