@@ -491,12 +491,14 @@ class TestSystemProbe:
         assert "未配置模型" in out["remediation"] and "内存水位 critical" in out["remediation"]
 
     def test_elevated_memory_hinted_not_degraded(self, lib, home, monkeypatch):
-        (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
         import gateway.memory_status as gw_mem
         monkeypatch.setattr(gw_mem, "collect_memory_status",
                             lambda home=None, **kw: {"pressure": "elevated",
                                                      "system_available_mb": 100,
                                                      "system_total_mb": 8000})
+        # 本用例测 memory 提示，不测 config 解析；run_tests.sh 的 pm 环境可能缺 PyYAML，
+        # monkeypatch 掉 _configured_model 使用例与 yaml 可用性解耦
+        monkeypatch.setattr(lib, "_configured_model", lambda home: "glm-4.7")
         out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
         assert out["status"] == "ok"
         assert "elevated" in out["detail"] and "100" in out["detail"]
@@ -557,6 +559,26 @@ class TestBuildDetail:
             lib.HealthCounters().snapshot(), home=home)
         assert detail["platform"]["status"] == "down"
         assert any("WeCom" in r for r in detail["remediation"])
+
+    def test_stale_weixin_does_not_degrade_overall(self, lib, home, monkeypatch):
+        """2026-10-15 生产假阳性复现：两个月前遗留的 weixin fatal 残留不得拉低总状态。"""
+        import os
+        _write_heartbeat(home, age_s=5.0, start_age_s=100.0)
+        _write_gateway_state(home, {
+            "pid": os.getpid(), "gateway_state": "running", "start_time": _own_start_time(),
+            "platforms": {
+                "wecom": {"state": "connected", "writer_start_time": _own_start_time(),
+                          "updated_at": _iso_ago(30)},
+                "weixin": {"state": "fatal", "error_code": "weixin_missing_token",
+                           "error_message": "Weixin startup failed: WEIXIN_TOKEN is required",
+                           "updated_at": "2026-08-14T01:02:02"}}})
+        # 同 test_elevated_memory_hinted_not_degraded：与 pm 环境的 PyYAML 可用性解耦
+        monkeypatch.setattr(lib, "_configured_model", lambda home: "glm-4.7")
+        detail = lib.build_health_detail(lib.HealthCounters(window_s=900).snapshot(), home=home)
+        assert detail["status"] == "ok"
+        assert detail["platform"]["platforms"]["weixin"]["status"] == "unknown"
+        assert "残留" in detail["platform"]["platforms"]["weixin"]["detail"]
+        assert detail["remediation"] == []
 
     def test_summarize_minimal(self, lib):
         detail = {"status": "degraded", "checked_at": "2026-09-15T00:00:00+00:00", "x": 1}
