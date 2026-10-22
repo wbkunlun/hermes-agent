@@ -459,9 +459,13 @@ def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
 def _configured_model(home: Path) -> str:
     """model from config.yaml, mirroring gateway.run._resolve_gateway_model's
     read (string, or mapping's default/model key) without importing the runner."""
+    # fork 2026-10-22 resync: read through the sanctioned raw reader (upstream's
+    # config_read_guard flags raw yaml.safe_load near config.yaml outside owner
+    # modules). read_user_config_raw swallows missing/unparseable files to {} —
+    # the same best-effort contract this probe needs.
     try:
-        import yaml
-        data = yaml.safe_load((Path(home) / "config.yaml").read_text(encoding="utf-8"))
+        from hermes_cli.config import read_user_config_raw
+        data = read_user_config_raw(Path(home) / "config.yaml")
     except Exception:
         return ""
     model_cfg = data.get("model") if isinstance(data, dict) else None

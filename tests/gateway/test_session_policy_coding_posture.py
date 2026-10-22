@@ -13,6 +13,18 @@ def create(params, config, **kwargs):
     return build_policy(params, config, workspace_posture=True, **kwargs)
 
 
+@pytest.fixture(autouse=True)
+def _no_plugin_toolsets(monkeypatch):
+    """Pin built-in posture semantics only. (fork 2026-10-22: the bundled wecom
+    plugin registers a 'wecom' toolset at discovery, so a bare session resolves
+    ('terminal', 'wecom') here and every == ('terminal',) posture assertion
+    fails. Upstream CI has no bundled toolset plugins; project the empty list —
+    the sanctioned gateway-session seam — instead of flipping the fork's
+    wecom-toolset-default-on decision.)"""
+    from hermes_cli import tools_config
+    monkeypatch.setattr(tools_config, "_gateway_plugin_toolsets", lambda: ([], {}))
+
+
 @pytest.fixture
 def project(tmp_path):
     root = tmp_path / 'project'
@@ -60,7 +72,10 @@ def test_a_project_file_written_mid_session_does_not_switch_toolsets(tmp_path):
 
 
 def test_plugin_mcp_servers_stay_in_the_posture(project, monkeypatch):
-    monkeypatch.setattr('hermes_cli.plugins.get_portable_mcp_server_names_nowait', lambda: {'plug'})
+    # Rides the empty-projection fixture (fork: bundled wecom toolset), but the
+    # portable-MCP name must still reach the posture — project it explicitly.
+    from hermes_cli import tools_config
+    monkeypatch.setattr(tools_config, "_gateway_plugin_toolsets", lambda: ([], {'plug'}))
     assert {'coding', 'plug'} <= set(create({'source': 'gui', 'cwd': str(project)}, FOCUS).toolsets)
 
 

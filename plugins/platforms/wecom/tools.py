@@ -73,6 +73,7 @@ def cli_tools_available() -> bool:
             proc = subprocess.run(
                 [cli_bin(), "auth", "show", "--status"],
                 capture_output=True, text=True, timeout=15,
+                stdin=subprocess.DEVNULL,
                 env=subprocess_env(), check=False,
             )
             ok = proc.returncode == 0 and (proc.stdout or "").strip() == "authorized"

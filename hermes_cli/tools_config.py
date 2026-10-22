@@ -527,7 +527,13 @@ def _composite_toolsets(toolset_names: list[str], platform: str, explicitly_conf
 
 def _enabled_plugin_toolsets(config: dict, platform: str, toolset_names: list[str], plugin_ts_keys: set[str]) -> set[str]:
     """Plugin toolsets: on by default unless default-off (catalog spotify) or "known" for this platform
-    (``known_plugin_toolsets``, written on every save) and absent from the saved list."""
+    (``known_plugin_toolsets``, written on every save) and absent from the saved list.
+
+    fork 2026-10-22: an explicitly saved EMPTY list is the authoritative zero-tool state
+    (#82010) — default-on plugin toolsets must not resurrect it. Upstream never noticed
+    because upstream CI ships no bundled toolset plugins; the fork's wecom plugin does."""
+    if not toolset_names:
+        return set()
     known_for_platform = set((config.get("known_plugin_toolsets", {}) or {}).get(platform, []) or [])
     return {
         pts for pts in plugin_ts_keys

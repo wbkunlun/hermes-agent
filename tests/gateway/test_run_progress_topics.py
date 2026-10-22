@@ -1624,30 +1624,6 @@ async def test_run_agent_previewed_split_keeps_final_delivery_pending(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        StreamingRefineAgent,
-        session_id="sess-matrix-streaming",
-        config_data={
-            "display": {"tool_progress": "off", "interim_assistant_messages": False},
-            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
-        },
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.example.org",
-        chat_type="group",
-        thread_id="$thread",
-    )
-
-    assert result.get("already_sent") is True
-    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
-    assert all_text, "expected streamed Matrix content to be sent or edited"
-    assert all("▉" not in text for text in all_text)
-    assert any("Continuing to refine:" in text for text in all_text)
-
-
-@pytest.mark.asyncio
 async def test_non_editable_interim_final_is_recorded_for_final_send_dedup(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,

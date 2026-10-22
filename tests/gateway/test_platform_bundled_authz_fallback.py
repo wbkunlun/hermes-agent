@@ -25,7 +25,10 @@ def test_registered_entries_carry_exactly_the_file_declaration():
 
     discover_plugins()
     names = _bundled_with_authz()
-    assert {"telegram", "weixin", "wecom_callback", "qqbot"} <= set(names)
+    # fork 2026-10-10: the wecom_callback sibling platform was removed (no CALLBACK_AUTHZ
+    # declaration in wecom's gateway_env.py), so it never appears in names here.
+    assert {"telegram", "weixin", "qqbot"} <= set(names)
+    assert "wecom_callback" not in names
     for name in names:
         entry = platform_registry.get(name)
         declared = bundled_authz(name)

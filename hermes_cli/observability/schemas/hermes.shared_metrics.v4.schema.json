@@ -3646,7 +3646,7 @@
                 "hermes-telegram",
                 "hermes-webhook",
                 "hermes-wecom",
-                "hermes-wecom-callback",
+                "send_message",
                 "hermes-weixin",
                 "hermes-whatsapp",
                 "hermes-yuanbao",

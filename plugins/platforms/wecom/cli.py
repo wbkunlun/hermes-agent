@@ -114,6 +114,7 @@ def run_cli(
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
             env=subprocess_env(), check=False,
         )
     except FileNotFoundError as exc:
