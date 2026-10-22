@@ -40,6 +40,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from utils import env_float, env_int
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
+from gateway.platforms.send_targets import StandaloneSendPolicy, parse_nonempty
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.learned_chats import LearnedChatsMixin
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
@@ -155,6 +156,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     # BEFORE the resubscribe — production 2026-10-09 17:31:09 group cron lost a
     # message because `_dm_resubscribe_timeout=15` < `_kicked_backoff_seconds=60`.
     KICKED_RESUBSCRIBE_BUFFER = 5.0
+    serial_receive_loop = True  # _read_events awaits each frame before reading the next
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM)
@@ -259,10 +261,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly.
             # See #18451.
-            from gateway.platforms._http_client_limits import platform_httpx_limits
-            from gateway.platforms.base import _ssrf_redirect_guard
-            from tools.url_safety import create_ssrf_safe_async_client
-            self._http_client = create_ssrf_safe_async_client(timeout=30.0, follow_redirects=True, event_hooks={"response": [_ssrf_redirect_guard]}, limits=platform_httpx_limits())
+            from gateway.platforms.helpers import platform_http_client
+            self._http_client = platform_http_client()
             await self._open_connection()
             self._mark_connected()
             self._listen_task, self._heartbeat_task = asyncio.create_task(self._listen_loop()), asyncio.create_task(self._heartbeat_loop())
@@ -335,15 +335,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         if not sess_kw:
             # No explicit proxy resolved: honor the gateway.trust_env config gate (upstream).
             sess_kw = {"trust_env": gateway_trust_env() and not bool(proxy_url)}
-        # Use certifi's CA bundle so aiohttp trusts the same roots as
-        # urllib/requests — avoids SSL_CERTIFICATE_VERIFY_FAILED on macOS
-        # where the OpenSSL default path may be empty or stale.
+        # certifi's CA bundle so aiohttp trusts the same roots as urllib/requests (macOS stale OpenSSL path),
+        # re-derived when an install-environment rotation deleted the imported one (#137255).
         import ssl as _ssl
-        try:
-            import certifi
-            cafile = certifi.where()
-        except ImportError:
-            cafile = None
+
+        from agent.ssl_verify import certifi_bundle_path
+        cafile = certifi_bundle_path()
         _ssl_ctx = _ssl.create_default_context(cafile=cafile)
         _connector = aiohttp.TCPConnector(ssl=_ssl_ctx)
         sess_kw.setdefault("connector", _connector)
@@ -1598,6 +1595,16 @@ def _is_connected(config) -> bool:
     return bool((getattr(config, "extra", {}) or {}).get("bot_id"))
 
 
+# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
+_WECOM_PLATFORM_HINT = (
+    "You are on WeCom (\u4f01\u4e1a\u5fae\u4fe1). Markdown is supported. "
+    "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
+    "Images (.jpg, .png, .webp) send as photos (\u226410 MB), other files as documents (\u226420 MB), videos "
+    "(.mp4) play inline. Voice messages must be AMR \u2014 other audio formats send as file attachments. Image "
+    "URLs via ![alt](url) are downloaded and sent as photos. Never claim you lack file-sending."
+)
+
+
 def register(ctx) -> None:
     """Plugin entry point — registers the WeCom Smart-Robot platform.
 
@@ -1614,9 +1621,23 @@ def register(ctx) -> None:
         logger.warning("[wecom] failed to register wecom-cli business tools", exc_info=True)
 
     common = dict(install_hint="Run `hermes setup` to install WeCom support.", emoji="💼", allow_update_command=True)
+    from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
+        target_ref_syntax_fn=parse_nonempty,
+        standalone_send=StandaloneSendPolicy(text_direct=True),
         name="wecom", label="WeCom (Enterprise WeChat)", adapter_factory=WeComAdapter, check_fn=check_wecom_requirements,
+        dashboard_label="WeCom (group bot)",
+        dashboard_description="Send-only WeCom group bot via webhook.",
+        docs_url="https://developer.work.weixin.qq.com/document/path/91770",
+        dashboard_env_vars=("WECOM_BOT_ID", "WECOM_SECRET"),
+        dashboard_required_env=("WECOM_BOT_ID",),
         is_connected=_is_connected, validate_config=_is_connected, required_env=["WECOM_BOT_ID", "WECOM_SECRET"],
-        setup_fn=interactive_setup, allowed_users_env="WECOM_ALLOWED_USERS", allow_all_env="WECOM_ALLOW_ALL_USERS",
+        setup_fn=interactive_setup,
         cron_deliver_env_var="WECOM_HOME_CHANNEL", standalone_sender_fn=_standalone_send, max_message_length=4000, **common,
+        platform_hint=_WECOM_PLATFORM_HINT,
+        display_tier="low",
+        # Non-editable, but its native "stream" msgtype gives a typing animation + cumulative updates.
+        display_overrides={"streaming": True},
+        env_overrides=gateway_env.ENV_OVERRIDES,
+        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
     )

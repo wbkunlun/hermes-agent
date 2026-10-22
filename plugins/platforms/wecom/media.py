@@ -206,7 +206,7 @@ class WeComMediaMixin:
         return decrypted[:-pad_len]
 
     async def _download_remote_bytes(self, url: str, max_bytes: int) -> tuple[bytes, dict[str, str]]:
-        from gateway.platforms.base import _ssrf_redirect_guard
+        from gateway.platforms.base import ssrf_redirect_guard
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
         from plugins.platforms.wecom import adapter as _adapter_mod
         # fork: per-deployment SSRF opt-out — in Tencent Cloud VPCs the WeCom media hosts
@@ -230,9 +230,9 @@ class WeComMediaMixin:
         # do not redirect, so it never fires for them.
         if _disable_url_safety:
             import httpx as _httpx
-            client = _httpx.AsyncClient(timeout=30.0, follow_redirects=True, event_hooks={"response": [_ssrf_redirect_guard]})
+            client = _httpx.AsyncClient(timeout=30.0, follow_redirects=True, event_hooks={"response": [ssrf_redirect_guard]})
         else:
-            client = self._http_client or create_ssrf_safe_async_client(timeout=30.0, follow_redirects=True, event_hooks={"response": [_ssrf_redirect_guard]})
+            client = self._http_client or create_ssrf_safe_async_client(timeout=30.0, follow_redirects=True, event_hooks={"response": [ssrf_redirect_guard]})
         try:
             async with client.stream("GET", url, headers={"User-Agent": "HermesAgent/1.0", "Accept": "*/*"}) as response:
                 response.raise_for_status()
