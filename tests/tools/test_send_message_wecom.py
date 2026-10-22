@@ -69,9 +69,19 @@ class TestSendToPlatformWecom:
         standalone_fn = AsyncMock(
             return_value={"success": True, "platform": "wecom", "message_id": "s1"}
         )
-        fake_entry = SimpleNamespace(standalone_sender_fn=standalone_fn)
+        # fork 2026-10-22 resync: upstream's _standalone_send_policy now checks
+        # is_registered() and reads entry.standalone_send (the policy object),
+        # so the stub tracks both. text_direct=True keeps the direct-send path.
+        from gateway.platforms.send_targets import StandaloneSendPolicy
+        fake_entry = SimpleNamespace(
+            standalone_sender_fn=standalone_fn,
+            standalone_send=StandaloneSendPolicy(text_direct=True),
+        )
         fake_registry_module = ModuleType("gateway.platform_registry")
-        fake_registry_module.platform_registry = SimpleNamespace(get=lambda name: fake_entry)
+        fake_registry_module.platform_registry = SimpleNamespace(
+            get=lambda name: fake_entry,
+            is_registered=lambda name: True,
+        )
 
         with patch.dict(
             sys.modules,

@@ -141,10 +141,19 @@ class TestYAMLNormalisation:
 # default" invariant now lives in TestStreamingPerPlatform.test_wecom_
 # default_is_streaming_enabled below.
 class TestPlatformDefaults:
-    """Built-in defaults reflect platform capability tiers."""
+    """Built-in defaults reflect platform capability tiers.
+
+    fork 2026-10-22 resync: defaults resolve through PlatformEntry
+    (display_tier/display_overrides) now, so each test must discover plugins
+    itself — the per-test isolation fixture resets the plugin manager (and
+    with it the registry entries a module-level discover_plugins() call
+    registered at collection time), which is why these guards read None when
+    discovery only runs at module import."""
 
     def test_high_tier_platforms(self):
         """Discord defaults to 'all'; Telegram defaults quiet for mobile."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         # Telegram: tier_high transport, but quiet mobile default.
@@ -155,6 +164,8 @@ class TestPlatformDefaults:
 
     def test_low_tier_platforms(self):
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         # wecom sits in TIER_LOW too, but keeps "streaming": True (native
@@ -172,6 +183,8 @@ class TestPlatformDefaults:
         When/if Cloud's edit_message lands, update _PLATFORM_DEFAULTS to
         TIER_MEDIUM and update this test to assert ``"new"`` accordingly.
         """
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
         assert resolve_display_setting({}, "whatsapp_cloud", "tool_progress") == "off"
         assert resolve_display_setting({}, "whatsapp_cloud", "streaming") is False
@@ -181,6 +194,8 @@ class TestPlatformDefaults:
 
         (homeassistant left this list with the upstream v2026.10.7 core exit —
         no in-tree tier row means resolve falls back to 'all', by design.)"""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         for plat in ("email", "sms", "webhook"):
@@ -188,6 +203,8 @@ class TestPlatformDefaults:
 
     def test_low_tier_streaming_defaults_to_false(self):
         """Low-tier platforms default streaming to False."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "signal", "streaming") is False
@@ -195,6 +212,8 @@ class TestPlatformDefaults:
 
     def test_high_tier_streaming_defaults_to_none(self):
         """High-tier platforms default streaming to None (follow global)."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "telegram", "streaming") is None
@@ -202,6 +221,8 @@ class TestPlatformDefaults:
     def test_telegram_mobile_chatter_defaults(self):
         """Telegram keeps real mid-turn signal (interim commentary + heartbeats)
         but skips the verbose busy-ack iteration counter by default."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         # Real model voice — keep on. Without this, Telegram users see
@@ -221,6 +242,8 @@ class TestPlatformDefaults:
 
     def test_slack_workspace_chatter_defaults(self):
         """Slack should not leave permanent heartbeat/debug breadcrumbs in channels."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "tool_progress") == "off"
@@ -355,6 +378,8 @@ class TestStreamingPerPlatform:
         """WeCom has a native streaming transport (msgtype: stream) so its
         built-in default opts into streaming even though it sits in the
         non-editable tier."""
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()  # fork 2026-10-22: wecom's default rides its PlatformEntry now
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "wecom", "streaming") is True
