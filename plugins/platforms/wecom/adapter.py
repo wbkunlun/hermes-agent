@@ -35,7 +35,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, send_chunks
 from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from plugins.platforms.wecom.stream_delivery import WeComStreamDelivery
-from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from utils import env_float, env_int
 
@@ -59,8 +59,9 @@ APP_CMD_SUBSCRIBE = "aibot_subscribe"
 APP_CMD_CALLBACK = "aibot_msg_callback"
 APP_CMD_LEGACY_CALLBACK = "aibot_callback"
 APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
-APP_CMD_SEND = "aibot_send_msg"
-APP_CMD_RESPONSE = "aibot_respond_msg"
+# fork: APP_CMD_RESPONSE_WELCOME stays a local constant — the welcome-message
+# send is a fork feature upstream never had; APP_CMD_SEND/APP_CMD_RESPONSE
+# import from the media/streaming siblings above (single definition each).
 APP_CMD_RESPONSE_WELCOME = "aibot_respond_welcome_msg"
 APP_CMD_PING = "ping"
 APP_CMD_PONG = "pong"

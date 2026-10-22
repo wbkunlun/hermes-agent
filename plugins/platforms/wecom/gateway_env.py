@@ -8,7 +8,7 @@ load ("type object 'Platform' has no attribute 'WECOM_CALLBACK'").
 """
 
 from gateway.config import Platform
-from gateway.platform_env import EnvCred, int_or
+from gateway.platform_env import EnvCred
 
 ENV_ENABLE_CREDENTIALS = ("WECOM_BOT_ID", "WECOM_SECRET")
 ENV_OVERRIDES = (
