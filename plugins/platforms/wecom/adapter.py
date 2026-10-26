@@ -177,6 +177,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     # BEFORE the resubscribe — production 2026-10-09 17:31:09 group cron lost a
     # message because `_dm_resubscribe_timeout=15` < `_kicked_backoff_seconds=60`.
     KICKED_RESUBSCRIBE_BUFFER = 5.0
+    # fork 2026-10-26: once a reconnect lands (SUBSCRIBE acked) the session is live —
+    # parked-group timed retries scheduled against the pre-kick kicked-floor no longer
+    # need to wait it out; _note_ws_established pulls them forward to this delay.
+    RESUBSCRIBE_FLUSH_DELAY = 5.0
     serial_receive_loop = True  # _read_events awaits each frame before reading the next
 
     def __init__(self, config: PlatformConfig):
@@ -489,6 +493,19 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._resubscribe_pending = False
         self._subscribed_gen += 1
         self._subscribed_event.set()
+        # fork 2026-10-26: session live again — pull parked-group retry timers forward
+        # (never backward) so parked sends go out seconds after the resubscribe instead
+        # of riding the schedule they got while kicked/disconnected.
+        if self._group_retry_timers:
+            loop = asyncio.get_running_loop()
+            for chat_id, handle in list(self._group_retry_timers.items()):
+                remaining = handle.when() - loop.time()
+                handle.cancel()
+                self._group_retry_timers[chat_id] = loop.call_later(
+                    min(self.RESUBSCRIBE_FLUSH_DELAY, max(0.0, remaining)),
+                    lambda cid=chat_id: self._group_retry_fire(cid),
+                )
+            logger.info("[%s] Subscription re-established — pulled %d parked-group retry timer(s) forward (≤%.0fs)", self.name, len(self._group_retry_timers), self.RESUBSCRIBE_FLUSH_DELAY)
 
     def _resubscribe_window(self, base: float) -> float:
         """fork 2026-10-09 hotfix: extend a resubscribe-aware wait when the listen loop

@@ -782,6 +782,28 @@ class TestGroupDeadWindowRetry:
         await self._drain(adapter)
 
     @pytest.mark.asyncio
+    async def test_resubscribe_pulls_parked_retry_timers_forward(self):
+        """fork 2026-10-26: a timer parked during the kick rides the kicked-floor window
+        (max(base, backoff+buffer)); once the SUBSCRIBE acks, the session is live and the
+        parked report should go out seconds later, not on the stale schedule."""
+        adapter = self._adapter(delays=(30.0, 120.0))
+        adapter._kicked_backoff_seconds = 0.1
+        adapter.KICKED_RESUBSCRIBE_BUFFER = 0.01
+        adapter._kicked_at_monotonic = time.monotonic()
+        adapter._pending_group_sends["g1"] = [(time.time(), "report")]
+        adapter._schedule_group_retry("g1")
+        loop = asyncio.get_running_loop()
+        before = adapter._group_retry_timers["g1"].when() - loop.time()
+        assert before > 0.5  # riding the kicked floor, not the 30s tier
+
+        adapter._note_ws_established()
+
+        after = adapter._group_retry_timers["g1"].when() - loop.time()
+        assert after <= adapter.RESUBSCRIBE_FLUSH_DELAY + 0.01
+        assert after < before
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
     async def test_retry_failure_reschedules_once_then_stops(self):
         adapter = self._adapter(delays=(0.01, 0.02))
         adapter._group_chat_ids.add("g1")
