@@ -1257,6 +1257,11 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
     # Relay egress discriminators (scope_id / user_id) from the persisted origin: the adapter's caches are cold
     # after a restart. See cron/scheduler_delivery_origin.py.
     _origin.stamp_origin_discriminators(t, route_metadata, media_metadata)
+    # fork 2026-10-26 (batch 3): the execution id rides to the adapter so a parked-group
+    # redelivery that succeeds later can correct the settled-failed ledger row (see
+    # cron/delivery_correction.py). Absent for non-cron sends — no correction then.
+    if job.get("execution_id"):
+        route_metadata["execution_id"] = str(job["execution_id"])
     return route_thread_id, route_metadata, media_metadata
 
 

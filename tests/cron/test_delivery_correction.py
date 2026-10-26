@@ -136,3 +136,38 @@ def test_correction_is_best_effort_on_bookkeeping_failure(tmp_path, monkeypatch)
 
     monkeypatch.setattr(executions, "correct_failed_delivery_outcome", boom)
     assert correct_failed_delivery(execution_id) is False
+
+
+def _target(job):
+    """A minimal ``_TargetDelivery`` shape for ``_live_route_metadata`` (wecom target)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        job=job, platform="wecom", platform_name="wecom", chat_id="g1", thread_id=None,
+        transport=None, runtime_adapter=None, loop=None, notify_delivery=True,
+        origin={}, origin_target=False, origin_user_id=None, is_dm_target=False,
+        is_relay=False,
+        mirror_text="", mirror_this_target=False, in_channel_surface=False,
+        inchannel_continuable=False, opened_thread_id=None,
+    )
+
+
+def test_live_route_metadata_carries_the_execution_id():
+    """The cron live lane threads the execution id to the adapter so a parked
+    redelivery that succeeds later can correct the settled-failed row (batch 3)."""
+    from cron.scheduler_delivery import _live_route_metadata
+
+    _, route_metadata, _ = _live_route_metadata(_target({"id": "j1", "execution_id": "exec-9"}))
+
+    assert route_metadata["execution_id"] == "exec-9"
+    assert route_metadata["job_id"] == "j1"
+
+
+def test_live_route_metadata_omits_the_key_without_an_execution_id():
+    """Non-cron sends park without a correction state — no id, no key."""
+    from cron.scheduler_delivery import _live_route_metadata
+
+    _, route_metadata, _ = _live_route_metadata(_target({"id": "j1"}))
+
+    assert "execution_id" not in route_metadata
+    assert route_metadata["job_id"] == "j1"
