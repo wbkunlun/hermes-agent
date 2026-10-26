@@ -171,8 +171,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     _SPLIT_THRESHOLD = 3900  # chunks near the 4000-char client split are almost certainly continued
-    # fork 2026-10-09 hotfix: when the listen loop is in the kicked-backoff sleep
-    # (default 60s), any resubscribe-aware retry (DM `_await_resubscribe`, group
+    # fork 2026-10-09 hotfix: when the listen loop is in the kicked-backoff sleep,
+    # any resubscribe-aware retry (DM `_await_resubscribe`, group
     # timed retry) must wait past that sleep + connect+ack time or it times out
     # BEFORE the resubscribe — production 2026-10-09 17:31:09 group cron lost a
     # message because `_dm_resubscribe_timeout=15` < `_kicked_backoff_seconds=60`.
@@ -510,8 +510,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     def _resubscribe_window(self, base: float) -> float:
         """fork 2026-10-09 hotfix: extend a resubscribe-aware wait when the listen loop
         is in the kicked-backoff sleep. Without this, a DM/group retry whose nominal
-        timeout is shorter than ``_kicked_backoff_seconds`` (e.g. 15s default vs 60s
-        default backoff) always times out BEFORE the resubscribe — every kicked+846609
+        timeout is shorter than ``_kicked_backoff_seconds`` (e.g. the 15s DM default
+        vs a larger kicked backoff) always times out BEFORE the resubscribe — every kicked+846609
         message is lost. Buffer covers connect+ack after the backoff ends. The base
         value still wins when it's already longer (an operator may have raised the
         retry budget for other reasons)."""
