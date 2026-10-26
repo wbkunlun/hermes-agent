@@ -904,7 +904,6 @@ class TestGroupDeadWindowRetry:
         assert result.success is True
         assert adapter._await_resubscribe.await_count == 1
         await self._drain(adapter)
-
     @pytest.mark.asyncio
     async def test_resubscribe_pulls_parked_retry_timers_forward(self):
         """fork 2026-10-26: a timer parked during the kick rides the kicked-floor window
@@ -1005,6 +1004,125 @@ class TestGroupDeadWindowRetry:
         # kicked_backoff (0.1s) + buffer (0.01s) = 0.11s, less the few ms spent in setup.
         assert remaining > 0.08, f"timed retry should be floored by kicked_backoff, got {remaining:.3f}s"
         await self._drain(adapter)
+
+
+class TestExecutionCorrection:
+    """fork 2026-10-26 (batch 3): a parked send carries its cron execution id; a
+    successful redelivery corrects the settled-failed ledger row (the cron live lane
+    threads the id in via send metadata; see cron/delivery_correction.py)."""
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_request = AsyncMock(return_value={"errcode": 0})
+        adapter._send_reply_request = AsyncMock(return_value={"errcode": 0})
+        adapter._group_retry_delays = (0.01,)
+        adapter._pending_group_sends = {}
+        adapter._pending_group_exec_ids = {}
+        return adapter
+
+    async def _drain(self, adapter):
+        for worker in list(adapter._chat_workers.values()) + list(adapter._control_workers.values()):
+            worker.cancel()
+        for handle in list(adapter._group_retry_timers.values()):
+            handle.cancel()
+        adapter._group_retry_timers = {}
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_send_metadata_execution_id_is_parked_with_the_content(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+
+        result = await adapter.send("g1", "17:31 report", metadata={"execution_id": "exec-1"})
+
+        assert result.success is False
+        assert adapter._pending_group_sends.get("g1")  # parked
+        assert adapter._pending_group_exec_ids == {"g1": ["exec-1"]}
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_send_without_execution_id_parks_without_correction_state(self):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+
+        await adapter.send("g1", "17:31 report")
+
+        assert adapter._pending_group_sends.get("g1")  # parked as before
+        assert adapter._pending_group_exec_ids == {}    # nothing to correct
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_timed_retry_success_corrects_the_ledger(self, monkeypatch):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        assert adapter._stash_group_pending("g1", "17:31 report", execution_id="exec-1") is True
+
+        await adapter._group_retry_flush("g1")
+
+        assert adapter._pending_group_sends.get("g1") in (None, [])
+        assert corrected == ["exec-1"]
+        assert "g1" not in adapter._pending_group_exec_ids
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_timed_retry_failure_keeps_parking_without_correction(self, monkeypatch):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+        assert adapter._stash_group_pending("g1", "17:31 report", execution_id="exec-1") is True
+
+        await adapter._group_retry_flush("g1")
+
+        assert corrected == []
+        assert adapter._pending_group_exec_ids == {"g1": ["exec-1"]}
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_inbound_flush_redelivery_success_corrects_the_ledger(self, monkeypatch):
+        """The ⏰ inbound-flush path corrects too — the redelivery landed on the chat's
+        next message."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        assert adapter._stash_group_pending("g1", "17:31 report", execution_id="exec-1") is True
+        adapter._pending_group_sends.pop("g1")  # the inbound flush pops before redelivering
+
+        await adapter._redeliver_group_pending("g1", "⏰ 定时补发\n---\n17:31 report")
+
+        assert corrected == ["exec-1"]
+        assert "g1" not in adapter._pending_group_exec_ids
+
+    @pytest.mark.asyncio
+    async def test_redelivery_correction_swallows_a_missing_correction_module(self, monkeypatch):
+        """The gateway must keep sending even when the cron module is absent (a plugin
+        or embedding that ships the adapter without cron)."""
+        import sys
+
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        monkeypatch.setitem(sys.modules, "cron.delivery_correction", None)
+
+        await adapter._redeliver_group_pending("g1", "⏰ 定时补发\n---\n17:31 report")
+
+        assert adapter._pending_group_exec_ids == {}
 
 
 class TestKickDetection:

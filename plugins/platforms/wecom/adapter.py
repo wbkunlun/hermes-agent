@@ -285,6 +285,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # The learned classification persists to wecom_learned_chats.json (fork 2026-10-08, see
         # learned_chats.py); the pending queue stays in-memory by design (TTL/时效语义).
         self._pending_group_sends: dict[str, list[tuple[float, str]]] = {}
+        # fork 2026-10-26 (batch 3): chat -> [cron execution ids] parked in the dead window —
+        # a redelivery success corrects their settled-failed ledger rows (see
+        # cron/delivery_correction.py); the cron live lane threads the id via send metadata.
+        self._pending_group_exec_ids: dict[str, list[str]] = {}
         # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
         # their group semantics and scheduled pushes take the DM branch — 2026-10-08 incident).
         self._learned_save_handle = None
@@ -1098,7 +1102,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         """Explicit reply_to mapping, else the chat's last inbound req_id."""
         return self._reply_req_id_for_message(reply_to) or self._last_chat_req_ids.get(chat_id)
 
-    def _stash_group_pending(self, chat_id: str, content: str) -> bool:
+    def _stash_group_pending(self, chat_id: str, content: str, execution_id: Optional[str] = None) -> bool:
         """fork: park an undeliverable group send for redelivery on the chat's next inbound req_id.
 
         Both group channels must be dead to land here (passive req_id gone AND proactive
@@ -1106,7 +1110,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         prerequisite); the entry is flushed pre-turn by ``_flush_group_pending``. Returns True when
         the content is parked (or already parked — the live and standalone cron lanes both land
         here with identical content, so exact-content dedup collapses the duplicate attempt
-        without dropping the redelivery).
+        without dropping the redelivery). ``execution_id`` (fork 2026-10-26, batch 3): the cron
+        live lane's execution — a redelivery success corrects its settled-failed ledger row.
         """
         pending = getattr(self, "_pending_group_sends", None)  # bare __new__ test stubs skip queueing
         if pending is None:
@@ -1128,6 +1133,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             logger.warning("[%s] Group pending queue full (chat=%s, max=%d) — dropping entry scheduled %s", self.name, chat_id, max_pending, time.strftime("%H:%M", time.localtime(dropped_ts)))
         entries.append((now, content))
         pending[chat_id] = entries
+        if execution_id and getattr(self, "_pending_group_exec_ids", None) is not None:
+            exec_ids = self._pending_group_exec_ids.setdefault(chat_id, [])
+            if execution_id not in exec_ids:
+                exec_ids.append(execution_id)
         logger.warning("[%s] Group send queued for redelivery on next group message (chat=%s, queued=%d, ttl=%.0fs)", self.name, chat_id, len(entries), ttl)
         return True
 
@@ -1161,6 +1170,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return
         if not getattr(result, "success", False):
             logger.warning("[%s] Group redelivery failed and was dropped (chat=%s, error=%s)", self.name, chat_id, getattr(result, "error", None))
+            return
+        # fork 2026-10-26 (batch 3): the redelivery landed — the cron rows parked with it
+        # are no longer failures.
+        self._correct_executions_after_redelivery(chat_id)
 
     def _schedule_group_retry(self, chat_id: str) -> None:
         """fork 2026-10-08: 846609 dead-window — retry parked group sends after the
@@ -1211,6 +1224,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         remaining = [e for e in (pending.get(chat_id) or []) if now - e[0] < ttl]
         if not remaining:
             self._group_retry_attempts.pop(chat_id, None)
+            if delivered:
+                # fork 2026-10-26 (batch 3): everything parked went out — correct the rows.
+                self._correct_executions_after_redelivery(chat_id)
             return
         if delivered or not dead_session:
             return  # non-dead failures stay parked for the inbound ⏰ flush
@@ -1227,6 +1243,27 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             entries.remove((ts, content))
         if not entries:
             pending.pop(chat_id, None)
+
+    def _correct_executions_after_redelivery(self, chat_id: str) -> None:
+        """fork 2026-10-26 (batch 3): parked content delivered — correct the settled-failed
+        cron ledger rows the parked sends came from (cron/delivery_correction.py; the
+        correction is double-fenced and idempotent, so extra calls are no-ops). Chat-granular
+        by design: two executions parked on one chat are corrected together on the first
+        successful redelivery — never correcting the delivered one is worse."""
+        ids = getattr(self, "_pending_group_exec_ids", None)
+        if not ids:
+            return
+        execution_ids = ids.pop(chat_id, None)
+        if not execution_ids:
+            return
+        try:
+            from cron.delivery_correction import correct_failed_delivery
+
+            for execution_id in execution_ids:
+                if correct_failed_delivery(execution_id):
+                    logger.info("[%s] Cron delivery %s corrected to delivered after parked redelivery (chat=%s)", self.name, execution_id, chat_id)
+        except Exception as exc:
+            logger.debug("[%s] Delivery correction unavailable (%s)", self.name, exc)
 
     async def _force_reconnect_on_stale_subscription(self, errcode: int) -> None:
         """On 846609 (subscription lost) drop req_ids bound to the dead session AND recycle
@@ -1311,9 +1348,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         force_proactive = bool(metadata.pop("force_proactive_send", False))
         # fork: a flushed pending entry must never re-stash on failure (redelivery loop guard).
         is_redelivery = bool(metadata.pop("is_redelivery", False))
+        # fork 2026-10-26 (batch 3): a cron queued delivery carries its execution id — a
+        # parked redelivery that later succeeds corrects the settled-failed ledger row.
+        execution_id = str(metadata.pop("execution_id", "") or "") or None
         # One queued send per chunk so each one draws a token from the 30 msgs/min bucket.
         return await send_chunks(self.truncate_message(content, self.MAX_MESSAGE_LENGTH), lambda chunk: self._enqueue_chat_send(
-            chat_id, lambda: self._send_inner(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery), is_control=is_control))
+            chat_id, lambda: self._send_inner(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=execution_id), is_control=is_control))
 
     def _is_group_chat(self, chat_id: str) -> bool:
         """fork: single source of truth for group-ness — inbound-learned set UNION
@@ -1325,7 +1365,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         (audit 2026-09-29 module-1 M1.7)"""
         return chat_id in self._group_chat_ids or chat_id in getattr(self, "_groups", {})
 
-    async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False, is_control: bool = False, is_redelivery: bool = False) -> SendResult:
+    async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False, is_control: bool = False, is_redelivery: bool = False, execution_id: Optional[str] = None) -> SendResult:
         """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
         is_group_chat = self._is_group_chat(chat_id)
         try:
@@ -1342,7 +1382,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                         if proactive_error is None:
                             logger.info("[%s] Group send delivered via proactive aibot_send_msg after passive failure (chat=%s)", self.name, chat_id)
                             return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
-                        stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
+                        stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content, execution_id=execution_id)
                         combined = f"Group send failed (passive: {passive_err}; proactive: {proactive_error})" + (" (queued for redelivery on next group message)" if stashed else "")
                         if stashed and _is_subscription_lost_error(combined):
                             self._schedule_group_retry(chat_id)
@@ -1358,7 +1398,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 if proactive_error is None:
                     return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
                 logger.warning("[%s] Group proactive send failed (chat=%s): %s", self.name, chat_id, proactive_error)
-                stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
+                stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content, execution_id=execution_id)
                 message = f"Group proactive send failed: {proactive_error}" + (" (queued for redelivery on next group message)" if stashed else "")
                 if stashed and _is_subscription_lost_error(proactive_error):
                     self._schedule_group_retry(chat_id)
