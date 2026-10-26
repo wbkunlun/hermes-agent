@@ -670,6 +670,16 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             event_type = str(event.get("eventtype") or body.get("event_type") or "")
             if event_type == "disconnected_event":
                 self._kicked_at_monotonic = time.monotonic()
+                # fork 2026-10-26: recycle the zombie socket NOW — the server displaces the
+                # subscription before it CLOSEs the socket, and every send in that gap passes
+                # _require_ws and eats a REAL 846609 (2026-10 cron report). Closing here puts
+                # the listen loop on its reconnect path immediately; the kicked floor still
+                # spaces the re-subscribe (mutual-kick damping unchanged). req_id caches die
+                # with the displaced session — purge them too instead of waiting for a send
+                # to discover it (mirror of the 846609 path).
+                self._last_chat_req_ids.clear()
+                self._reply_req_ids.clear()
+                self._schedule_recycle("disconnected_event")
                 logger.warning(
                     "[%s] Displaced by a newer WeCom WS subscription (disconnected_event) — "
                     "official docs allow ONE live connection per bot; a duplicate gateway "

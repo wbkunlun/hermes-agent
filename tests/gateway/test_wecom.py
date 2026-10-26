@@ -853,6 +853,23 @@ class TestKickDetection:
             await adapter._dispatch_payload(self._kick_payload(nested=False))
         assert adapter._kicked_at_monotonic is not None
 
+    @pytest.mark.asyncio
+    async def test_displacement_recycles_zombie_socket_immediately(self):
+        """fork 2026-10-26: disconnected_event previously only stamped the kick flag — the
+        zombie socket stayed transport-alive until the server CLOSE landed, so sends in
+        that gap passed _require_ws and ate a REAL 846609 (2026-10 cron report). Now the
+        kick itself recycles the connection: the listen loop heads for the reconnect at
+        once; the kicked floor still spaces the re-subscribe."""
+        adapter = self._adapter()
+        adapter._ws = SimpleNamespace(closed=False, close=AsyncMock())
+
+        await adapter._dispatch_payload(self._kick_payload())
+        await asyncio.sleep(0)  # pump the ensure_future(_close_ws_for_recycle)
+
+        assert adapter._kicked_at_monotonic is not None
+        assert adapter._resubscribe_pending is True
+        adapter._ws.close.assert_awaited_once()
+
     def test_reconnect_delay_floored_after_kick(self):
         from plugins.platforms.wecom.adapter import RECONNECT_BACKOFF
 
