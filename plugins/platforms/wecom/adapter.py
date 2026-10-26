@@ -15,8 +15,8 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone, UTC
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, UTC
+from typing import Any, Optional
 from urllib.parse import urlparse  # FORK(wbkunlun): explicit — the deleted PLUGIN-COMPAT
 # shim (#126164) used to re-export this name; _open_connection needs it for proxy resolution.
 
@@ -213,7 +213,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # close forensics; see _reconnect_delay / _note_ws_established / _ws_close_detail.
         self._kicked_at_monotonic: Optional[float] = None
         self._connected_at_monotonic: Optional[float] = None
-        self._kicked_backoff_seconds = max(5.0, env_float("HERMES_WECOM_KICKED_BACKOFF_SECONDS", 60.0))
+        # fork 2026-10-26: default 60→20 — a displaced subscription's dead window was
+        # the dominant cost of the 2026-10 cron-report incident (group retry fired at
+        # max(30, 60+5)=65s); 20s keeps the mutual-kick damping while the listen loop
+        # reclaims the session in ~20s. Env still overrides for deployments that want
+        # the old damping.
+        self._kicked_backoff_seconds = max(5.0, env_float("HERMES_WECOM_KICKED_BACKOFF_SECONDS", 20.0))
         # fork 2026-10-09: pong-verified liveness + subscription recycle, mirroring the
         # official @wecom/aibot-node-sdk WsConnectionManager (maxMissedPong=2, terminate
         # on threshold). A subscription-revoked socket still accepts ping frames at the

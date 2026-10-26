@@ -862,6 +862,23 @@ class TestKickDetection:
         assert adapter._reconnect_delay(0) == 90.0
         assert adapter._reconnect_delay(len(RECONNECT_BACKOFF) + 5) == 90.0  # floor beats cap too
 
+    def test_kicked_backoff_knob_resolution(self, monkeypatch):
+        """fork 2026-10-26: the kicked-backoff default dropped 60→20 — a displaced
+        subscription's dead window is paid by every send attempted during it; the env
+        var still overrides and the max(5.0, ...) floor still applies."""
+        monkeypatch.delenv("HERMES_WECOM_KICKED_BACKOFF_SECONDS", raising=False)
+
+        def make():
+            from plugins.platforms.wecom.adapter import WeComAdapter
+
+            return WeComAdapter(PlatformConfig(enabled=True))
+
+        assert make()._kicked_backoff_seconds == 20.0
+        monkeypatch.setenv("HERMES_WECOM_KICKED_BACKOFF_SECONDS", "30")
+        assert make()._kicked_backoff_seconds == 30.0
+        monkeypatch.setenv("HERMES_WECOM_KICKED_BACKOFF_SECONDS", "3")
+        assert make()._kicked_backoff_seconds == 5.0  # floor
+
     def test_establishment_clears_kick_flag(self):
         adapter = self._adapter()
         adapter._kicked_at_monotonic = time.monotonic()
