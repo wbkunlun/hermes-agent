@@ -255,6 +255,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # fork 2026-10-26: did THIS instance take the machine-scoped bot lock? (the
         # process-level set says who may take it; this says who must give it back)
         self._wecom_lock_acquired = False
+        # fork 2026-10-26: the local send relay (out-of-process senders reach THIS
+        # gateway's single live subscription instead of opening a competing one)
+        self._relay_server = None
         # fork 2026-10-09: pong-verified liveness + subscription recycle, mirroring the
         # official @wecom/aibot-node-sdk WsConnectionManager (maxMissedPong=2, terminate
         # on threshold). A subscription-revoked socket still accepts ping frames at the
@@ -330,6 +333,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             self._listen_task, self._heartbeat_task = asyncio.create_task(self._listen_loop()), asyncio.create_task(self._heartbeat_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             self._wire_plugin_handlers(None)  # ctx.register_platform_handler hooks
+            self._start_relay_server()
             return True
         except Exception as exc:
             self._set_fatal_error("wecom_connect_error", f"WeCom startup failed: {exc}", retryable=True)
@@ -344,6 +348,44 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         return os.getenv("WECOM_ALLOW_STANDALONE_CONNECT", "").strip().lower() in {
             "1", "true", "yes", "on",
         }
+
+    def _start_relay_server(self) -> None:
+        """fork 2026-10-26: publish the local send relay so out-of-process senders (the
+        cron worker, an external script, ``hermes send``) reach THIS gateway's single
+        live subscription instead of opening a competing one — the bot-identity lock
+        refuses the competing connection, so the relay is the sanctioned route. The
+        server lives on a daemon thread and dispatches onto the gateway loop."""
+        if self._relay_server is not None:
+            return
+        if os.getenv("WECOM_RELAY", "").strip().lower() in {"0", "false", "off", "no"}:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        from plugins.platforms.wecom.relay_server import start_server
+
+        async def _dispatch(chat_id: str, message: str) -> dict:
+            result = await self.send(chat_id, message)
+            if getattr(result, "success", False):
+                return {"success": True, "platform": "wecom", "chat_id": chat_id,
+                        "message_id": getattr(result, "message_id", None)}
+            return {"error": str(getattr(result, "error", None) or "WeCom send failed")}
+
+        self._relay_server = start_server(dispatch=_dispatch, loop=loop, logger_=logger)
+
+    def _stop_relay_server(self) -> None:
+        """fork 2026-10-26: take the relay down with the adapter (the port must be free
+        for the next connect)."""
+        server = getattr(self, "_relay_server", None)
+        if server is None:
+            return
+        self._relay_server = None
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception as exc:
+            logger.debug("[%s] relay server shutdown failed: %s", self.name, exc)
 
     def _release_bot_lock(self) -> None:
         """fork 2026-10-26: hand the bot lock back (connect failure / shutdown). The
@@ -361,6 +403,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # fork 2026-10-26: give the machine-scoped bot lock back so a restarted gateway
         # (or another profile) can connect — a stale lock wedges every later connect.
         self._release_bot_lock()
+        self._stop_relay_server()
         for handle in list(self._group_retry_timers.values()):
             handle.cancel()
         self._group_retry_timers.clear()
@@ -1606,6 +1649,22 @@ async def _standalone_send(
             # it would displace the live subscription (846609). Return the
             # original error; the caller may retry.
             return {"error": _live_error or "WeCom send failed: no reachable gateway loop"}
+
+    # fork 2026-10-26: out-of-process, the relay is the sanctioned route — the gateway's
+    # single live WS delivers (and its parked-group queue owns dead-window recovery).
+    # A relay ANSWER is final (success or error): the gateway owned the attempt, and
+    # retrying through our own connection is exactly what displaces the gateway. Only
+    # "no relay" (unreachable/unconfigured) falls through to the ephemeral connect
+    # below, which the bot-identity lock refuses while the gateway holds the bot.
+    try:
+        from plugins.platforms.wecom.relay_client import try_relay_send
+
+        relayed = try_relay_send(chat_id, message)
+    except Exception as exc:
+        logger.debug("[wecom] relay attempt failed (%s)", exc)
+        relayed = None
+    if relayed is not None:
+        return relayed
 
     if not check_wecom_requirements():
         return send_error("WeCom requirements not met. Need aiohttp + WECOM_BOT_ID/SECRET.")
