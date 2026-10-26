@@ -177,6 +177,130 @@ class TestWeComConnect:
         assert adapter.fatal_error_code == "wecom_connect_error"
         assert "invalid secret" in (adapter.fatal_error_message or "")
 
+    @staticmethod
+    def _connect_stubs(monkeypatch):
+        """The dependency-availability stubs connect() checks before it opens a socket."""
+        import plugins.platforms.wecom.adapter as wecom_module
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_closed_when_bot_lock_held(self, monkeypatch):
+        """fork 2026-10-26: WeCom allows ONE live WS subscription per bot — a second
+        process must not open a competing connection (the 2026-10 cron-report incident:
+        an external script's standalone adapter displaced the gateway's session and
+        every send in the gap hit the dead window)."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        self._connect_stubs(monkeypatch)
+        held = []
+
+        def _acquire(scope, identity, metadata=None):
+            held.append((scope, identity))
+            return False, {"pid": 4242}
+
+        monkeypatch.setattr("gateway.status.acquire_scoped_lock", _acquire)
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+        )
+        adapter._open_connection = AsyncMock(
+            side_effect=AssertionError("must not open a competing WS")
+        )
+
+        success = await adapter.connect()
+
+        assert success is False
+        assert held == [("wecom-bot-id", "bot-1")]
+        assert adapter._open_connection.await_count == 0
+        assert adapter.fatal_error_code == "wecom-bot-id_lock"
+        assert "already in use" in (adapter.fatal_error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_releases_bot_lock(self, monkeypatch):
+        """fork 2026-10-26: a failed connect must hand the bot lock back — a stale lock
+        would keep the NEXT gateway from connecting."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        self._connect_stubs(monkeypatch)
+        released = []
+        monkeypatch.setattr(
+            "gateway.status.acquire_scoped_lock",
+            lambda scope, identity, metadata=None: (True, None),
+        )
+        monkeypatch.setattr(
+            "gateway.status_scoped_locks.release_scoped_lock",
+            lambda scope, identity: released.append((scope, identity)),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+        )
+        adapter._open_connection = AsyncMock(side_effect=RuntimeError("invalid secret"))
+
+        success = await adapter.connect()
+
+        assert success is False
+        assert released == [("wecom-bot-id", "bot-1")]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_releases_bot_lock(self, monkeypatch):
+        """fork 2026-10-26: shutdown hands the bot lock back so a restarted gateway
+        (or a second profile) can connect."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        released = []
+        monkeypatch.setattr(
+            "gateway.status_scoped_locks.release_scoped_lock",
+            lambda scope, identity: released.append((scope, identity)),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+        )
+        # The state connect() would have left behind after acquiring the lock.
+        adapter._platform_lock_scope = "wecom-bot-id"
+        adapter._platform_lock_identity = "bot-1"
+
+        await adapter.disconnect()
+
+        assert released == [("wecom-bot-id", "bot-1")]
+
+    @pytest.mark.asyncio
+    async def test_standalone_connect_env_escape_skips_lock(self, monkeypatch):
+        """fork 2026-10-26: WECOM_ALLOW_STANDALONE_CONNECT is the operator escape hatch
+        for an intentional ephemeral sender that accepts the displacement."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        self._connect_stubs(monkeypatch)
+        monkeypatch.setenv("WECOM_ALLOW_STANDALONE_CONNECT", "1")
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("the bot lock must not be consulted when the escape hatch is set")
+
+        monkeypatch.setattr("gateway.status.acquire_scoped_lock", _boom)
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+        )
+        adapter._open_connection = AsyncMock(side_effect=RuntimeError("invalid secret"))
+
+        success = await adapter.connect()
+
+        assert success is False
+        assert adapter.fatal_error_code == "wecom_connect_error"  # not a lock error
+        assert adapter._open_connection.await_count == 1
+
 
 
 

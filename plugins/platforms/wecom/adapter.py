@@ -83,6 +83,15 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
+# fork 2026-10-26: machine-scoped bot-identity lock (gateway/AGENTS.md platform-lock
+# contract; irc/line/qqbot/signal precedent). The WeCom server allows ONE live WS
+# subscription per bot, so the lock's scope is the bot identity, not a secret.
+_WECOM_LOCK_SCOPE = "wecom-bot-id"
+# Bot locks THIS PROCESS holds — an in-process ephemeral sender must not take (and then
+# release) the live gateway's lock. Same-PID locks are self-reacquired by the status
+# module, so the process-level set is what keeps the second adapter out of the file.
+_WECOM_LOCKS_HELD: set[tuple[str, str]] = set()
+
 DEDUP_MAX_SIZE = 1000
 
 
@@ -243,6 +252,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # reclaims the session in ~20s. Env still overrides for deployments that want
         # the old damping.
         self._kicked_backoff_seconds = max(5.0, env_float("HERMES_WECOM_KICKED_BACKOFF_SECONDS", 20.0))
+        # fork 2026-10-26: did THIS instance take the machine-scoped bot lock? (the
+        # process-level set says who may take it; this says who must give it back)
+        self._wecom_lock_acquired = False
         # fork 2026-10-09: pong-verified liveness + subscription recycle, mirroring the
         # official @wecom/aibot-node-sdk WsConnectionManager (maxMissedPong=2, terminate
         # on threshold). A subscription-revoked socket still accepts ping frames at the
@@ -288,6 +300,26 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 return self._startup_failure("wecom_missing_dependency", f"WeCom startup failed: {dep} not installed", "[%s] %s. Run: pip install %s", dep)
         if not self._bot_id or not self._secret:
             return self._startup_failure("wecom_missing_credentials", "WeCom startup failed: WECOM_BOT_ID and WECOM_SECRET are required", "[%s] %s")
+        # fork 2026-10-26: machine-scoped bot-identity lock (the platform-lock contract in
+        # gateway/AGENTS.md — irc/line/qqbot/signal precedent). The WeCom server allows ONE
+        # live WS subscription per bot: a second process (the 2026-10 cron-report incident's
+        # external script) displaces the gateway's session and every send in the gap hits the
+        # dead window. Fail the second connecter closed instead of fighting over the bot.
+        # WECOM_ALLOW_STANDALONE_CONNECT is the operator escape hatch for a script that
+        # deliberately accepts the displacement.
+        if not self._wecom_lock_escape_allowed():
+            lock_key = (_WECOM_LOCK_SCOPE, self._bot_id)
+            if lock_key not in _WECOM_LOCKS_HELD:
+                if not self._acquire_platform_lock(
+                    _WECOM_LOCK_SCOPE, self._bot_id, f"WeCom bot identity {self._bot_id}"
+                ):
+                    return False
+                _WECOM_LOCKS_HELD.add(lock_key)
+                self._wecom_lock_acquired = True
+            # else: this PROCESS already holds the bot lock (an in-process ephemeral
+            # sender next to the live adapter) — same-PID locks are self-reacquired by
+            # the status module, and releasing on disconnect would hand the GATEWAY's
+            # lock back, so the ephemeral adapter must not take it at all.
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly.
             # See #18451.
@@ -302,13 +334,33 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         except Exception as exc:
             self._set_fatal_error("wecom_connect_error", f"WeCom startup failed: {exc}", retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
+            self._release_bot_lock()
             await self._teardown()
             return False
+
+    def _wecom_lock_escape_allowed(self) -> bool:
+        """fork 2026-10-26: the operator escape hatch — an intentional ephemeral
+        connection (a script that accepts the displacement) may bypass the bot lock."""
+        return os.getenv("WECOM_ALLOW_STANDALONE_CONNECT", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+    def _release_bot_lock(self) -> None:
+        """fork 2026-10-26: hand the bot lock back (connect failure / shutdown). The
+        release is PID-guarded in the status module, so a lock this process never took
+        is left alone; the process-level set only tracks WHO may acquire."""
+        self._release_platform_lock()
+        if getattr(self, "_wecom_lock_acquired", False):
+            self._wecom_lock_acquired = False
+            _WECOM_LOCKS_HELD.discard((_WECOM_LOCK_SCOPE, self._bot_id))
 
     async def disconnect(self) -> None:
         self._running = False
         self._mark_disconnected()
         self._cancel_learned_save()
+        # fork 2026-10-26: give the machine-scoped bot lock back so a restarted gateway
+        # (or another profile) can connect — a stale lock wedges every later connect.
+        self._release_bot_lock()
         for handle in list(self._group_retry_timers.values()):
             handle.cancel()
         self._group_retry_timers.clear()
