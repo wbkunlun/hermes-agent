@@ -55,7 +55,10 @@ class GroupPendingMixin:
         whole body, not just the JSON parse — a valid-JSON file with a wrong-shaped
         ``chats``/``exec_ids`` value used to raise out of ``__init__`` and take the
         whole wecom platform down (the recoverable state file became an outage).
-        Entries past the TTL are dropped on load (a restart does not extend them)."""
+        Entries past the TTL are dropped on load (a restart does not extend them).
+        A file that cannot be parsed is QUARANTINED before it is overwritten: the
+        parked reports in it are undelivered work, and silently replacing them with
+        an empty queue loses them for good."""
         pending = getattr(self, "_pending_group_sends", None)
         if pending is None or not self._pending_persist_enabled():
             return  # bare __new__ test stubs skip persistence
@@ -69,6 +72,7 @@ class GroupPendingMixin:
                 "[%s] group-pending file unreadable — starting empty (%s): %s",
                 getattr(self, "name", "wecom"), path, exc,
             )
+            self._quarantine_pending_file(path)
             return
         if restored:
             logger.info(
@@ -76,23 +80,41 @@ class GroupPendingMixin:
                 getattr(self, "name", "wecom"), restored, path.name,
             )
 
+    @staticmethod
+    def _quarantine_pending_file(path: Path) -> None:
+        """fork 2026-10-26 (release fix): a corrupt parked-queue file holds undelivered
+        reports. Move it aside (never delete it) so the next write does not bury it."""
+        try:
+            quarantine = path.with_name(f"{path.name}.corrupt")
+            path.replace(quarantine)
+            logger.warning(
+                "[%s] Quarantined the unreadable group-pending file to %s",
+                "wecom", quarantine.name,
+            )
+        except OSError as exc:
+            logger.warning("[%s] Could not quarantine the group-pending file %s (%s)",
+                           "wecom", path, exc)
+
     def _read_pending_file(self, path: Path, pending: dict) -> int:
         import json
 
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
-            return 0
+            raise ValueError("group-pending file is not a JSON object")
         now = time.time()
         ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
         restored = 0
+        dropped = 0
         chats = data.get("chats")
         if isinstance(chats, dict):
             for chat_id, entries in chats.items():
                 if not isinstance(entries, list):
+                    dropped += 1
                     continue
                 live = [(float(ts), str(text)) for ts, text in entries
                         if isinstance(ts, (int, float)) and isinstance(text, str)
                         and now - float(ts) < ttl]
+                dropped += len(entries) - len(live)
                 if live:
                     pending[str(chat_id)] = live
                     restored += len(live)
@@ -108,6 +130,32 @@ class GroupPendingMixin:
                                 and (ttl <= 0 or now - float(ts) < ttl)]
                     if live_ids:
                         exec_ids[str(chat_id)] = live_ids
+        delivered = getattr(self, "_pending_delivered_exec_ids", None)
+        if delivered is not None:
+            stored = data.get("delivered_ids")
+            if isinstance(stored, dict):
+                for chat_id, pairs in stored.items():
+                    if not isinstance(pairs, list):
+                        continue
+                    live_ids = [(str(eid), float(ts)) for eid, ts in pairs
+                                if isinstance(eid, str) and isinstance(ts, (int, float))
+                                and (ttl <= 0 or now - float(ts) < ttl)]
+                    if live_ids:
+                        delivered[str(chat_id)] = live_ids
+        # fork 2026-10-26 (release fix): an id whose content is gone is NOT a delivered
+        # report — the inbound flush pops the content BEFORE the redelivery, and a failed
+        # redelivery drops it (by design). Treating such an id as delivered would stamp a
+        # never-delivered report 'delivered' (a false stamp hides a real message loss).
+        # The genuinely-delivered ids wait in the DELIVERED map, which the correction
+        # attempt fills — that map is the restart-safe home of a pending correction.
+        if dropped:
+            # fork 2026-10-26 (release fix): the restore was PARTIAL — say what was lost
+            # instead of staying silent (a dropped report is undelivered work).
+            logger.warning(
+                "[%s] group-pending restore dropped %d unusable/expired entr%s from %s",
+                getattr(self, "name", "wecom"), dropped,
+                "y" if dropped == 1 else "ies", path.name,
+            )
         return restored
 
     def _pending_payload(self) -> dict:
@@ -117,14 +165,25 @@ class GroupPendingMixin:
             "exec_ids": {chat_id: [[eid, ts] for eid, ts in pairs]
                          for chat_id, pairs in
                          (getattr(self, "_pending_group_exec_ids", None) or {}).items()},
+            # fork 2026-10-26 (release fix): ids whose report went out but whose ledger
+            # row has not settled yet — they need a correction retry, and a restart must
+            # not lose them.
+            "delivered_ids": {chat_id: [[eid, ts] for eid, ts in pairs]
+                              for chat_id, pairs in
+                              (getattr(self, "_pending_delivered_exec_ids", None) or {}).items()},
         }
 
     def _schedule_pending_save(self) -> None:
         if not self._pending_persist_enabled():
             return
+        if getattr(self, "_shutting_down", False):
+            return  # the disconnect flush owns the last write
         if getattr(self, "_pending_save_handle", None) is not None:
             return  # one debounced write absorbs the burst
-        loop = asyncio.get_running_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop (a synchronous caller) — the next write persists it
         self._pending_save_handle = loop.call_later(self._pending_save_delay, self._pending_save_fire)
 
     def _pending_save_fire(self) -> None:
@@ -132,8 +191,15 @@ class GroupPendingMixin:
         payload, path = self._pending_payload(), self._pending_queue_path()
         # fork 2026-10-26 (release fix): keep the task — an unreferenced task can be
         # garbage-collected mid-flight, silently skipping the persist this exists for;
-        # the disconnect flush also needs it to serialise against.
-        self._pending_write_task = asyncio.ensure_future(self._write_pending(payload, path))
+        # the disconnect flush also needs it to serialise against. A SET, not a single
+        # slot: the debounce can fire again while the previous write is still in the
+        # thread, and a single slot dropped the earlier reference.
+        task = asyncio.ensure_future(self._write_pending(payload, path))
+        tasks = getattr(self, "_pending_write_tasks", None)
+        if tasks is None:
+            tasks = self._pending_write_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _write_pending(self, payload: dict, path: Path) -> None:
         try:

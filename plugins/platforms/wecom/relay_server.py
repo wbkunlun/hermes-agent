@@ -14,6 +14,7 @@ future nobody wakes. The request thread schedules the coroutine with
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import logging
@@ -109,18 +110,37 @@ def _make_handler(*, dispatch: Callable, loop, secret: str, log: logging.Logger)
     return RelayHandler
 
 
-def publish_rendezvous(port: int, secret: str, log: logging.Logger) -> Optional[Path]:
-    """Publish ``{port, secret, pid}`` so same-user clients can find the relay.
+def publish_rendezvous(port: int, secret: str, log: logging.Logger,
+                        bot_id: Optional[str] = None) -> Optional[Path]:
+    """Publish ``{port, secret, pid, bot_id}`` so same-user clients can find the relay.
 
     fork 2026-10-26 (release fix): the file holds the live bearer secret, so it is
-    written 0600 (the surrounding lock dir stays the shared per-user one)."""
+    written 0600 (the surrounding lock dir stays the shared per-user one). The mode is
+    set BEFORE the secret is written — a pre-existing world-readable file would
+    otherwise hold the live secret for the duration of the write. The rendezvous path
+    is MACHINE-scoped, so the bot id rides along: a client that knows its own bot
+    refuses another bot's relay instead of sending through the wrong subscription.
+    """
     path = rendezvous_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"port": port, "secret": secret, "pid": os.getpid()}))
-        os.chmod(path, 0o600)  # a pre-existing file keeps whatever mode it had
+        try:
+            # fork 2026-10-26 (release fix): os.fchmod is Unix-only — on Windows it raised
+            # AttributeError out of start_server and took the whole WeCom platform down at
+            # connect. There the lock dir is already owner-private; skip the tightening.
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)  # an existing file keeps its old mode — tighten it first
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "port": port, "secret": secret, "pid": os.getpid(),
+                    "bot_id": str(bot_id or ""),
+                }))
+        except BaseException:
+            # Never leave a secret behind in a file we could not protect.
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
         return path
     except OSError as exc:
         log.warning("wecom-relay: could not publish the rendezvous file %s (%s) — "
@@ -131,6 +151,7 @@ def publish_rendezvous(port: int, secret: str, log: logging.Logger) -> Optional[
 def start_server(*, dispatch: Callable, loop, port: Optional[int] = None,
                  logger_: Optional[logging.Logger] = None,
                  secret: Optional[str] = None,
+                 bot_id: Optional[str] = None,
                  publish: bool = True) -> Optional[ThreadingHTTPServer]:
     """Serve ``POST /notify`` on 127.0.0.1; None when the bind fails.
 
@@ -162,7 +183,7 @@ def start_server(*, dispatch: Callable, loop, port: Optional[int] = None,
     server.daemon_threads = True
     server.relay_secret = secret  # type: ignore[attr-defined]
     if publish:
-        published = publish_rendezvous(server.server_address[1], secret, log)
+        published = publish_rendezvous(server.server_address[1], secret, log, bot_id=bot_id)
         # fork 2026-10-26 (release fix): remember the file so _stop_relay_server can
         # unpublish it — a stale rendezvous routes later senders to a dead endpoint.
         server.relay_rendezvous_path = published  # type: ignore[attr-defined]

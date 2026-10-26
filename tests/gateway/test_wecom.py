@@ -1180,8 +1180,10 @@ class TestExecutionCorrection:
         adapter._correct_executions_after_redelivery("g1")
 
         assert attempts == ["exec-1"]
-        # the id is kept for a bounded retry instead of being dropped
-        assert [eid for eid, _ts in adapter._pending_group_exec_ids.get("g1", [])] == ["exec-1"]
+        # the id is kept for a bounded retry instead of being dropped — it waits in the
+        # DELIVERED map (its report went out; only the ledger row is still unsettled)
+        assert [eid for eid, _ts in adapter._pending_delivered_exec_ids.get("g1", [])] == ["exec-1"]
+        assert "g1" not in adapter._pending_group_exec_ids
         assert "g1" in adapter._pending_correction_timers
         for handle in list(adapter._pending_correction_timers.values()):
             handle.cancel()
@@ -1205,6 +1207,226 @@ class TestExecutionCorrection:
 
         assert corrected == []
         assert adapter._pending_group_exec_ids == {}
+
+    @pytest.mark.asyncio
+    async def test_a_redelivery_corrects_only_the_report_it_delivered(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the chat-granular correction stamped ids whose
+        report was still parked — a never-delivered report booked 'delivered' hides a
+        real message loss. The redelivery scopes the correction to its own entry."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        assert adapter._stash_group_pending("g1", "report A", execution_id="exec-a") is True
+        adapter._pending_group_sends["g1"].append((adapter._pending_group_sends["g1"][0][0] + 1, "report B"))
+        adapter._pending_group_exec_ids["g1"].append(("exec-b", adapter._pending_group_sends["g1"][1][0]))
+
+        ts_a = adapter._pending_group_sends["g1"][0][0]
+        await adapter._redeliver_group_pending("g1", "⏰ 定时补发\n---\nreport A", park_ts=ts_a)
+
+        assert corrected == ["exec-a"]
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-b"]
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_the_duplicate_lane_still_registers_its_execution_id(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the live and standalone lanes park identical
+        content; the second (dedup'd) attempt used to return early WITHOUT recording
+        its execution id — that execution's ledger row stayed failed forever."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        assert adapter._stash_group_pending("g1", "17:31 report", execution_id="exec-a") is True
+        assert adapter._stash_group_pending("g1", "17:31 report", execution_id="exec-b") is True
+
+        assert [t for _, t in adapter._pending_group_sends["g1"]] == ["17:31 report"]  # dedup holds
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-a", "exec-b"]
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_never_evicts_a_full_queue(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the cap trim ran BEFORE the duplicate check, so
+        the second lane re-parking identical content on a FULL queue evicted the oldest
+        undelivered report (and its correction id) while adding nothing."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._group_pending_max = 2
+        assert adapter._stash_group_pending("g1", "report A", execution_id="exec-a") is True
+        adapter._pending_group_sends["g1"][0] = (adapter._pending_group_sends["g1"][0][0] - 5.0, "report A")
+        adapter._pending_group_exec_ids["g1"][0] = ("exec-a", adapter._pending_group_sends["g1"][0][0])
+        assert adapter._stash_group_pending("g1", "report B", execution_id="exec-b") is True
+
+        assert adapter._stash_group_pending("g1", "report B", execution_id="exec-b2") is True
+
+        assert [t for _, t in adapter._pending_group_sends["g1"]] == ["report A", "report B"]
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-a", "exec-b", "exec-b2"]
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_single_chunk_report_keeps_its_execution_id(self):
+        """The control for the multi-chunk rule below — the ordinary report still corrects."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+
+        await adapter.send("g1", "17:31 report", metadata={"execution_id": "exec-1"})
+
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-1"]
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_a_multi_chunk_report_never_corrects_off_one_chunk(self):
+        """fork 2026-10-26 (release fix): send() splits a long report and every chunk rides
+        the SAME execution id; chunks are redelivered independently and a lost chunk is
+        dropped, so a 1-of-N delivery must not stamp the execution 'delivered'."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+
+        async def _inline(chat_id, factory, **kwargs):
+            return await factory()
+
+        adapter._enqueue_chat_send = _inline
+        long_report = " ".join(["word"] * 1200)  # > 4000 chars: several truncate_message chunks
+        assert len(adapter.truncate_message(long_report, adapter.MAX_MESSAGE_LENGTH)) > 1
+
+        await adapter.send("g1", long_report, metadata={"execution_id": "exec-1"})
+
+        # send_chunks stops at the first failed chunk, so only the FIRST chunk is parked;
+        # that chunk must not carry the execution id (a 1-of-N delivery is not a delivery)
+        assert adapter._pending_group_sends.get("g1")
+        assert "g1" not in adapter._pending_group_exec_ids
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_report_is_never_corrected_by_a_sibling(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the inbound flush drops a failed redelivery BY
+        DESIGN — the content is gone, so its ids must go with it. The timed retry used to
+        sweep every id of the chat and stamp the lost report 'delivered'."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        failed = asyncio.Event()
+
+        async def _send(chat_id, content, **kwargs):
+            from gateway.platforms.base import SendResult
+
+            if "lost report" in content:
+                failed.set()
+                return SendResult(success=False, error="WeCom errcode 40058: nope")
+            return SendResult(success=True, message_id="mid-1")
+
+        monkeypatch.setattr(adapter, "send", _send)
+        adapter._pending_group_sends = {"g1": [(time.time(), "lost report")]}
+        adapter._pending_group_exec_ids = {"g1": [("exec-lost", adapter._pending_group_sends["g1"][0][0])]}
+
+        adapter._flush_group_pending("g1")           # pops the content, the redelivery fails
+        await asyncio.wait_for(failed.wait(), timeout=5)
+
+        assert "g1" not in adapter._pending_group_exec_ids  # the lost id went with its content
+
+        assert adapter._stash_group_pending("g1", "later report", execution_id="exec-later") is True
+        await adapter._group_retry_flush("g1")       # the later report goes out
+
+        assert corrected == ["exec-later"]           # the lost report was never stamped
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_a_timed_retry_corrects_each_entry_it_delivered(self, monkeypatch):
+        """fork 2026-10-26 (release fix): a successful entry is corrected even when a
+        sibling stays parked (the whole-queue sweep used to skip it, and the sweep also
+        stamped ids of reports that were never delivered)."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        now = time.time()
+        adapter._pending_group_sends = {"g1": [(now, "report A"), (now + 1, "report B")]}
+        adapter._pending_group_exec_ids = {"g1": [("exec-a", now), ("exec-b", now + 1)]}
+        responses = iter([{"errcode": 0}, {"errcode": 6000, "errmsg": "global error"}])
+
+        async def _send(chat_id, content, **kwargs):
+            from gateway.platforms.base import SendResult
+
+            response = next(responses)
+            if response["errcode"] == 0:
+                return SendResult(success=True, message_id="mid-1")
+            return SendResult(success=False, error="WeCom errcode 6000: global error")
+
+        monkeypatch.setattr(adapter, "send", _send)
+
+        await adapter._group_retry_flush("g1")
+
+        assert corrected == ["exec-a"]
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-b"]  # still parked
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_a_given_up_correction_is_terminal(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the give-up branch left the ids in the delivered
+        map, so every reconnect re-armed a fresh budget and retried the uncorrectable rows
+        forever."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        attempts = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: attempts.append(execution_id) or False,  # never settles
+        )
+        adapter._pending_delivered_exec_ids = {"g1": [("exec-1", time.time())]}
+        adapter._pending_correction_attempts["g1"] = len(adapter._CORRECTION_RETRY_DELAYS)
+
+        adapter._rearm_correction_retry("g1", [])
+
+        assert adapter._pending_delivered_exec_ids == {}
+        assert "g1" not in adapter._pending_correction_timers
+
+        adapter._note_ws_established()  # a reconnect must not resurrect the budget
+
+        assert "g1" not in adapter._pending_correction_timers
+        assert attempts == []
+
+    @pytest.mark.asyncio
+    async def test_the_delivered_correction_is_retried_not_stuck(self, monkeypatch):
+        """fork 2026-10-26 (release fix): a delivered report whose ledger row has not
+        settled yet is retried on the timer — and the retry hits the DELIVERED map only
+        (a retry must never stamp a still-parked report)."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        attempts = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: attempts.append(execution_id) or False,  # not settled yet
+        )
+        assert adapter._stash_group_pending("g1", "still parked", execution_id="exec-parked") is True
+        ts_parked = adapter._pending_group_sends["g1"][0][0]
+        adapter._pending_group_sends["g1"].append((ts_parked + 1, "delivered report"))
+        adapter._pending_group_exec_ids["g1"].append(("exec-delivered", ts_parked + 1))
+
+        await adapter._redeliver_group_pending(
+            "g1", "⏰ 定时补发\n---\ndelivered report", park_ts=ts_parked + 1)
+
+        assert attempts == ["exec-delivered"]
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-parked"]
+        assert [eid for eid, _ts in adapter._pending_delivered_exec_ids["g1"]] == ["exec-delivered"]
+        assert "g1" in adapter._pending_correction_timers
+
+        attempts.clear()
+        adapter._correction_retry_fire("g1")  # the retry runs the delivered map only
+
+        assert attempts == ["exec-delivered"]  # the still-parked report is never stamped
+        for handle in list(adapter._pending_correction_timers.values()):
+            handle.cancel()
 
 
 class TestGroupPendingPersistence:
@@ -1347,11 +1569,12 @@ class TestGroupPendingPersistence:
 
         async def _slow_capture(payload, path):
             writes.append(payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
             await asyncio.sleep(0)  # yield so the flush lanes interleave
 
         monkeypatch.setattr(adapter, "_write_pending", _slow_capture)
         adapter._pending_save_fire()          # the debounced write is now in flight
-        assert adapter._pending_write_task is not None
+        assert adapter._pending_write_tasks
         adapter._pending_group_sends.clear()  # drained inside the debounce window
 
         await adapter.disconnect()
@@ -1359,6 +1582,87 @@ class TestGroupPendingPersistence:
         assert len(writes) == 2
         assert writes[0]["chats"]["g1"]       # the in-flight snapshot had the entry
         assert writes[-1]["chats"] == {}      # the final state on disk is the drained one
+
+    @pytest.mark.asyncio
+    async def test_shutdown_never_arms_a_new_debounced_save(self, pending_env):
+        """fork 2026-10-26 (release fix): a save armed during the teardown dies with the
+        loop — the disconnect flush owns the last write."""
+        adapter = self._adapter()
+        adapter._shutting_down = True
+
+        adapter._schedule_pending_save()
+
+        assert adapter._pending_save_handle is None
+
+    @pytest.mark.asyncio
+    async def test_a_redelivery_during_the_flush_is_rewritten(self, pending_env, monkeypatch):
+        """fork 2026-10-26 (release fix): a redelivery completing inside the write window
+        mutates the queue — the disconnect flush repeats until the payload stops changing."""
+        adapter = self._adapter()
+        adapter._pending_group_sends = {"g1": [(time.time(), "17:31 report")]}
+        writes = []
+        flushed_once = False
+
+        async def _capture(payload, path):
+            nonlocal flushed_once
+            writes.append(payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            if not flushed_once:  # a redelivery lands between the writes
+                flushed_once = True
+                adapter._pending_group_sends.clear()
+
+        monkeypatch.setattr(adapter, "_write_pending", _capture)
+
+        await adapter.disconnect()
+
+        assert len(writes) == 2
+        assert writes[0]["chats"]["g1"]       # the pre-drain payload went out first
+        assert writes[-1]["chats"] == {}      # and the drain is the state on disk
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_file_is_quarantined_not_buried(self, pending_env):
+        """fork 2026-10-26 (release fix): the corrupt file holds undelivered reports —
+        overwriting it silently loses them for good; it is moved aside instead."""
+        pending_env.GROUP_PENDING_PATH.write_text("{not json", encoding="utf-8")
+
+        self._adapter()  # must not raise
+
+        assert not pending_env.GROUP_PENDING_PATH.exists()
+        assert pending_env.GROUP_PENDING_PATH.with_name("wecom_group_pending.json.corrupt").exists()
+
+    @pytest.mark.asyncio
+    async def test_restored_ids_without_content_get_a_correction_retry(self, pending_env):
+        """fork 2026-10-26 (release fix): an id whose report was DELIVERED before the
+        restart waits for a ledger correction — nothing will redeliver it, so the
+        correction needs its own timer on reconnect."""
+        adapter = self._adapter()
+        adapter._pending_delivered_exec_ids = {"g1": [("exec-1", time.time())]}
+        await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
+
+        restored = self._adapter()
+
+        assert [eid for eid, _ts in restored._pending_delivered_exec_ids.get("g1", [])] == ["exec-1"]
+
+        restored._note_ws_established()
+
+        assert "g1" in restored._pending_correction_timers
+        for handle in list(restored._pending_correction_timers.values()):
+            handle.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_restored_id_without_content_is_never_stamped_delivered(self, pending_env):
+        """fork 2026-10-26 (release fix): the inbound flush pops the content BEFORE the
+        redelivery, and a failed redelivery drops it — an id whose content is gone must
+        NOT be treated as a delivered report (that would stamp a never-delivered report
+        'delivered' and hide a real message loss)."""
+        adapter = self._adapter()
+        adapter._pending_group_exec_ids = {"g1": [("exec-1", time.time())]}
+        await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
+
+        restored = self._adapter()
+
+        assert restored._pending_delivered_exec_ids == {}
+        assert [eid for eid, _ts in restored._pending_group_exec_ids.get("g1", [])] == ["exec-1"]
 
 
 class TestKickDetection:

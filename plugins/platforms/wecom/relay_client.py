@@ -49,11 +49,13 @@ def rendezvous_path() -> Path:
     return state_home / "hermes" / "gateway-locks" / RENDEZVOUS_FILENAME
 
 
-def read_rendezvous() -> Optional[dict]:
-    """The gateway's published ``{port, secret, pid}`` — None when absent/unreadable/
-    stale. fork 2026-10-26 (release fix): a dead publisher's file is ignored (the
-    adapter unlinks it on clean shutdown, but a crashed gateway leaves it behind, and
-    posting to the dead port would read as "no relay" anyway)."""
+def read_rendezvous(bot_id: Optional[str] = None) -> Optional[dict]:
+    """The gateway's published ``{port, secret, pid, bot_id}`` — None when
+    absent/unreadable/stale. fork 2026-10-26 (release fix): a dead publisher's file is
+    ignored (the adapter unlinks it on clean shutdown, but a crashed gateway leaves it
+    behind, and posting to the dead port would read as "no relay" anyway). The
+    rendezvous file is MACHINE-scoped, so a second gateway (another bot) can own it —
+    a file published for another bot is not ours to use."""
     try:
         doc = json.loads(rendezvous_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -63,35 +65,43 @@ def read_rendezvous() -> Optional[dict]:
     pid = doc.get("pid")
     if isinstance(pid, int) and pid > 0 and not _pid_alive(pid):
         return None
+    published_bot = doc.get("bot_id")
+    if bot_id and published_bot and str(published_bot) != str(bot_id):
+        return None  # another bot's relay — using it would send through the wrong bot
     return doc
 
 
 def _pid_alive(pid: int) -> bool:
+    """Is the publisher still running? fork 2026-10-26 (release fix): os.kill(pid, 0)
+    TERMINATES the target on Windows (no sig==0 special case) — a probe that killed the
+    gateway on every send. The repo's own stdlib-only helper is the safe answer."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # alive, owned by someone else
-    except OSError:
-        return True  # unknown platform answer — assume alive, let the POST decide
-    return True
+        from hermes_cli._subprocess_compat import pid_exists_stdlib
+    except Exception:
+        return True  # no probe available — assume alive, let the POST decide
+    try:
+        return bool(pid_exists_stdlib(int(pid)))
+    except Exception:
+        return True
 
 
 def try_relay_send(chat_id: str, message: str, *, port: Optional[int] = None,
                    secret: Optional[str] = None,
+                   bot_id: Optional[str] = None,
                    timeout: float = CLIENT_TIMEOUT_SECONDS) -> Optional[dict]:
     """Hand *message* to the gateway's relay; None when the relay is unreachable.
 
     A relay ANSWER (success or error) is final — the gateway owned the attempt, so
     the caller must NOT retry through its own connection (that is what displaces the
-    gateway). Only "no relay" returns None.
+    gateway). Only "no relay" returns None. ``bot_id`` scopes the lookup: the
+    rendezvous file is machine-scoped, so a relay published for ANOTHER bot must not
+    be used (it would deliver through the wrong bot's subscription).
     """
     from urllib.error import HTTPError, URLError
     from urllib.request import ProxyHandler, Request, build_opener
 
     if port is None or secret is None:
-        doc = read_rendezvous()
+        doc = read_rendezvous(bot_id=bot_id)
         if not doc:
             return None
         port, secret = int(doc["port"]), str(doc["secret"])

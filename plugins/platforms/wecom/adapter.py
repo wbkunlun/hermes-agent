@@ -270,10 +270,16 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # fork 2026-10-26: did THIS instance take the machine-scoped bot lock? (the
         # process-level set says who may take it; this says who must give it back)
         self._wecom_lock_acquired = False
-        # fork 2026-10-26 (release fix): the in-flight parked-queue write task — a
+        # fork 2026-10-26 (release fix): the in-flight parked-queue write tasks — a
         # debounced write that nobody holds can be garbage-collected mid-flight, and
-        # the disconnect flush must not race it.
-        self._pending_write_task = None
+        # the disconnect flush must not race them. A SET, not a single slot: two
+        # debounced writes can overlap (the second fires while the first is still in
+        # the thread) and a single slot dropped the earlier reference.
+        self._pending_write_tasks: set[asyncio.Task] = set()
+        # fork 2026-10-26 (release fix): the shutdown flag — during disconnect no new
+        # debounced save may be armed (it would die with the loop) and the flush owns
+        # the final write.
+        self._shutting_down = False
         # fork 2026-10-26 (release fix): bounded retries for a ledger correction the
         # drain had not settled yet (the row is still 'queued' while a multi-chunk
         # report is still being paced out).
@@ -313,6 +319,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # dead window — a redelivery success corrects their failed ledger rows (see
         # cron/delivery_correction.py); the cron live lane threads the id via send metadata.
         self._pending_group_exec_ids: dict[str, list[tuple[str, float]]] = {}
+        # fork 2026-10-26 (release fix): ids whose report was DELIVERED but whose ledger
+        # row has not settled yet — the correction is retried from here. Kept apart from
+        # the parked ids: a parked report must not be stamped 'delivered' (that would
+        # hide a real message loss), while a delivered one must be.
+        self._pending_delivered_exec_ids: dict[str, list[tuple[str, float]]] = {}
         # fork 2026-10-26 (batch 4A): debounced disk save for the parked queue (the handle).
         self._pending_save_handle = None
         # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
@@ -331,6 +342,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         return False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # fork 2026-10-26 (release fix): a fresh session re-opens the parked-queue
+        # persistence — the shutdown flag only governs the teardown window.
+        self._shutting_down = False
         for available, dep in ((AIOHTTP_AVAILABLE, "aiohttp"), (HTTPX_AVAILABLE, "httpx")):
             if not available:
                 return self._startup_failure("wecom_missing_dependency", f"WeCom startup failed: {dep} not installed", "[%s] %s. Run: pip install %s", dep)
@@ -414,13 +428,23 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                         "message_id": getattr(result, "message_id", None)}
             return {"error": str(getattr(result, "error", None) or "WeCom send failed")}
 
-        self._relay_server = start_server(dispatch=_dispatch, loop=loop, logger_=logger)
+        try:
+            self._relay_server = start_server(dispatch=_dispatch, loop=loop, logger_=logger,
+                                              bot_id=self._bot_id)
+        except Exception as exc:
+            # fork 2026-10-26 (release fix): the relay is an OPTIONAL side channel — its
+            # failure must never take the (working) platform down at connect time.
+            logger.error("[%s] wecom-relay failed to start (%s) — out-of-process senders "
+                         "will be refused by the bot-identity lock", self.name, exc)
+            self._relay_server = None
 
     def _stop_relay_server(self) -> None:
         """fork 2026-10-26: take the relay down with the adapter (the port must be free
         for the next connect). fork 2026-10-26 (release fix): also unpublish the
         rendezvous file — a stale file routes later senders to a dead endpoint whose
-        error body they would take as the final answer."""
+        error body they would take as the final answer. The rendezvous path is
+        MACHINE-scoped, so the file may describe ANOTHER gateway's relay by now:
+        unlink it only while it still names THIS process."""
         server = getattr(self, "_relay_server", None)
         if server is None:
             return
@@ -432,8 +456,19 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             logger.debug("[%s] relay server shutdown failed: %s", self.name, exc)
         rendezvous = getattr(server, "relay_rendezvous_path", None)
         if rendezvous is not None:
-            with contextlib.suppress(OSError):
-                rendezvous.unlink()
+            self._unpublish_rendezvous(rendezvous)
+
+    @staticmethod
+    def _unpublish_rendezvous(path) -> None:
+        """Remove the rendezvous file only while it still describes THIS process."""
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(doc, dict) or doc.get("pid") != os.getpid():
+            return  # another gateway owns the file now — leave it alone
+        with contextlib.suppress(OSError):
+            path.unlink()
 
     def _release_bot_lock(self) -> None:
         """fork 2026-10-26: hand the bot lock back (connect failure / shutdown). The
@@ -446,33 +481,19 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
 
     async def disconnect(self) -> None:
         self._running = False
+        # fork 2026-10-26 (release fix): the shutdown flag goes up FIRST — a debounced
+        # save armed during the teardown would die with the loop, and the flush below
+        # owns the last write.
+        self._shutting_down = True
         self._mark_disconnected()
         self._cancel_learned_save()
         # fork 2026-10-26: give the machine-scoped bot lock back so a restarted gateway
         # (or another profile) can connect — a stale lock wedges every later connect.
         self._release_bot_lock()
         self._stop_relay_server()
-        # fork 2026-10-26 (batch 4A): a debounced write dropped at exit loses parked
-        # content for good — flush it now, awaited (this is the last chance to save).
-        # fork 2026-10-26 (release fix): three holes closed — (1) an already-fired
-        # debounced write races this flush (last rename wins: the stale snapshot could
-        # resurrect delivered entries), so hold its task and let it finish first;
-        # (2) a queue drained inside the debounce window left the PRE-drain snapshot on
-        # disk because the flush was skipped when the maps were empty — an armed
-        # (or in-flight) save must also force the rewrite; (3) correction retries die
-        # with the loop anyway, so cancel their timers.
-        if self._pending_persist_enabled() and (
-                getattr(self, "_pending_group_sends", None)
-                or getattr(self, "_pending_group_exec_ids", None)
-                or getattr(self, "_pending_save_handle", None) is not None
-                or getattr(self, "_pending_write_task", None) is not None):
-            self._cancel_pending_save()
-            inflight = getattr(self, "_pending_write_task", None)
-            if inflight is not None:
-                with contextlib.suppress(Exception):
-                    await inflight
-            with contextlib.suppress(Exception):
-                await self._write_pending(self._pending_payload(), self._pending_queue_path())
+        # fork 2026-10-26 (release fix): the timers die with the loop anyway, and one
+        # firing DURING the flush would mutate the queue while it is being written —
+        # cancel them BEFORE the flush, not after.
         for handle in list(getattr(self, "_pending_correction_timers", {}).values()):
             handle.cancel()
         self._pending_correction_timers.clear()
@@ -480,6 +501,17 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             handle.cancel()
         self._group_retry_timers.clear()
         self._group_retry_attempts.clear()
+        # fork 2026-10-26 (batch 4A): a debounced write dropped at exit loses parked
+        # content for good — flush it now, awaited (this is the last chance to save).
+        # fork 2026-10-26 (release fix): three holes closed — (1) an already-fired
+        # debounced write races this flush (last rename wins: the stale snapshot could
+        # resurrect delivered entries), so its task is awaited first; (2) a queue drained
+        # inside the debounce window left the PRE-drain snapshot on disk because the
+        # flush was skipped when the maps were empty — the write runs whenever there is
+        # anything to say; (3) a redelivery that lands DURING the write window mutates
+        # the queue again — the write repeats until the payload stops changing.
+        with contextlib.suppress(Exception):
+            await self._flush_pending_to_disk()
         for task in list(self._chat_workers.values()) + list(self._control_workers.values()):
             task.cancel()
         for registry in (self._chat_workers, self._control_workers, self._chat_queues, self._control_queues):
@@ -497,6 +529,29 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         await self._teardown()
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
+
+    async def _flush_pending_to_disk(self) -> None:
+        """fork 2026-10-26 (release fix): the last write of the parked queue.
+
+        The in-flight debounced writes are awaited first (the last rename wins, so a
+        stale snapshot must not land after the final one), then the current payload is
+        written — repeatedly, until the queue stops changing under us (a redelivery
+        that completes during the write window mutates it)."""
+        if not self._pending_persist_enabled():
+            return
+        for task in list(getattr(self, "_pending_write_tasks", None) or ()):
+            with contextlib.suppress(Exception):
+                await task
+        self._cancel_pending_save()
+        path = self._pending_queue_path()
+        for _ in range(3):
+            payload = self._pending_payload()
+            if not payload["chats"] and not payload["exec_ids"] and not payload["delivered_ids"] and not path.exists():
+                return  # nothing parked and nothing on disk — do not create a junk file
+            await self._write_pending(payload, path)
+            if payload == self._pending_payload():
+                return
+        logger.warning("[%s] Parked-group queue kept changing during the disconnect flush — the last write may be stale", self.name)
 
     def _fail_all(self, exc: Exception) -> None:
         self._fail_pending_responses(exc)
@@ -712,6 +767,17 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     self._schedule_group_retry(chat_id)
                 except RuntimeError:
                     break  # no running loop (a synchronous caller) — the next connect arms it
+        # fork 2026-10-26 (release fix): ids restored from disk whose report was already
+        # DELIVERED — nothing will redeliver them, so the correction needs its own retry
+        # (the ledger row may settle after the restart).
+        for chat_id in list(getattr(self, "_pending_delivered_exec_ids", None) or {}):
+            if chat_id in self._pending_correction_timers:
+                continue
+            try:
+                self._rearm_correction_retry(
+                    chat_id, list(self._pending_delivered_exec_ids.get(chat_id) or []))
+            except RuntimeError:
+                break  # no running loop (a synchronous caller) — the next connect arms it
 
     def _resubscribe_window(self, base: float) -> float:
         """fork 2026-10-09 hotfix: extend a resubscribe-aware wait when the listen loop
@@ -1230,23 +1296,33 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         entries = [(ts, text) for ts, text in pending.get(chat_id, []) if now - ts < ttl]
         if not entries:
             self._group_retry_attempts.pop(chat_id, None)  # fork 2026-10-08: fresh parking episode — retry budget restored
-        if any(text == content for _, text in entries):
+        # fork 2026-10-26 (release fix): the duplicate check runs BEFORE the cap — the live
+        # and standalone lanes park identical content, and a duplicate must never evict
+        # an older undelivered report from a full queue.
+        content_ts: Optional[float] = next((ts for ts, text in entries if text == content), None)
+        if content_ts is not None:
             logger.info("[%s] Group send already queued for redelivery (chat=%s, queued=%d) — duplicate live/standalone attempt not re-queued", self.name, chat_id, len(entries))
-            pending[chat_id] = entries
-            return True
-        max_pending = getattr(self, "_group_pending_max", 5)
-        while len(entries) >= max_pending:  # newest scheduled reports matter more; drop oldest
-            dropped_ts, _ = entries.pop(0)
-            logger.warning("[%s] Group pending queue full (chat=%s, max=%d) — dropping entry scheduled %s", self.name, chat_id, max_pending, time.strftime("%H:%M", time.localtime(dropped_ts)))
-        entries.append((now, content))
+        else:
+            max_pending = max(1, int(getattr(self, "_group_pending_max", 5) or 1))
+            while len(entries) >= max_pending:  # newest scheduled reports matter more; drop oldest
+                dropped_ts, _ = entries.pop(0)
+                logger.warning("[%s] Group pending queue full (chat=%s, max=%d) — dropping entry scheduled %s", self.name, chat_id, max_pending, time.strftime("%H:%M", time.localtime(dropped_ts)))
+                # fork 2026-10-26 (release fix): the ids and the pending corrections of
+                # the dropped content go with it — they can never be delivered now, so a
+                # correction for them would stamp a never-delivered report 'delivered'.
+                self._drop_exec_ids(chat_id, [eid for eid, ts in self._pending_group_exec_ids.get(chat_id, []) if ts == dropped_ts])
+                self._drop_delivered_exec_ids(chat_id, [eid for eid, ts in self._pending_delivered_exec_ids.get(chat_id, []) if ts == dropped_ts])
+                self._cancel_pending_retry(chat_id)
+            content_ts = now
+            entries.append((now, content))
         pending[chat_id] = entries
         if execution_id and getattr(self, "_pending_group_exec_ids", None) is not None:
-            # fork 2026-10-26 (release fix): each id rides its park timestamp so a
-            # correction can never fire for content whose entries expired past the TTL
-            # long ago (that would stamp a never-delivered report as 'delivered').
+            # fork 2026-10-26 (release fix): each id rides its CONTENT's park timestamp —
+            # the correction then targets exactly the report that was delivered, and an
+            # id can never fire for content whose entries expired past the TTL.
             exec_ids = self._pending_group_exec_ids.setdefault(chat_id, [])
             if not any(eid == execution_id for eid, _ts in exec_ids):
-                exec_ids.append((execution_id, now))
+                exec_ids.append((execution_id, content_ts))
         self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): parked content must survive a restart
         logger.warning("[%s] Group send queued for redelivery on next group message (chat=%s, queued=%d, ttl=%.0fs)", self.name, chat_id, len(entries), ttl)
         return True
@@ -1266,26 +1342,46 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         stashed = pending.pop(chat_id, [])
         self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): the queue changed
         entries = [(ts, text) for ts, text in stashed if now - ts < ttl]
+        # fork 2026-10-26 (release fix): entries past the TTL are dropped here — so are
+        # their correction ids (correcting content that was never delivered would be a
+        # false 'delivered').
+        expired_ts = {ts for ts, _text in stashed} - {ts for ts, _text in entries}
+        for ts in expired_ts:
+            self._drop_exec_ids(chat_id, [eid for eid, e_ts in self._pending_group_exec_ids.get(chat_id, []) if e_ts == ts])
         if len(entries) != len(stashed):
             logger.info("[%s] Group redelivery: %d expired of %d stashed entries dropped (chat=%s, ttl=%.0fs)", self.name, len(stashed) - len(entries), len(stashed), chat_id, ttl)
         for ts, content in entries:
             header = f"⏰ 定时补发（原定 {time.strftime('%H:%M', time.localtime(ts))}）"
             # No pre-slice: _send_inner byte-segments downstream; the header rides segment 1.
-            asyncio.ensure_future(self._redeliver_group_pending(chat_id, f"{header}\n---\n{content}"))
+            # fork 2026-10-26 (release fix): the park timestamp scopes the ledger
+            # correction to THIS report — a sibling report still parked on the chat must
+            # not be stamped 'delivered'.
+            asyncio.ensure_future(self._redeliver_group_pending(chat_id, f"{header}\n---\n{content}", park_ts=ts))
 
-    async def _redeliver_group_pending(self, chat_id: str, composed: str) -> None:
+    async def _redeliver_group_pending(self, chat_id: str, composed: str, park_ts: Optional[float] = None) -> None:
         """One flushed entry; never raises into the event loop (fire-and-forget owner)."""
         try:
             result = await self.send(chat_id, composed, metadata={"is_redelivery": True})
         except Exception as exc:
             logger.warning("[%s] Group redelivery raised and was dropped (chat=%s): %s", self.name, chat_id, exc)
+            self._forget_lost_content(chat_id, park_ts)
             return
         if not getattr(result, "success", False):
             logger.warning("[%s] Group redelivery failed and was dropped (chat=%s, error=%s)", self.name, chat_id, getattr(result, "error", None))
+            self._forget_lost_content(chat_id, park_ts)
             return
         # fork 2026-10-26 (batch 3): the redelivery landed — the cron rows parked with it
         # are no longer failures.
-        self._correct_executions_after_redelivery(chat_id)
+        self._correct_executions_after_redelivery(chat_id, park_ts)
+
+    def _forget_lost_content(self, chat_id: str, park_ts: Optional[float]) -> None:
+        """fork 2026-10-26 (release fix): the inbound flush drops a failed redelivery BY
+        DESIGN — the content is gone, so its correction ids must go with it. Keeping
+        them would let a later sibling delivery stamp the lost report 'delivered'."""
+        if park_ts is None:
+            return
+        self._drop_exec_ids(chat_id, [eid for eid, ts in self._pending_group_exec_ids.get(chat_id, []) if ts == park_ts])
+        self._drop_delivered_exec_ids(chat_id, [eid for eid, ts in self._pending_delivered_exec_ids.get(chat_id, []) if ts == park_ts])
 
     def _schedule_group_retry(self, chat_id: str) -> None:
         """fork 2026-10-08: 846609 dead-window — retry parked group sends after the
@@ -1323,24 +1419,28 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return
         ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
         now = time.time()
-        dead_session, delivered = False, 0
+        dead_session = False
+        delivered_ts: list[float] = []
         for ts, content in entries:
             if now - ts >= ttl:
+                self._drop_exec_ids(chat_id, [eid for eid, e_ts in self._pending_group_exec_ids.get(chat_id, []) if e_ts == ts])
                 continue
             result = await self.send(chat_id, content, metadata={"is_redelivery": True})
             if getattr(result, "success", False):
                 self._unstash_group_pending(chat_id, ts, content)
-                delivered += 1
+                delivered_ts.append(ts)
             elif _is_subscription_lost_error(getattr(result, "error", "")):
                 dead_session = True
         remaining = [e for e in (pending.get(chat_id) or []) if now - e[0] < ttl]
+        # fork 2026-10-26 (release fix): each delivered entry corrects ITS OWN ids — the
+        # chat-granular sweep also stamped ids whose report was lost (the inbound flush
+        # drops a failed redelivery), booking a never-delivered report 'delivered'.
+        for ts in delivered_ts:
+            self._correct_executions_after_redelivery(chat_id, ts)
         if not remaining:
             self._group_retry_attempts.pop(chat_id, None)
-            if delivered:
-                # fork 2026-10-26 (batch 3): everything parked went out — correct the rows.
-                self._correct_executions_after_redelivery(chat_id)
             return
-        if delivered or not dead_session:
+        if delivered_ts or not dead_session:
             return  # non-dead failures stay parked for the inbound ⏰ flush
         self._group_retry_attempts[chat_id] = self._group_retry_attempts.get(chat_id, 0) + 1
         self._schedule_group_retry(chat_id)
@@ -1364,68 +1464,158 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     # (their content is long gone — correcting them would be a false 'delivered').
     _CORRECTION_RETRY_DELAYS = (30.0, 60.0, 120.0)
 
-    def _correct_executions_after_redelivery(self, chat_id: str) -> None:
+    def _correct_executions_after_redelivery(self, chat_id: str, park_ts: Optional[float] = None) -> None:
         """fork 2026-10-26 (batch 3): parked content delivered — correct the settled-failed
         cron ledger rows the parked sends came from (cron/delivery_correction.py; the
-        correction is double-fenced and idempotent, so extra calls are no-ops). Chat-granular
-        by design: two executions parked on one chat are corrected together on the first
-        successful redelivery — never correcting the delivered one is worse."""
+        correction is double-fenced and idempotent, so extra calls are no-ops).
+
+        fork 2026-10-26 (release fix): the attempt is scoped to the report that was
+        DELIVERED (``park_ts``) — a report still parked on the chat, or one whose content
+        was lost, must never be stamped 'delivered' (a false stamp hides a real message
+        loss). Every caller knows which entry it delivered; None means "every id of this
+        chat" and is reserved for a whole-chat sweep."""
         ids = getattr(self, "_pending_group_exec_ids", None)
         if not ids:
             return
-        execution_ids = ids.pop(chat_id, None)
-        if not execution_ids:
-            self._cancel_correction_retry(chat_id)
+        stored = list(ids.get(chat_id) or [])
+        if park_ts is None:
+            targets = stored
+        else:
+            targets = [pair for pair in stored if pair[1] == park_ts]
+        if not targets:
             return
-        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
-        now = time.time()
         try:
             from cron.delivery_correction import correct_failed_delivery
         except Exception as exc:
             # An embedding that ships the adapter without cron: corrections are
             # unavailable, not pending — drop the ids, never arm a retry for them.
             logger.debug("[%s] Delivery correction unavailable (%s)", self.name, exc)
+            self._drop_exec_ids(chat_id, [eid for eid, _ts in targets])
             return
-        uncorrected: list[tuple[str, float]] = []
-        for execution_id, parked_at in execution_ids:
+        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
+        now = time.time()
+        unsettled: list[tuple[str, float]] = []
+        for execution_id, parked_at in targets:
             if ttl > 0 and now - parked_at >= ttl:
                 logger.info("[%s] Cron delivery %s correction dropped — parked past the %.0fs TTL (chat=%s)", self.name, execution_id, ttl, chat_id)
                 continue
             if correct_failed_delivery(execution_id):
                 logger.info("[%s] Cron delivery %s corrected to delivered after parked redelivery (chat=%s)", self.name, execution_id, chat_id)
             else:
-                uncorrected.append((execution_id, parked_at))
-        self._rearm_correction_retry(chat_id, uncorrected)
+                unsettled.append((execution_id, parked_at))
+        # the attempted ids no longer describe PARKED content — the report went out
+        self._drop_exec_ids(chat_id, [eid for eid, _ts in targets])
+        self._rearm_correction_retry(chat_id, unsettled)
+        # fork 2026-10-26 (release fix): the correction state moved to the delivered map
+        # — persist it, a restart must not lose a pending correction.
+        self._schedule_pending_save()
 
-    def _rearm_correction_retry(self, chat_id: str, uncorrected: list[tuple[str, float]]) -> None:
-        """fork 2026-10-26 (release fix): keep the ids the ledger has not settled yet and
-        retry a bounded number of times; drop the chat when the budget is exhausted."""
+    def _drop_exec_ids(self, chat_id: str, execution_ids: list[str]) -> None:
+        """Remove settled/attempted cron execution ids from the parked map."""
         ids = getattr(self, "_pending_group_exec_ids", None)
-        if ids is None:
+        if not ids or not execution_ids:
             return
-        self._cancel_correction_retry(chat_id)
-        if not uncorrected:
+        dropped = set(execution_ids)
+        remaining = [pair for pair in (ids.get(chat_id) or []) if pair[0] not in dropped]
+        if remaining:
+            ids[chat_id] = remaining
+        else:
+            ids.pop(chat_id, None)
+
+    def _drop_delivered_exec_ids(self, chat_id: str, execution_ids: list[str]) -> None:
+        """Remove correction ids whose content can never be delivered any more."""
+        delivered = getattr(self, "_pending_delivered_exec_ids", None)
+        if not delivered or not execution_ids:
+            return
+        dropped = set(execution_ids)
+        remaining = [pair for pair in (delivered.get(chat_id) or []) if pair[0] not in dropped]
+        if remaining:
+            delivered[chat_id] = remaining
+        else:
+            delivered.pop(chat_id, None)
+
+    def _rearm_correction_retry(self, chat_id: str, unsettled: list[tuple[str, float]]) -> None:
+        """fork 2026-10-26 (release fix): keep the ids the ledger has not settled yet and
+        retry a bounded number of times. The unsettled ids move to the DELIVERED map —
+        their report went out, so correcting them is right; they wait there for the
+        ledger to settle. The DELIVERED map is the single source of truth for "what
+        still needs a correction": one timer per chat while it holds something."""
+        delivered = getattr(self, "_pending_delivered_exec_ids", None)
+        if delivered is None:
+            return
+        if unsettled:
+            merged = delivered.setdefault(chat_id, [])
+            for pair in unsettled:
+                if not any(eid == pair[0] for eid, _ts in merged):
+                    merged.append(pair)
+        elif not delivered.get(chat_id):
+            self._cancel_correction_retry(chat_id)
             self._pending_correction_attempts.pop(chat_id, None)  # fresh episode next time
             return
+        if chat_id in self._pending_correction_timers:
+            return  # a retry is already armed for this chat
         attempts = self._pending_correction_attempts.get(chat_id, 0)
         if attempts >= len(self._CORRECTION_RETRY_DELAYS):
-            logger.info("[%s] Cron delivery correction gave up after %d retries (chat=%s)", self.name, attempts, chat_id)
+            # fork 2026-10-26 (release fix): a give-up is TERMINAL for these ids — leaving
+            # them in the map re-armed a fresh budget on every reconnect, forever.
+            given_up = delivered.pop(chat_id, [])
             self._pending_correction_attempts.pop(chat_id, None)
+            logger.warning("[%s] Cron delivery correction gave up after %d retries (chat=%s) — %d row(s) stay as recorded", self.name, attempts, chat_id, len(given_up))
+            self._schedule_pending_save()
             return
         delay = self._CORRECTION_RETRY_DELAYS[attempts]
         self._pending_correction_attempts[chat_id] = attempts + 1
-        merged = ids.setdefault(chat_id, [])
-        for pair in uncorrected:
-            if not any(eid == pair[0] for eid, _ts in merged):
-                merged.append(pair)
         loop = asyncio.get_running_loop()
         self._pending_correction_timers[chat_id] = loop.call_later(
             delay, lambda cid=chat_id: self._correction_retry_fire(cid))
 
+    def _cancel_pending_retry(self, chat_id: str) -> None:
+        """fork 2026-10-26 (release fix): the chat's last parked content was evicted and
+        its corrections were dropped — with nothing left to correct, an armed retry would
+        only find the chat empty, reset the attempt budget, and re-arm a fresh cycle."""
+        if self._pending_delivered_exec_ids.get(chat_id) or self._pending_group_exec_ids.get(chat_id):
+            return
+        self._cancel_correction_retry(chat_id)
+        self._pending_correction_attempts.pop(chat_id, None)
+
     def _correction_retry_fire(self, chat_id: str) -> None:
         self._pending_correction_timers.pop(chat_id, None)
         with contextlib.suppress(Exception):
-            self._correct_executions_after_redelivery(chat_id)
+            self._retry_delivered_corrections(chat_id)
+
+    def _retry_delivered_corrections(self, chat_id: str) -> None:
+        """Retry the corrections for reports that were DELIVERED but whose ledger row
+        has not settled yet (the drain settles a row only after its WHOLE paced send
+        returns, so a redelivery can land while the row is still 'queued')."""
+        delivered = getattr(self, "_pending_delivered_exec_ids", None)
+        if not delivered:
+            return
+        entries = list(delivered.get(chat_id) or [])
+        if not entries:
+            self._pending_correction_attempts.pop(chat_id, None)
+            return
+        try:
+            from cron.delivery_correction import correct_failed_delivery
+        except Exception as exc:
+            logger.debug("[%s] Delivery correction unavailable (%s)", self.name, exc)
+            return
+        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
+        now = time.time()
+        still_unsettled: list[tuple[str, float]] = []
+        for execution_id, parked_at in entries:
+            if ttl > 0 and now - parked_at >= ttl:
+                logger.info("[%s] Cron delivery %s correction dropped — parked past the %.0fs TTL (chat=%s)", self.name, execution_id, ttl, chat_id)
+                continue
+            if correct_failed_delivery(execution_id):
+                logger.info("[%s] Cron delivery %s corrected to delivered on retry (chat=%s)", self.name, execution_id, chat_id)
+            else:
+                still_unsettled.append((execution_id, parked_at))
+        if still_unsettled:
+            delivered[chat_id] = still_unsettled
+        else:
+            delivered.pop(chat_id, None)
+        self._rearm_correction_retry(chat_id, still_unsettled)
+        self._schedule_pending_save()  # the correction state changed — persist it
 
     def _cancel_correction_retry(self, chat_id: str) -> None:
         handle = self._pending_correction_timers.pop(chat_id, None)
@@ -1519,8 +1709,15 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # parked redelivery that later succeeds corrects the settled-failed ledger row.
         execution_id = str(metadata.pop("execution_id", "") or "") or None
         # One queued send per chunk so each one draws a token from the 30 msgs/min bucket.
-        return await send_chunks(self.truncate_message(content, self.MAX_MESSAGE_LENGTH), lambda chunk: self._enqueue_chat_send(
-            chat_id, lambda: self._send_inner(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=execution_id), is_control=is_control))
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
+        # fork 2026-10-26 (release fix): one execution id belongs to the WHOLE report, but
+        # each chunk parks separately and the chunks go out independently (one can be
+        # redelivered while a sibling is still parked, and a lost chunk is dropped). Only
+        # a single-chunk report may be corrected off one chunk's delivery — otherwise a
+        # 1-of-N delivery would stamp the execution 'delivered' and hide the lost chunks.
+        chunk_execution_id = execution_id if len(chunks) == 1 else None
+        return await send_chunks(chunks, lambda chunk: self._enqueue_chat_send(
+            chat_id, lambda: self._send_inner(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=chunk_execution_id), is_control=is_control))
 
     def _is_group_chat(self, chat_id: str) -> bool:
         """fork: single source of truth for group-ness — inbound-learned set UNION
@@ -1733,6 +1930,27 @@ def _consume_cross_loop_result(future) -> None:
         pass
 
 
+def _standalone_bot_id(pconfig) -> Optional[str]:
+    """The bot this out-of-process sender speaks for.
+
+    fork 2026-10-26 (release fix): the relay rendezvous file is MACHINE-scoped — a
+    second gateway (another bot) can own it. The sender scopes the lookup to its own
+    bot so it never posts through another bot's subscription. Unknown (None) means the
+    sender cannot scope the lookup; the relay then answers for whichever bot it serves
+    (the bot-identity lock still guards the fallback path).
+    """
+    extra = getattr(pconfig, "extra", None)
+    bot_id = ""
+    if isinstance(extra, dict):
+        bot_id = str(extra.get("bot_id") or extra.get("botId") or "").strip()
+    if bot_id:
+        return bot_id
+    try:
+        return str(_get_scoped_secret("WECOM_BOT_ID", "") or "").strip() or None
+    except Exception:
+        return str(os.getenv("WECOM_BOT_ID") or "").strip() or None
+
+
 async def _standalone_send(
 
     pconfig,
@@ -1866,7 +2084,7 @@ async def _standalone_send(
     try:
         from plugins.platforms.wecom.relay_client import try_relay_send
 
-        relayed = try_relay_send(chat_id, message)
+        relayed = try_relay_send(chat_id, message, bot_id=_standalone_bot_id(pconfig))
     except Exception as exc:
         logger.debug("[wecom] relay attempt failed (%s)", exc)
         relayed = None

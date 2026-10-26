@@ -293,10 +293,85 @@ async def test_relay_server_lifecycle_follows_the_adapter(monkeypatch, tmp_path)
     port = adapter._relay_server.server_address[1]
     doc = json.loads((tmp_path / "wecom-relay.json").read_text())
     assert doc["port"] == port
+    assert doc["bot_id"] == "bot-1"
 
     adapter._stop_relay_server()
     assert adapter._relay_server is None
     assert not (tmp_path / "wecom-relay.json").exists()  # unpublished with the server
+
+
+@pytest.mark.asyncio
+async def test_stop_never_unpublishes_another_gateways_rendezvous(monkeypatch, tmp_path):
+    """fork 2026-10-26 (release fix): the rendezvous path is MACHINE-scoped — a second
+    gateway (another bot) may own it by now. The adapter unlinks the file only while
+    it still names THIS process (as release_scoped_lock does for the lock itself)."""
+    from plugins.platforms.wecom.adapter import WeComAdapter
+
+    monkeypatch.setenv("WECOM_RELAY_PORT", "0")
+    monkeypatch.setattr(relay_server, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+    monkeypatch.setattr(relay_client, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+    )
+    adapter._start_relay_server()
+    assert adapter._relay_server is not None
+    path = tmp_path / "wecom-relay.json"
+    doc = json.loads(path.read_text())
+    doc["pid"] = 4_000_000_000  # another gateway's publication
+    path.write_text(json.dumps(doc))
+
+    adapter._stop_relay_server()
+
+    assert path.exists()  # not ours to delete
+
+
+@pytest.mark.asyncio
+async def test_a_relay_failure_never_takes_the_platform_down(monkeypatch, tmp_path):
+    """fork 2026-10-26 (release fix): the relay is an OPTIONAL side channel — its failure
+    must not escape _start_relay_server (a Windows os.fchmod AttributeError did exactly
+    that and killed the whole WeCom platform at connect time)."""
+    from plugins.platforms.wecom.adapter import WeComAdapter
+
+    monkeypatch.setenv("WECOM_RELAY_PORT", "0")
+    monkeypatch.setattr(relay_server, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+
+    def _boom(**kwargs):
+        raise AttributeError("module 'os' has no attribute 'fchmod'")
+
+    monkeypatch.setattr(relay_server, "start_server", _boom)
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+    )
+
+    adapter._start_relay_server()  # must not raise
+
+    assert adapter._relay_server is None
+
+
+def test_the_standalone_sender_scopes_the_relay_to_its_own_bot(monkeypatch):
+    """fork 2026-10-26 (release fix): the rendezvous file is machine-scoped — the
+    sender scopes the lookup to its own bot so it never posts through another bot's
+    subscription (the wrong bot would deliver, or the send would fail outright)."""
+    import plugins.platforms.wecom.adapter as wecom_module
+    from plugins.platforms.wecom.adapter import _standalone_send
+
+    seen = {}
+
+    def _fake_relay(chat_id, message, **kwargs):
+        seen.update(kwargs)
+        return {"success": True}
+
+    monkeypatch.setattr(wecom_module, "WeComAdapter",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ephemeral adapter built")))
+    monkeypatch.setattr("tools.send_message_senders._live_adapter", lambda platform: (None, None))
+    monkeypatch.setattr("plugins.platforms.wecom.relay_client.try_relay_send", _fake_relay)
+
+    result = asyncio.run(_standalone_send(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-mine"}), "g1", "report"))
+
+    assert result == {"success": True}
+    assert seen["bot_id"] == "bot-mine"
 
 
 def test_a_typo_port_falls_back_instead_of_killing_the_platform(monkeypatch, tmp_path):
@@ -343,6 +418,18 @@ async def test_the_adapter_dispatch_maps_a_failed_send_to_an_error_answer(monkey
         assert result == {"error": "send queue is down"}
     finally:
         adapter._stop_relay_server()
+
+
+def test_publishing_survives_a_platform_without_fchmod(monkeypatch, tmp_path):
+    """fork 2026-10-26 (release fix): os.fchmod does not exist on Windows — the publish
+    must still work there (the lock dir is already owner-private)."""
+    monkeypatch.setattr(relay_server, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+    monkeypatch.delattr(relay_server.os, "fchmod")
+
+    path = relay_server.publish_rendezvous(7861, "s3cret", relay_server.logger, bot_id="bot-1")
+
+    assert path is not None
+    assert json.loads(path.read_text())["secret"] == "s3cret"
 
 
 @pytest.mark.asyncio
