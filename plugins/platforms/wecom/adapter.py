@@ -43,6 +43,7 @@ from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, s
 from gateway.platforms.send_targets import StandaloneSendPolicy, parse_nonempty
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.learned_chats import LearnedChatsMixin
+from plugins.platforms.wecom.group_pending import GroupPendingMixin
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
@@ -162,7 +163,7 @@ def _content_of(container: dict[str, Any], key: str) -> str:
     return str(_dict_or_empty(container, key).get("content") or "").strip()
 
 
-class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, LearnedChatsMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
+class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, LearnedChatsMixin, GroupPendingMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     ALLOW_ALL_ENV_PREFIX = "WECOM"
@@ -289,10 +290,15 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # a redelivery success corrects their settled-failed ledger rows (see
         # cron/delivery_correction.py); the cron live lane threads the id via send metadata.
         self._pending_group_exec_ids: dict[str, list[str]] = {}
+        # fork 2026-10-26 (batch 4A): debounced disk save for the parked queue (the handle).
+        self._pending_save_handle = None
         # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
         # their group semantics and scheduled pushes take the DM branch — 2026-10-08 incident).
         self._learned_save_handle = None
         self._load_learned_chats()
+        # fork 2026-10-26 (batch 4A): the parked queue survives restarts — a gateway
+        # restart mid-dead-window used to drop every parked report silently.
+        self._load_pending()
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
 
@@ -408,6 +414,13 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # (or another profile) can connect — a stale lock wedges every later connect.
         self._release_bot_lock()
         self._stop_relay_server()
+        # fork 2026-10-26 (batch 4A): a debounced write dropped at exit loses parked
+        # content for good — flush it now, awaited (this is the last chance to save).
+        if self._pending_persist_enabled() and (
+                getattr(self, "_pending_group_sends", None) or getattr(self, "_pending_group_exec_ids", None)):
+            self._cancel_pending_save()
+            with contextlib.suppress(Exception):
+                await self._write_pending(self._pending_payload(), self._pending_queue_path())
         for handle in list(self._group_retry_timers.values()):
             handle.cancel()
         self._group_retry_timers.clear()
@@ -1137,6 +1150,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             exec_ids = self._pending_group_exec_ids.setdefault(chat_id, [])
             if execution_id not in exec_ids:
                 exec_ids.append(execution_id)
+        self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): parked content must survive a restart
         logger.warning("[%s] Group send queued for redelivery on next group message (chat=%s, queued=%d, ttl=%.0fs)", self.name, chat_id, len(entries), ttl)
         return True
 
@@ -1153,6 +1167,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
         now = time.time()
         stashed = pending.pop(chat_id, [])
+        self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): the queue changed
         entries = [(ts, text) for ts, text in stashed if now - ts < ttl]
         if len(entries) != len(stashed):
             logger.info("[%s] Group redelivery: %d expired of %d stashed entries dropped (chat=%s, ttl=%.0fs)", self.name, len(stashed) - len(entries), len(stashed), chat_id, ttl)
@@ -1243,6 +1258,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             entries.remove((ts, content))
         if not entries:
             pending.pop(chat_id, None)
+        self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): the queue changed
 
     def _correct_executions_after_redelivery(self, chat_id: str) -> None:
         """fork 2026-10-26 (batch 3): parked content delivered — correct the settled-failed

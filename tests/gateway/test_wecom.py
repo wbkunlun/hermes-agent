@@ -1125,6 +1125,87 @@ class TestExecutionCorrection:
         assert adapter._pending_group_exec_ids == {}
 
 
+class TestGroupPendingPersistence:
+    """fork 2026-10-26 (batch 4A): the parked-group queue survives a gateway restart
+    (the learned-chats incident shape: an in-memory recovery queue dies with the
+    process, and a restart mid-dead-window drops every parked report)."""
+
+    @pytest.fixture
+    def pending_env(self, tmp_path, monkeypatch):
+        import plugins.platforms.wecom.group_pending as gp
+
+        monkeypatch.setattr(gp, "GROUP_PENDING_PATH", tmp_path / "wecom_group_pending.json")
+        return gp
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        return WeComAdapter(PlatformConfig(enabled=True))
+
+    @pytest.mark.asyncio
+    async def test_stash_arms_a_debounced_save(self, pending_env):
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+
+        await adapter.send("g1", "17:31 report")
+
+        assert adapter._pending_save_handle is not None  # debounced write armed
+        adapter._cancel_pending_save()
+
+    @pytest.mark.asyncio
+    async def test_parked_queue_roundtrips_through_the_file(self, pending_env):
+        adapter = self._adapter()
+        adapter._pending_group_sends = {"g1": [(time.time(), "17:31 report")]}
+        adapter._pending_group_exec_ids = {"g1": ["exec-1"]}
+
+        await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
+
+        restored = self._adapter()
+        assert [t for _, t in restored._pending_group_sends.get("g1", [])] == ["17:31 report"]
+        assert restored._pending_group_exec_ids == {"g1": ["exec-1"]}  # the correction survives too
+
+    @pytest.mark.asyncio
+    async def test_expired_entries_do_not_survive_a_restart(self, pending_env):
+        adapter = self._adapter()
+        old = time.time() - 21700.0  # past the 6h TTL
+        adapter._pending_group_sends = {"g1": [(old, "stale"), (time.time(), "fresh")]}
+
+        await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
+
+        restored = self._adapter()
+        assert [t for _, t in restored._pending_group_sends.get("g1", [])] == ["fresh"]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_flushes_the_pending_save(self, pending_env, monkeypatch):
+        """The debounce dies with the process — disconnect awaits one final write."""
+        adapter = self._adapter()
+        adapter._pending_group_sends = {"g1": [(time.time(), "17:31 report")]}
+        writes = []
+
+        async def _capture(payload, path):
+            writes.append(payload)
+
+        monkeypatch.setattr(adapter, "_write_pending", _capture)
+
+        await adapter.disconnect()
+
+        assert writes and writes[0]["chats"]["g1"]
+
+    @pytest.mark.asyncio
+    async def test_persistence_can_be_disabled(self, pending_env, monkeypatch):
+        monkeypatch.setenv("HERMES_WECOM_GROUP_PENDING_PERSIST", "0")
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(return_value={"errcode": 846609})
+
+        await adapter.send("g1", "17:31 report")
+
+        assert adapter._pending_group_sends.get("g1")  # still parked in memory
+        assert adapter._pending_save_handle is None     # but nothing armed for disk
+        adapter._cancel_pending_save()
+
+
 class TestKickDetection:
     """fork 2026-10-09: official docs allow ONE live subscription per bot; a newer
     subscribe displaces this one with a NESTED body.event.eventtype disconnected_event —
