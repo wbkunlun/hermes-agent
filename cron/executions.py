@@ -402,6 +402,26 @@ def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     return cur.rowcount == 1
 
 
+def correct_failed_delivery_outcome(execution_id: str) -> Optional[str]:
+    """fork 2026-10-26 (batch 3): the SECOND fenced post-terminal rewrite — a parked
+    WeCom group send that the drain had already settled ``failed`` was delivered by the
+    timed redelivery. Flips ONLY a completed attempt whose delivery_outcome is exactly
+    ``failed`` (a failed RUN and an ``unknown`` row are never touched); returns the
+    row's job_id when the correction applied, else None."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome='delivered'
+               WHERE id=? AND delivery_outcome='failed' AND status='completed'""",
+            (execution_id,),
+        )
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT job_id FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    return str(row["job_id"]) if row and row["job_id"] else None
+
+
 _OWNER_GONE_REASON = (
     "Scheduler restarted after this execution's owner exited before a durable "
     "terminal state; whether side effects ran is unknown."

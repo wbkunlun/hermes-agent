@@ -11,6 +11,10 @@ Both sides call :func:`settle_queued_delivery`: the drain right after it termina
 row, and the run right after its own bookkeeping (a drain can finish before the run's
 ``mark_job_run`` lands). Every write is fenced on the execution id, so the call is
 idempotent and never rewrites a later run's status.
+
+fork 2026-10-26 (batch 3): a record corrected after a late parked redelivery
+(``cron/delivery_correction.py``) is honored — a late settle of the same execution
+never re-fails a job whose parked redelivery delivered.
 """
 from __future__ import annotations
 
@@ -40,6 +44,13 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
         completions = job.get("canonical_completions") or []
         if not completions or completions[-1] != execution_id:
             return False
+        # fork 2026-10-26 (batch 3): a corrected record (the parked redelivery delivered
+        # after this execution settled failed) must never be stomped back to failed by a
+        # late settle of the same execution — the redelivery superseded the failure.
+        if (delivery_error
+                and job.get("last_status") == "ok"
+                and not job.get("last_delivery_error")):
+            return True
         status = job.get("last_status")
         if status == "delivery_queued":
             status = "delivery_failed" if delivery_error else "ok"
