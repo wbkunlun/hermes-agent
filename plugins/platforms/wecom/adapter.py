@@ -191,6 +191,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
     # parked-group timed retries scheduled against the pre-kick kicked-floor no longer
     # need to wait it out; _note_ws_established pulls them forward to this delay.
     RESUBSCRIBE_FLUSH_DELAY = 5.0
+    # fork 2026-10-26 (batch 4B): budgeted fast reconnect — see _reconnect_delay /
+    # _refill_fast_reconnect_budget. The kicked floor overrides this tier entirely.
+    FAST_RECONNECT_BUDGET = 4
+    FAST_RECONNECT_DELAY = 1.0
+    FAST_RECONNECT_HOLD_SECONDS = 90.0
     serial_receive_loop = True  # _read_events awaits each frame before reading the next
 
     def __init__(self, config: PlatformConfig):
@@ -253,6 +258,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # reclaims the session in ~20s. Env still overrides for deployments that want
         # the old damping.
         self._kicked_backoff_seconds = max(5.0, env_float("HERMES_WECOM_KICKED_BACKOFF_SECONDS", 20.0))
+        # fork 2026-10-26 (batch 4B): budgeted fast reconnect — the dead window's bulk
+        # was the unconditional listen-loop backoff [2,5,10,30,60]. A connection that
+        # held ≥90s earns FAST_RECONNECT_BUDGET quick retries; a flapping link climbs
+        # the ladder instead.
+        self._fast_reconnect_remaining = self.FAST_RECONNECT_BUDGET
         # fork 2026-10-26: did THIS instance take the machine-scoped bot lock? (the
         # process-level set says who may take it; this says who must give it back)
         self._wecom_lock_acquired = False
@@ -573,6 +583,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     return
                 logger.warning("[%s] WebSocket error: %s", self.name, exc)
                 self._fail_all(RuntimeError("WeCom connection interrupted"))
+                # fork 2026-10-26 (batch 4B): a connection that held ≥90s earns a fresh
+                # fast-tier budget (the stamp still describes the connection that died).
+                self._refill_fast_reconnect_budget()
                 await asyncio.sleep(self._reconnect_delay(backoff_idx))  # fork 2026-10-09: displacement floors the delay
                 backoff_idx += 1
                 try:
@@ -588,11 +601,27 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         (disconnected_event) floors the delay — an ephemeral competing connection finishes
         and goes away before we re-subscribe, and each subscribe kicks the other side
         (official exclusivity rule), so an eager retry would start a mutual-kick war and
-        hammer the aibot_subscribe rate protection."""
-        delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+        hammer the aibot_subscribe rate protection. fork 2026-10-26 (batch 4B): before the
+        ladder, a budgeted fast tier (~1s + jitter) covers reconnects after a genuinely
+        healthy connection — the kicked floor still wins over everything (and consumes no
+        budget); once the budget burns, the ladder takes over."""
         if self._kicked_at_monotonic is not None:
-            return max(delay, self._kicked_backoff_seconds)
-        return delay
+            return self._kicked_backoff_seconds
+        if self._fast_reconnect_remaining > 0:
+            import random as _random
+
+            self._fast_reconnect_remaining -= 1
+            return self.FAST_RECONNECT_DELAY * (1.0 + _random.random() / 10.0)
+        return RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+
+    def _refill_fast_reconnect_budget(self) -> None:
+        """fork 2026-10-26 (batch 4B): refill the fast tier only after a connection proved
+        healthy (held ≥ FAST_RECONNECT_HOLD_SECONDS) — called from the listen loop BEFORE
+        the sleep, when ``_connected_at_monotonic`` still stamps the connection that just
+        died."""
+        connected_at = self._connected_at_monotonic
+        if connected_at is not None and time.monotonic() - connected_at >= self.FAST_RECONNECT_HOLD_SECONDS:
+            self._fast_reconnect_remaining = self.FAST_RECONNECT_BUDGET
 
     def _note_ws_established(self) -> None:
         """fork 2026-10-09: SUBSCRIBE acked — stamp the connection start (uptime forensics),

@@ -1265,6 +1265,7 @@ class TestKickDetection:
         from plugins.platforms.wecom.adapter import RECONNECT_BACKOFF
 
         adapter = self._adapter(backoff=90.0)
+        adapter._fast_reconnect_remaining = 0  # fork 2026-10-26 (batch 4B): test the ladder tier
         assert adapter._reconnect_delay(0) == RECONNECT_BACKOFF[0]  # no floor when not kicked
         adapter._kicked_at_monotonic = time.monotonic()
         assert adapter._reconnect_delay(0) == 90.0
@@ -1293,6 +1294,7 @@ class TestKickDetection:
         adapter._note_ws_established()
         assert adapter._kicked_at_monotonic is None
         assert adapter._connected_at_monotonic is not None
+        adapter._fast_reconnect_remaining = 0  # fork 2026-10-26 (batch 4B): test the ladder tier
         assert adapter._reconnect_delay(0) == 2  # floor lifted
 
     def test_resubscribe_window_extends_when_kicked(self):
@@ -1313,6 +1315,70 @@ class TestKickDetection:
         # After the kick clears (resubscribe ack), base is back to unchanged
         adapter._note_ws_established()
         assert adapter._resubscribe_window(0.02) == 0.02
+
+
+class TestFastReconnect:
+    """fork 2026-10-26 (batch 4B): the dead window's bulk was the unconditional listen-loop
+    backoff [2,5,10,30,60]. After a connection held ≥90s (healthy, not flapping), the
+    first FAST_RECONNECT_BUDGET reconnects go out at ~1s (+jitter); once the budget burns,
+    the ladder takes over. The kicked floor still wins over everything — mutual-kick
+    damping is not negotiable."""
+
+    def _adapter(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        return WeComAdapter(PlatformConfig(enabled=True))
+
+    def test_budget_refills_after_a_healthy_hold(self, monkeypatch):
+        adapter = self._adapter()
+        now = 1000.0
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        adapter._connected_at_monotonic = now - 120.0  # held ≥ 90s → budget refills
+        adapter._fast_reconnect_remaining = 0
+
+        adapter._refill_fast_reconnect_budget()
+
+        assert adapter._fast_reconnect_remaining == adapter.FAST_RECONNECT_BUDGET
+
+    def test_budget_not_refilled_after_a_short_hold(self, monkeypatch):
+        """A flapping link must climb the ladder, not pin at 1s forever."""
+        adapter = self._adapter()
+        now = 1000.0
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        adapter._connected_at_monotonic = now - 30.0
+        adapter._fast_reconnect_remaining = 1
+
+        adapter._refill_fast_reconnect_budget()
+
+        assert adapter._fast_reconnect_remaining == 1
+
+    def test_fast_tier_fires_within_budget(self, monkeypatch):
+        import random as random_module
+
+        adapter = self._adapter()
+        adapter._kicked_at_monotonic = None
+        adapter._fast_reconnect_remaining = 3
+        monkeypatch.setattr(random_module, "random", lambda: 0.0)
+
+        assert adapter._reconnect_delay(0) == adapter.FAST_RECONNECT_DELAY
+        assert adapter._fast_reconnect_remaining == 2  # the fast tier consumes budget
+
+    def test_kicked_floor_beats_the_fast_tier(self):
+        adapter = self._adapter()
+        adapter._kicked_at_monotonic = time.monotonic()
+        adapter._fast_reconnect_remaining = 3
+
+        assert adapter._reconnect_delay(0) == adapter._kicked_backoff_seconds
+        assert adapter._fast_reconnect_remaining == 3  # the floor path consumes nothing
+
+    def test_ladder_takes_over_after_the_budget_burns(self):
+        from plugins.platforms.wecom.adapter import RECONNECT_BACKOFF
+
+        adapter = self._adapter()
+        adapter._kicked_at_monotonic = None
+        adapter._fast_reconnect_remaining = 0
+
+        assert adapter._reconnect_delay(2) == RECONNECT_BACKOFF[2]
 
 
 class TestCloseDetail:
