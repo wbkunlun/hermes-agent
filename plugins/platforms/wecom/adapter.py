@@ -100,6 +100,26 @@ def _parse_group_retry_delays(raw: str) -> tuple[float, ...]:
     return tuple(values) or (30.0, 120.0)
 
 
+# fork 2026-10-26: every failure text that means "the WS subscription/session is gone" —
+# the server errcode (846609) AND the two local raise sites that fire when the socket
+# dies before/while a send is in flight (_require_ws / _fail_all texts). All three now
+# feed the same recovery chains (group timed retry / DM resubscribe wait); previously
+# the local texts left parked group sends without a timer and DM sends without a wait
+# (2026-10 cron-report incident).
+_SUBSCRIPTION_LOST_MARKERS = (
+    str(STREAM_NOT_SUBSCRIBED_ERRCODE),
+    "WeCom websocket is not connected",
+    "WeCom connection interrupted",
+)
+
+
+def _is_subscription_lost_error(error: object) -> bool:
+    """fork 2026-10-26: True when an error text means the WS subscription is gone —
+    the server errcode or a local gate that fired because the socket died."""
+    text = str(error or "")
+    return any(marker in text for marker in _SUBSCRIPTION_LOST_MARKERS)
+
+
 def check_wecom_requirements() -> bool:
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
 
@@ -1074,7 +1094,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             if getattr(result, "success", False):
                 self._unstash_group_pending(chat_id, ts, content)
                 delivered += 1
-            elif str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(getattr(result, "error", "") or ""):
+            elif _is_subscription_lost_error(getattr(result, "error", "")):
                 dead_session = True
         remaining = [e for e in (pending.get(chat_id) or []) if now - e[0] < ttl]
         if not remaining:
@@ -1212,9 +1232,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                             return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)
                         stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
                         combined = f"Group send failed (passive: {passive_err}; proactive: {proactive_error})" + (" (queued for redelivery on next group message)" if stashed else "")
-                        if stashed and str(STREAM_NOT_SUBSCRIBED_ERRCODE) in combined:
+                        if stashed and _is_subscription_lost_error(combined):
                             self._schedule_group_retry(chat_id)
-                        return self._send_failure(combined, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in combined)
+                        return self._send_failure(combined, _is_subscription_lost_error(combined))
                     # req_id may be stale after a reconnect — proactive send needs none.
                     logger.warning("[%s] Passive reply failed (%s), falling back to proactive send", self.name, passive_err)
                     response = await self._send_proactive_markdown(chat_id, content)
@@ -1228,10 +1248,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 logger.warning("[%s] Group proactive send failed (chat=%s): %s", self.name, chat_id, proactive_error)
                 stashed = not is_control and not is_redelivery and self._stash_group_pending(chat_id, content)
                 message = f"Group proactive send failed: {proactive_error}" + (" (queued for redelivery on next group message)" if stashed else "")
-                if stashed and str(STREAM_NOT_SUBSCRIBED_ERRCODE) in proactive_error:
+                if stashed and _is_subscription_lost_error(proactive_error):
                     self._schedule_group_retry(chat_id)
                 # 846609 schedules the stale-req_id purge even when stashed — the cache holds dead req_ids.
-                return self._send_failure(message, str(STREAM_NOT_SUBSCRIBED_ERRCODE) in proactive_error)
+                return self._send_failure(message, _is_subscription_lost_error(proactive_error))
             else:
                 try:
                     response = await self._send_proactive_markdown(chat_id, content)
@@ -1242,7 +1262,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     # 08:56, DM target, both live and standalone lanes failed). Redeliveries
                     # skip this (loop guard); a multi-segment partial may duplicate an already
                     # delivered head segment — accepted, same tradeoff as the group timed retry.
-                    if str(STREAM_NOT_SUBSCRIBED_ERRCODE) not in str(exc) or is_redelivery:
+                    if not _is_subscription_lost_error(exc) or is_redelivery:
                         raise
                     if not await self._await_resubscribe(timeout=self._dm_resubscribe_timeout):
                         raise
@@ -1251,7 +1271,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
             logger.error("[%s] Send failed: %s", self.name, exc)
-            return self._send_failure(str(exc), str(STREAM_NOT_SUBSCRIBED_ERRCODE) in str(exc))
+            return self._send_failure(str(exc), _is_subscription_lost_error(exc))
         if error := self._response_error(response):
             return self._send_failure(error, response.get("errcode", 0) == STREAM_NOT_SUBSCRIBED_ERRCODE)
         return SendResult(success=True, message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12], raw_response=response)

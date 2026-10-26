@@ -735,6 +735,52 @@ class TestGroupDeadWindowRetry:
         assert "g1" not in adapter._group_retry_attempts
         await self._drain(adapter)
 
+    def test_subscription_lost_marker_classification(self):
+        from plugins.platforms.wecom.adapter import _is_subscription_lost_error
+
+        assert _is_subscription_lost_error("send proactive markdown segment failed: WeCom errcode 846609: gone")
+        assert _is_subscription_lost_error(RuntimeError("WeCom websocket is not connected"))
+        assert _is_subscription_lost_error("WeCom connection interrupted")
+        assert not _is_subscription_lost_error("Group proactive send failed: errcode 40058: invalid chatid")
+        assert not _is_subscription_lost_error(None)
+        assert not _is_subscription_lost_error("Timeout sending message to WeCom")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate_text", ["WeCom websocket is not connected", "WeCom connection interrupted"])
+    async def test_local_gate_failures_schedule_timed_retry(self, gate_text):
+        """fork 2026-10-26: when the socket closes BEFORE the send (server CLOSE beat us
+        to the zombie), the proactive send raises the local gate text, not 846609 — the
+        parked entry used to sit WITHOUT a timed retry until the group's next inbound.
+        Every subscription-lost text now schedules the retry chain."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        adapter._send_request = AsyncMock(side_effect=RuntimeError(gate_text))
+
+        result = await adapter.send("g1", "17:31 report")
+
+        assert result.success is False
+        assert adapter._pending_group_sends.get("g1")  # parked
+        assert "g1" in adapter._group_retry_timers  # scheduled — this was the hole
+        await self._drain(adapter)
+
+    @pytest.mark.asyncio
+    async def test_dm_local_gate_failure_waits_for_resubscribe(self):
+        """fork 2026-10-26: a DM proactive send hitting the local gate (socket closed
+        first) used to raise straight through — the _await_resubscribe retry only
+        triggered on 846609. Subscription-lost texts now all get the bounded wait."""
+        adapter = self._adapter()
+        adapter._send_request = AsyncMock(side_effect=[
+            RuntimeError("WeCom websocket is not connected"),
+            {"errcode": 0},
+        ])
+        adapter._await_resubscribe = AsyncMock(return_value=True)
+
+        result = await adapter.send("dm-1", "hello")
+
+        assert result.success is True
+        assert adapter._await_resubscribe.await_count == 1
+        await self._drain(adapter)
+
     @pytest.mark.asyncio
     async def test_retry_failure_reschedules_once_then_stops(self):
         adapter = self._adapter(delays=(0.01, 0.02))
