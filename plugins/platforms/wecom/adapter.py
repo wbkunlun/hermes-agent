@@ -263,9 +263,22 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # held ≥90s earns FAST_RECONNECT_BUDGET quick retries; a flapping link climbs
         # the ladder instead.
         self._fast_reconnect_remaining = self.FAST_RECONNECT_BUDGET
+        # fork 2026-10-26 (release fix): the fast tier is granted ONCE per healthy
+        # connection — without this flag every failed listen-loop iteration re-granted
+        # it and a sustained outage hot-looped at the 1s tier forever.
+        self._fast_reconnect_granted = False
         # fork 2026-10-26: did THIS instance take the machine-scoped bot lock? (the
         # process-level set says who may take it; this says who must give it back)
         self._wecom_lock_acquired = False
+        # fork 2026-10-26 (release fix): the in-flight parked-queue write task — a
+        # debounced write that nobody holds can be garbage-collected mid-flight, and
+        # the disconnect flush must not race it.
+        self._pending_write_task = None
+        # fork 2026-10-26 (release fix): bounded retries for a ledger correction the
+        # drain had not settled yet (the row is still 'queued' while a multi-chunk
+        # report is still being paced out).
+        self._pending_correction_timers: dict[str, asyncio.TimerHandle] = {}
+        self._pending_correction_attempts: dict[str, int] = {}
         # fork 2026-10-26: the local send relay (out-of-process senders reach THIS
         # gateway's single live subscription instead of opening a competing one)
         self._relay_server = None
@@ -296,10 +309,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # The learned classification persists to wecom_learned_chats.json (fork 2026-10-08, see
         # learned_chats.py); the pending queue stays in-memory by design (TTL/时效语义).
         self._pending_group_sends: dict[str, list[tuple[float, str]]] = {}
-        # fork 2026-10-26 (batch 3): chat -> [cron execution ids] parked in the dead window —
-        # a redelivery success corrects their settled-failed ledger rows (see
+        # fork 2026-10-26 (batch 3): chat -> [(cron execution id, parked_at)] parked in the
+        # dead window — a redelivery success corrects their failed ledger rows (see
         # cron/delivery_correction.py); the cron live lane threads the id via send metadata.
-        self._pending_group_exec_ids: dict[str, list[str]] = {}
+        self._pending_group_exec_ids: dict[str, list[tuple[str, float]]] = {}
         # fork 2026-10-26 (batch 4A): debounced disk save for the parked queue (the handle).
         self._pending_save_handle = None
         # fork 2026-10-08: learned classification survives restarts (quiet groups otherwise lose
@@ -332,17 +345,26 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # deliberately accepts the displacement.
         if not self._wecom_lock_escape_allowed():
             lock_key = (_WECOM_LOCK_SCOPE, self._bot_id)
-            if lock_key not in _WECOM_LOCKS_HELD:
+            if getattr(self, "_wecom_lock_acquired", False):
+                pass  # our own lock — a same-instance reconnect keeps it
+            elif lock_key in _WECOM_LOCKS_HELD:
+                # fork 2026-10-26 (release fix): ANOTHER adapter in THIS process holds
+                # the bot lock (the live gateway's). Connecting anyway displaces the
+                # live subscription in-process — the very incident the lock exists to
+                # stop. Fail closed like the out-of-process case; the relay (or the
+                # live adapter) is the sanctioned route.
+                logger.warning(
+                    "[%s] Refusing a second connection for bot %s — this process already "
+                    "holds the bot-identity lock (same-PID locks are self-reacquired, so "
+                    "the live subscription would be displaced)", self.name, self._bot_id)
+                return False
+            else:
                 if not self._acquire_platform_lock(
                     _WECOM_LOCK_SCOPE, self._bot_id, f"WeCom bot identity {self._bot_id}"
                 ):
                     return False
                 _WECOM_LOCKS_HELD.add(lock_key)
                 self._wecom_lock_acquired = True
-            # else: this PROCESS already holds the bot lock (an in-process ephemeral
-            # sender next to the live adapter) — same-PID locks are self-reacquired by
-            # the status module, and releasing on disconnect would hand the GATEWAY's
-            # lock back, so the ephemeral adapter must not take it at all.
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly.
             # See #18451.
@@ -396,7 +418,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
 
     def _stop_relay_server(self) -> None:
         """fork 2026-10-26: take the relay down with the adapter (the port must be free
-        for the next connect)."""
+        for the next connect). fork 2026-10-26 (release fix): also unpublish the
+        rendezvous file — a stale file routes later senders to a dead endpoint whose
+        error body they would take as the final answer."""
         server = getattr(self, "_relay_server", None)
         if server is None:
             return
@@ -406,6 +430,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             server.server_close()
         except Exception as exc:
             logger.debug("[%s] relay server shutdown failed: %s", self.name, exc)
+        rendezvous = getattr(server, "relay_rendezvous_path", None)
+        if rendezvous is not None:
+            with contextlib.suppress(OSError):
+                rendezvous.unlink()
 
     def _release_bot_lock(self) -> None:
         """fork 2026-10-26: hand the bot lock back (connect failure / shutdown). The
@@ -426,11 +454,28 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._stop_relay_server()
         # fork 2026-10-26 (batch 4A): a debounced write dropped at exit loses parked
         # content for good — flush it now, awaited (this is the last chance to save).
+        # fork 2026-10-26 (release fix): three holes closed — (1) an already-fired
+        # debounced write races this flush (last rename wins: the stale snapshot could
+        # resurrect delivered entries), so hold its task and let it finish first;
+        # (2) a queue drained inside the debounce window left the PRE-drain snapshot on
+        # disk because the flush was skipped when the maps were empty — an armed
+        # (or in-flight) save must also force the rewrite; (3) correction retries die
+        # with the loop anyway, so cancel their timers.
         if self._pending_persist_enabled() and (
-                getattr(self, "_pending_group_sends", None) or getattr(self, "_pending_group_exec_ids", None)):
+                getattr(self, "_pending_group_sends", None)
+                or getattr(self, "_pending_group_exec_ids", None)
+                or getattr(self, "_pending_save_handle", None) is not None
+                or getattr(self, "_pending_write_task", None) is not None):
             self._cancel_pending_save()
+            inflight = getattr(self, "_pending_write_task", None)
+            if inflight is not None:
+                with contextlib.suppress(Exception):
+                    await inflight
             with contextlib.suppress(Exception):
                 await self._write_pending(self._pending_payload(), self._pending_queue_path())
+        for handle in list(getattr(self, "_pending_correction_timers", {}).values()):
+            handle.cancel()
+        self._pending_correction_timers.clear()
         for handle in list(self._group_retry_timers.values()):
             handle.cancel()
         self._group_retry_timers.clear()
@@ -618,9 +663,15 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         """fork 2026-10-26 (batch 4B): refill the fast tier only after a connection proved
         healthy (held ≥ FAST_RECONNECT_HOLD_SECONDS) — called from the listen loop BEFORE
         the sleep, when ``_connected_at_monotonic`` still stamps the connection that just
-        died."""
+        died. fork 2026-10-26 (release fix): the grant is ONCE per healthy connection —
+        the stamp is never cleared, so without the flag every failure iteration of a
+        sustained outage re-granted the budget and the reconnect delay was pinned at
+        ~1s forever (ladder unreachable, subscribe rate hammered)."""
+        if self._fast_reconnect_granted:
+            return
         connected_at = self._connected_at_monotonic
         if connected_at is not None and time.monotonic() - connected_at >= self.FAST_RECONNECT_HOLD_SECONDS:
+            self._fast_reconnect_granted = True
             self._fast_reconnect_remaining = self.FAST_RECONNECT_BUDGET
 
     def _note_ws_established(self) -> None:
@@ -634,6 +685,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._resubscribe_pending = False
         self._subscribed_gen += 1
         self._subscribed_event.set()
+        # fork 2026-10-26 (release fix): a NEW connection can earn a fresh fast-tier
+        # grant when it dies — the flag is one-grant-per-connection.
+        self._fast_reconnect_granted = False
         # fork 2026-10-26: session live again — pull parked-group retry timers forward
         # (never backward) so parked sends go out seconds after the resubscribe instead
         # of riding the schedule they got while kicked/disconnected.
@@ -647,6 +701,17 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                     lambda cid=chat_id: self._group_retry_fire(cid),
                 )
             logger.info("[%s] Subscription re-established — pulled %d parked-group retry timer(s) forward (≤%.0fs)", self.name, len(self._group_retry_timers), self.RESUBSCRIBE_FLUSH_DELAY)
+        # fork 2026-10-26 (release fix): a queue restored from disk has NO retry timer —
+        # without arming one here the restored report was delivered only if the group
+        # happened to post an inbound message before the TTL (the quiet-group case the
+        # persistence exists for). Arm timers for parked chats that have none
+        # (_schedule_group_retry is idempotent per chat and respects the attempt cap).
+        for chat_id in list(getattr(self, "_pending_group_sends", None) or {}):
+            if chat_id not in self._group_retry_timers:
+                try:
+                    self._schedule_group_retry(chat_id)
+                except RuntimeError:
+                    break  # no running loop (a synchronous caller) — the next connect arms it
 
     def _resubscribe_window(self, base: float) -> float:
         """fork 2026-10-09 hotfix: extend a resubscribe-aware wait when the listen loop
@@ -1176,9 +1241,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         entries.append((now, content))
         pending[chat_id] = entries
         if execution_id and getattr(self, "_pending_group_exec_ids", None) is not None:
+            # fork 2026-10-26 (release fix): each id rides its park timestamp so a
+            # correction can never fire for content whose entries expired past the TTL
+            # long ago (that would stamp a never-delivered report as 'delivered').
             exec_ids = self._pending_group_exec_ids.setdefault(chat_id, [])
-            if execution_id not in exec_ids:
-                exec_ids.append(execution_id)
+            if not any(eid == execution_id for eid, _ts in exec_ids):
+                exec_ids.append((execution_id, now))
         self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): parked content must survive a restart
         logger.warning("[%s] Group send queued for redelivery on next group message (chat=%s, queued=%d, ttl=%.0fs)", self.name, chat_id, len(entries), ttl)
         return True
@@ -1289,6 +1357,13 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             pending.pop(chat_id, None)
         self._schedule_pending_save()  # fork 2026-10-26 (batch 4A): the queue changed
 
+    # fork 2026-10-26 (release fix): the drain settles a delivery row only after its
+    # WHOLE paced send returns, so a parked redelivery can land while the row is still
+    # 'queued' — correct then, the fence refuses, and the correction was lost forever.
+    # Retry a bounded number of times instead; ids past the pending TTL are dropped
+    # (their content is long gone — correcting them would be a false 'delivered').
+    _CORRECTION_RETRY_DELAYS = (30.0, 60.0, 120.0)
+
     def _correct_executions_after_redelivery(self, chat_id: str) -> None:
         """fork 2026-10-26 (batch 3): parked content delivered — correct the settled-failed
         cron ledger rows the parked sends came from (cron/delivery_correction.py; the
@@ -1300,15 +1375,62 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             return
         execution_ids = ids.pop(chat_id, None)
         if not execution_ids:
+            self._cancel_correction_retry(chat_id)
             return
+        ttl = getattr(self, "_group_pending_ttl_seconds", 21600.0)
+        now = time.time()
         try:
             from cron.delivery_correction import correct_failed_delivery
-
-            for execution_id in execution_ids:
-                if correct_failed_delivery(execution_id):
-                    logger.info("[%s] Cron delivery %s corrected to delivered after parked redelivery (chat=%s)", self.name, execution_id, chat_id)
         except Exception as exc:
+            # An embedding that ships the adapter without cron: corrections are
+            # unavailable, not pending — drop the ids, never arm a retry for them.
             logger.debug("[%s] Delivery correction unavailable (%s)", self.name, exc)
+            return
+        uncorrected: list[tuple[str, float]] = []
+        for execution_id, parked_at in execution_ids:
+            if ttl > 0 and now - parked_at >= ttl:
+                logger.info("[%s] Cron delivery %s correction dropped — parked past the %.0fs TTL (chat=%s)", self.name, execution_id, ttl, chat_id)
+                continue
+            if correct_failed_delivery(execution_id):
+                logger.info("[%s] Cron delivery %s corrected to delivered after parked redelivery (chat=%s)", self.name, execution_id, chat_id)
+            else:
+                uncorrected.append((execution_id, parked_at))
+        self._rearm_correction_retry(chat_id, uncorrected)
+
+    def _rearm_correction_retry(self, chat_id: str, uncorrected: list[tuple[str, float]]) -> None:
+        """fork 2026-10-26 (release fix): keep the ids the ledger has not settled yet and
+        retry a bounded number of times; drop the chat when the budget is exhausted."""
+        ids = getattr(self, "_pending_group_exec_ids", None)
+        if ids is None:
+            return
+        self._cancel_correction_retry(chat_id)
+        if not uncorrected:
+            self._pending_correction_attempts.pop(chat_id, None)  # fresh episode next time
+            return
+        attempts = self._pending_correction_attempts.get(chat_id, 0)
+        if attempts >= len(self._CORRECTION_RETRY_DELAYS):
+            logger.info("[%s] Cron delivery correction gave up after %d retries (chat=%s)", self.name, attempts, chat_id)
+            self._pending_correction_attempts.pop(chat_id, None)
+            return
+        delay = self._CORRECTION_RETRY_DELAYS[attempts]
+        self._pending_correction_attempts[chat_id] = attempts + 1
+        merged = ids.setdefault(chat_id, [])
+        for pair in uncorrected:
+            if not any(eid == pair[0] for eid, _ts in merged):
+                merged.append(pair)
+        loop = asyncio.get_running_loop()
+        self._pending_correction_timers[chat_id] = loop.call_later(
+            delay, lambda cid=chat_id: self._correction_retry_fire(cid))
+
+    def _correction_retry_fire(self, chat_id: str) -> None:
+        self._pending_correction_timers.pop(chat_id, None)
+        with contextlib.suppress(Exception):
+            self._correct_executions_after_redelivery(chat_id)
+
+    def _cancel_correction_retry(self, chat_id: str) -> None:
+        handle = self._pending_correction_timers.pop(chat_id, None)
+        if handle is not None:
+            handle.cancel()
 
     async def _force_reconnect_on_stale_subscription(self, errcode: int) -> None:
         """On 846609 (subscription lost) drop req_ids bound to the dead session AND recycle

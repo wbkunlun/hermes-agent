@@ -21,6 +21,7 @@ import os
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable, Optional
 
 from plugins.platforms.wecom.relay_client import rendezvous_path
@@ -44,15 +45,18 @@ def _consume_detached_result(future) -> None:
 
 def _make_handler(*, dispatch: Callable, loop, secret: str, log: logging.Logger) -> type:
     class RelayHandler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):  # noqa: A003 — stdlib signature
+        def log_message(self, fmt, *args):  # stdlib signature
             log.debug("wecom-relay: " + fmt, *args)
 
-        def do_POST(self):  # noqa: N802 — stdlib naming
+        def do_POST(self):  # stdlib naming
             if self.path != "/notify":
                 self._reply(404, {"error": "not found"})
                 return
-            provided = self.headers.get("X-Relay-Secret") or ""
-            if not hmac.compare_digest(provided, secret):
+            provided = (self.headers.get("X-Relay-Secret") or "").encode("utf-8", "replace")
+            # fork 2026-10-26 (release fix): compare BYTES — str compare_digest raises
+            # TypeError on non-ASCII input (HTTP headers are latin-1 decodable), which
+            # crashed the handler into a traceback instead of answering 401.
+            if not hmac.compare_digest(provided, secret.encode("utf-8")):
                 self._reply(401, {"error": "invalid secret"})
                 return
             try:
@@ -72,7 +76,7 @@ def _make_handler(*, dispatch: Callable, loop, secret: str, log: logging.Logger)
             result = self._deliver(chat_id, message)
             self._reply(200 if result.get("success") else 502, result)
 
-        def do_GET(self):  # noqa: N802 — stdlib naming
+        def do_GET(self):  # stdlib naming
             self._reply(405, {"error": "POST /notify only"})
 
         def _deliver(self, chat_id: str, message: str) -> dict:
@@ -105,16 +109,23 @@ def _make_handler(*, dispatch: Callable, loop, secret: str, log: logging.Logger)
     return RelayHandler
 
 
-def publish_rendezvous(port: int, secret: str, log: logging.Logger) -> None:
-    """Publish ``{port, secret, pid}`` so same-user clients can find the relay."""
+def publish_rendezvous(port: int, secret: str, log: logging.Logger) -> Optional[Path]:
+    """Publish ``{port, secret, pid}`` so same-user clients can find the relay.
+
+    fork 2026-10-26 (release fix): the file holds the live bearer secret, so it is
+    written 0600 (the surrounding lock dir stays the shared per-user one)."""
     path = rendezvous_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"port": port, "secret": secret, "pid": os.getpid()}), encoding="utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"port": port, "secret": secret, "pid": os.getpid()}))
+        os.chmod(path, 0o600)  # a pre-existing file keeps whatever mode it had
+        return path
     except OSError as exc:
         log.warning("wecom-relay: could not publish the rendezvous file %s (%s) — "
                     "out-of-process senders cannot find the relay", path, exc)
+        return None
 
 
 def start_server(*, dispatch: Callable, loop, port: Optional[int] = None,
@@ -129,7 +140,15 @@ def start_server(*, dispatch: Callable, loop, port: Optional[int] = None,
     """
     log = logger_ or logger
     secret = secret or secrets.token_urlsafe(32)
-    port = int(port if port is not None else (os.getenv("WECOM_RELAY_PORT") or DEFAULT_PORT))
+    try:
+        port = int(port if port is not None else (os.getenv("WECOM_RELAY_PORT") or DEFAULT_PORT))
+    except (TypeError, ValueError):
+        # fork 2026-10-26 (release fix): a typo'd port is an optional-relay problem,
+        # not a WeCom startup failure — it used to raise out of connect() and take the
+        # whole platform down.
+        log.warning("wecom-relay: WECOM_RELAY_PORT=%r is not a port number — using %s",
+                    os.getenv("WECOM_RELAY_PORT"), DEFAULT_PORT)
+        port = DEFAULT_PORT
     try:
         server = ThreadingHTTPServer(
             ("127.0.0.1", port),
@@ -143,7 +162,10 @@ def start_server(*, dispatch: Callable, loop, port: Optional[int] = None,
     server.daemon_threads = True
     server.relay_secret = secret  # type: ignore[attr-defined]
     if publish:
-        publish_rendezvous(server.server_address[1], secret, log)
+        published = publish_rendezvous(server.server_address[1], secret, log)
+        # fork 2026-10-26 (release fix): remember the file so _stop_relay_server can
+        # unpublish it — a stale rendezvous routes later senders to a dead endpoint.
+        server.relay_rendezvous_path = published  # type: ignore[attr-defined]
     threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": _POLL_INTERVAL_SECONDS},
         name="wecom-relay", daemon=True,

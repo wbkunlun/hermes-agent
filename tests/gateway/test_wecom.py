@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import socket
@@ -300,6 +301,40 @@ class TestWeComConnect:
         assert success is False
         assert adapter.fatal_error_code == "wecom_connect_error"  # not a lock error
         assert adapter._open_connection.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_second_adapter_in_the_same_process_is_refused(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the in-process holder of the bot lock is the
+        live gateway's adapter — a second adapter for the same bot would displace it
+        in-process (the incident the lock exists to stop). Same-PID locks are
+        self-reacquired, so the second one must fail closed, not slip through."""
+        import plugins.platforms.wecom.adapter as wecom_module
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        self._connect_stubs(monkeypatch)
+        monkeypatch.setattr(
+            "gateway.status.acquire_scoped_lock",
+            lambda scope, identity, metadata=None: (True, None),
+        )
+        live = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+        )
+        live._wecom_lock_acquired = True
+        wecom_module._WECOM_LOCKS_HELD.add((wecom_module._WECOM_LOCK_SCOPE, "bot-1"))
+        try:
+            second = WeComAdapter(
+                PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+            )
+            second._open_connection = AsyncMock(
+                side_effect=AssertionError("must not open a competing WS")
+            )
+
+            success = await second.connect()
+
+            assert success is False
+            assert second._open_connection.await_count == 0
+        finally:
+            wecom_module._WECOM_LOCKS_HELD.discard((wecom_module._WECOM_LOCK_SCOPE, "bot-1"))
 
 
 
@@ -1040,7 +1075,7 @@ class TestExecutionCorrection:
 
         assert result.success is False
         assert adapter._pending_group_sends.get("g1")  # parked
-        assert adapter._pending_group_exec_ids == {"g1": ["exec-1"]}
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-1"]
         await self._drain(adapter)
 
     @pytest.mark.asyncio
@@ -1088,7 +1123,7 @@ class TestExecutionCorrection:
         await adapter._group_retry_flush("g1")
 
         assert corrected == []
-        assert adapter._pending_group_exec_ids == {"g1": ["exec-1"]}
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids["g1"]] == ["exec-1"]
         await self._drain(adapter)
 
     @pytest.mark.asyncio
@@ -1124,6 +1159,53 @@ class TestExecutionCorrection:
 
         assert adapter._pending_group_exec_ids == {}
 
+    @pytest.mark.asyncio
+    async def test_an_unsettled_row_is_retried_not_dropped(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the drain settles a row only after its WHOLE
+        paced send returns, so a redelivery can land while the row is still 'queued' —
+        the correction fence then refuses, and the id used to be dropped with it (the
+        report stayed booked failed forever)."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        attempts = []
+
+        def _not_settled_yet(execution_id):
+            attempts.append(execution_id)
+            return False  # the ledger has not settled the row yet
+
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery", _not_settled_yet)
+        assert adapter._stash_group_pending("g1", "17:31 report", execution_id="exec-1") is True
+
+        adapter._correct_executions_after_redelivery("g1")
+
+        assert attempts == ["exec-1"]
+        # the id is kept for a bounded retry instead of being dropped
+        assert [eid for eid, _ts in adapter._pending_group_exec_ids.get("g1", [])] == ["exec-1"]
+        assert "g1" in adapter._pending_correction_timers
+        for handle in list(adapter._pending_correction_timers.values()):
+            handle.cancel()
+
+    @pytest.mark.asyncio
+    async def test_an_expired_execution_is_never_corrected(self, monkeypatch):
+        """fork 2026-10-26 (release fix): an id parked past the TTL is dropped, not
+        corrected — its content is long gone, so a 'delivered' stamp would be a lie."""
+        adapter = self._adapter()
+        adapter._group_chat_ids.add("g1")
+        corrected = []
+        monkeypatch.setattr(
+            "cron.delivery_correction.correct_failed_delivery",
+            lambda execution_id: corrected.append(execution_id) or True,
+        )
+        old = time.time() - 21700.0
+        adapter._pending_group_sends = {"g1": [(old, "stale report")]}
+        adapter._pending_group_exec_ids = {"g1": [("exec-stale", old)]}
+
+        adapter._correct_executions_after_redelivery("g1")
+
+        assert corrected == []
+        assert adapter._pending_group_exec_ids == {}
+
 
 class TestGroupPendingPersistence:
     """fork 2026-10-26 (batch 4A): the parked-group queue survives a gateway restart
@@ -1156,14 +1238,16 @@ class TestGroupPendingPersistence:
     @pytest.mark.asyncio
     async def test_parked_queue_roundtrips_through_the_file(self, pending_env):
         adapter = self._adapter()
-        adapter._pending_group_sends = {"g1": [(time.time(), "17:31 report")]}
-        adapter._pending_group_exec_ids = {"g1": ["exec-1"]}
+        parked_at = time.time()
+        adapter._pending_group_sends = {"g1": [(parked_at, "17:31 report")]}
+        adapter._pending_group_exec_ids = {"g1": [("exec-1", parked_at)]}
 
         await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
 
         restored = self._adapter()
         assert [t for _, t in restored._pending_group_sends.get("g1", [])] == ["17:31 report"]
-        assert restored._pending_group_exec_ids == {"g1": ["exec-1"]}  # the correction survives too
+        # the correction survives too (the id rides along with its park timestamp)
+        assert [eid for eid, _ts in restored._pending_group_exec_ids.get("g1", [])] == ["exec-1"]
 
     @pytest.mark.asyncio
     async def test_expired_entries_do_not_survive_a_restart(self, pending_env):
@@ -1204,6 +1288,77 @@ class TestGroupPendingPersistence:
         assert adapter._pending_group_sends.get("g1")  # still parked in memory
         assert adapter._pending_save_handle is None     # but nothing armed for disk
         adapter._cancel_pending_save()
+
+    @pytest.mark.asyncio
+    async def test_a_restored_queue_arms_a_retry_timer(self, pending_env):
+        """fork 2026-10-26 (release fix): a queue restored from disk had NO timer — the
+        report was delivered only if the group happened to post an inbound message, so
+        the quiet group (the case the persistence exists for) never got it."""
+        adapter = self._adapter()
+        adapter._pending_group_sends = {"g1": [(time.time(), "17:31 report")]}
+        await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
+
+        restored = self._adapter()
+        assert restored._pending_group_sends.get("g1")
+
+        restored._note_ws_established()  # the subscription is live again
+
+        assert "g1" in restored._group_retry_timers
+        for handle in list(restored._group_retry_timers.values()):
+            handle.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_or_wrong_shaped_file_does_not_take_the_platform_down(self, pending_env):
+        """fork 2026-10-26 (release fix): a valid-JSON file with a wrong-shaped value
+        used to raise out of __init__ — a recoverable state file became an outage."""
+        pending_env.GROUP_PENDING_PATH.write_text(
+            json.dumps({"chats": [1, 2], "exec_ids": "nope"}), encoding="utf-8"
+        )
+
+        adapter = self._adapter()  # must not raise
+
+        assert adapter._pending_group_sends == {}
+        assert adapter._pending_group_exec_ids == {}
+
+    @pytest.mark.asyncio
+    async def test_expired_executions_are_not_restored(self, pending_env):
+        """fork 2026-10-26 (release fix): an id whose content expired past the TTL must
+        not come back — a later redelivery would stamp a never-delivered report as
+        'delivered'."""
+        old = time.time() - 21700.0
+        adapter = self._adapter()
+        adapter._pending_group_sends = {"g1": [(old, "stale")]}
+        adapter._pending_group_exec_ids = {"g1": [("exec-stale", old)]}
+        await adapter._write_pending(adapter._pending_payload(), pending_env.GROUP_PENDING_PATH)
+
+        restored = self._adapter()
+
+        assert restored._pending_group_exec_ids == {}
+
+    @pytest.mark.asyncio
+    async def test_disconnect_awaits_the_inflight_write_and_wins_the_race(self, pending_env, monkeypatch):
+        """fork 2026-10-26 (release fix): an already-fired debounced write raced the
+        awaited disconnect flush (last rename wins — the stale snapshot could resurrect
+        delivered entries), and a queue drained inside the debounce window skipped the
+        flush entirely because both maps were empty."""
+        adapter = self._adapter()
+        adapter._pending_group_sends = {"g1": [(time.time(), "17:31 report")]}
+        writes = []
+
+        async def _slow_capture(payload, path):
+            writes.append(payload)
+            await asyncio.sleep(0)  # yield so the flush lanes interleave
+
+        monkeypatch.setattr(adapter, "_write_pending", _slow_capture)
+        adapter._pending_save_fire()          # the debounced write is now in flight
+        assert adapter._pending_write_task is not None
+        adapter._pending_group_sends.clear()  # drained inside the debounce window
+
+        await adapter.disconnect()
+
+        assert len(writes) == 2
+        assert writes[0]["chats"]["g1"]       # the in-flight snapshot had the entry
+        assert writes[-1]["chats"] == {}      # the final state on disk is the drained one
 
 
 class TestKickDetection:
@@ -1379,6 +1534,40 @@ class TestFastReconnect:
         adapter._fast_reconnect_remaining = 0
 
         assert adapter._reconnect_delay(2) == RECONNECT_BACKOFF[2]
+
+    def test_grant_is_once_per_connection_not_per_failure(self, monkeypatch):
+        """fork 2026-10-26 (release fix): the grant belongs to the CONNECTION that held
+        ≥90s, not to every failure iteration — the uptime stamp is never cleared, so a
+        re-grant pinned the reconnect delay at ~1s for the whole outage and the ladder
+        ([2,5,10,30,60]) was unreachable."""
+        adapter = self._adapter()
+        now = 1000.0
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        adapter._connected_at_monotonic = now - 120.0  # a healthy connection that died
+        adapter._fast_reconnect_remaining = 0
+
+        adapter._refill_fast_reconnect_budget()  # the failure that killed it
+        assert adapter._fast_reconnect_remaining == adapter.FAST_RECONNECT_BUDGET
+        adapter._reconnect_delay(0)  # the fast tier consumes one
+        after_first = adapter._fast_reconnect_remaining
+
+        adapter._refill_fast_reconnect_budget()  # the next failure in the same outage
+        assert adapter._fast_reconnect_remaining == after_first
+
+    @pytest.mark.asyncio
+    async def test_a_new_connection_earns_a_fresh_grant(self, monkeypatch):
+        adapter = self._adapter()
+        now = 1000.0
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        adapter._connected_at_monotonic = now - 120.0
+        adapter._refill_fast_reconnect_budget()
+        adapter._fast_reconnect_remaining = 0
+
+        adapter._note_ws_established()  # a fresh subscription landed
+        adapter._connected_at_monotonic = now - 120.0
+        adapter._refill_fast_reconnect_budget()
+
+        assert adapter._fast_reconnect_remaining == adapter.FAST_RECONNECT_BUDGET
 
 
 class TestCloseDetail:

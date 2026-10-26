@@ -389,8 +389,10 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
 
-    The only post-terminal rewrite the ledger allows: the attempt's status is untouched and
-    only a ``queued`` handoff can settle, so a replay or a late caller is a no-op.
+    One of the two post-terminal rewrites the ledger allows: the attempt's status is
+    untouched and only a ``queued`` handoff can settle, so a replay or a late caller is
+    a no-op. (The other is ``correct_failed_delivery_outcome`` below, which flips a
+    settled ``failed`` delivery to ``delivered`` after a late redelivery landed.)
     """
     with _transaction() as conn:
         cur = conn.execute(

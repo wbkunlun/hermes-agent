@@ -31,7 +31,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CLIENT_TIMEOUT_SECONDS = 30.0
+# fork 2026-10-26 (release fix): strictly greater than the server's dispatch timeout,
+# so a slow-but-real server answer always beats the client's read timeout (equal
+# timeouts raced: the client gave up exactly when the server answered, took it as
+# "no relay", and the caller fell through to the connection the lock then refused).
+CLIENT_TIMEOUT_SECONDS = 35.0
 RENDEZVOUS_FILENAME = "wecom-relay.json"
 
 
@@ -46,14 +50,32 @@ def rendezvous_path() -> Path:
 
 
 def read_rendezvous() -> Optional[dict]:
-    """The gateway's published ``{port, secret, pid}`` — None when absent/unreadable."""
+    """The gateway's published ``{port, secret, pid}`` — None when absent/unreadable/
+    stale. fork 2026-10-26 (release fix): a dead publisher's file is ignored (the
+    adapter unlinks it on clean shutdown, but a crashed gateway leaves it behind, and
+    posting to the dead port would read as "no relay" anyway)."""
     try:
         doc = json.loads(rendezvous_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if isinstance(doc, dict) and doc.get("port") and doc.get("secret"):
-        return doc
-    return None
+    if not (isinstance(doc, dict) and doc.get("port") and doc.get("secret")):
+        return None
+    pid = doc.get("pid")
+    if isinstance(pid, int) and pid > 0 and not _pid_alive(pid):
+        return None
+    return doc
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, owned by someone else
+    except OSError:
+        return True  # unknown platform answer — assume alive, let the POST decide
+    return True
 
 
 def try_relay_send(chat_id: str, message: str, *, port: Optional[int] = None,
@@ -66,7 +88,7 @@ def try_relay_send(chat_id: str, message: str, *, port: Optional[int] = None,
     gateway). Only "no relay" returns None.
     """
     from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
+    from urllib.request import ProxyHandler, Request, build_opener
 
     if port is None or secret is None:
         doc = read_rendezvous()
@@ -80,8 +102,12 @@ def try_relay_send(chat_id: str, message: str, *, port: Optional[int] = None,
         method="POST",
         headers={"Content-Type": "application/json", "X-Relay-Secret": str(secret)},
     )
+    # fork 2026-10-26 (release fix): bypass the system proxy — a corporate/macOS proxy
+    # that does not exempt 127.0.0.1 dialed the loopback POST through it and the relay
+    # was silently unreachable (the caller then opened the connection the lock refuses).
+    opener = build_opener(ProxyHandler({}))
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             payload = json.loads(response.read())
     except HTTPError as exc:
         # The gateway answered with an error status — its body is the answer.

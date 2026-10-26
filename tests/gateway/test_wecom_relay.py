@@ -50,7 +50,8 @@ def relay(gateway_loop, tmp_path, monkeypatch):
     )
     assert server is not None
     try:
-        yield SimpleNamespace(port=server.server_address[1], secret="s3cret", dispatched=dispatched)
+        yield SimpleNamespace(port=server.server_address[1], secret="s3cret",
+                              dispatched=dispatched, server=server)
     finally:
         server.shutdown()
         server.server_close()
@@ -102,6 +103,21 @@ def test_relay_publishes_rendezvous_file(relay, tmp_path):
     assert doc["pid"]
 
 
+def test_relay_binds_loopback_only(relay):
+    """The endpoint SENDS messages — it must never bind a routable interface."""
+    assert relay.server.server_address[0] == "127.0.0.1"
+
+
+@pytest.mark.platforms("posix")
+def test_rendezvous_file_is_owner_only(relay, tmp_path):
+    """fork 2026-10-26 (release fix): the file holds the live bearer secret — any
+    world-readable copy lets another local user drive the bot."""
+    import os as os_module
+
+    mode = os_module.stat(tmp_path / "wecom-relay.json").st_mode & 0o777
+    assert mode == 0o600, f"rendezvous file mode {oct(mode)}, expected 0o600"
+
+
 def test_client_posts_to_the_published_relay(relay):
     result = relay_client.try_relay_send("g1", "report")
     assert result == {"success": True, "platform": "wecom", "chat_id": "g1", "message_id": "mid-1"}
@@ -116,6 +132,72 @@ def test_client_returns_none_without_rendezvous(monkeypatch, tmp_path):
 def test_client_returns_none_when_relay_unreachable():
     # Port 1 is not served — the "no relay" answer, not an error dict.
     assert relay_client.try_relay_send("g1", "report", port=1, secret="x") is None
+
+
+def test_client_ignores_a_dead_publisher(monkeypatch, tmp_path):
+    """fork 2026-10-26 (release fix): a crashed gateway leaves the rendezvous behind —
+    posting at the dead port reads as 'no relay', so ignore the file outright."""
+    import subprocess
+    import sys as sys_module
+
+    child = subprocess.Popen([sys_module.executable, "-c", "pass"])
+    child.wait()  # born dead
+    (tmp_path / "wecom-relay.json").write_text(
+        json.dumps({"port": 7861, "secret": "x", "pid": child.pid}))
+    monkeypatch.setattr(relay_client, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+
+    assert relay_client.try_relay_send("g1", "report") is None
+
+
+def test_a_system_proxy_never_blocks_the_loopback_relay(relay, monkeypatch):
+    """fork 2026-10-26 (release fix): urlopen honours HTTP_PROXY — on a proxied host the
+    loopback POST was dialed through the proxy and the relay went silently missing."""
+    monkeypatch.setenv("HTTP_PROXY", "http://192.0.2.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://192.0.2.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    result = relay_client.try_relay_send("g1", "report")
+
+    assert result is not None and result.get("success") is True
+
+
+def test_relay_answers_502_with_the_dispatch_error(gateway_loop, tmp_path, monkeypatch):
+    """A failed gateway send is a FINAL answer (the client must not fall through to a
+    competing connection) — the 502 path turns the dispatch error into the body."""
+    from urllib.error import HTTPError
+
+    monkeypatch.setattr(relay_server, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+    monkeypatch.setattr(relay_client, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+
+    async def _failing_dispatch(chat_id: str, message: str) -> dict:
+        return {"error": "group policy refused"}
+
+    server = relay_server.start_server(
+        dispatch=_failing_dispatch, loop=gateway_loop, port=0,
+        secret="s3cret", logger_=relay_server.logger,
+    )
+    assert server is not None
+    try:
+        with pytest.raises(HTTPError) as excinfo:
+            _post(server.server_address[1], "s3cret", {"chat_id": "g1", "message": "report"})
+        assert excinfo.value.code == 502
+        assert json.loads(excinfo.value.read()) == {"error": "group policy refused"}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_non_ascii_secret_header_gets_a_401_not_a_crash(relay):
+    """fork 2026-10-26 (release fix): str compare_digest raises TypeError on non-ASCII —
+    the handler crashed into a traceback instead of answering 401."""
+    from urllib.error import HTTPError
+
+    with pytest.raises(HTTPError) as excinfo:
+        _post(relay.port, "s3cr\xffet", {"chat_id": "g1", "message": "hi"})
+    assert excinfo.value.code == 401
+    assert relay.dispatched == []
 
 
 def test_standalone_send_prefers_the_relay_over_an_ephemeral_connection(monkeypatch):
@@ -214,6 +296,53 @@ async def test_relay_server_lifecycle_follows_the_adapter(monkeypatch, tmp_path)
 
     adapter._stop_relay_server()
     assert adapter._relay_server is None
+    assert not (tmp_path / "wecom-relay.json").exists()  # unpublished with the server
+
+
+def test_a_typo_port_falls_back_instead_of_killing_the_platform(monkeypatch, tmp_path):
+    """fork 2026-10-26 (release fix): a non-numeric WECOM_RELAY_PORT raised ValueError
+    out of connect() — the whole WeCom platform died over an optional relay knob."""
+    from plugins.platforms.wecom.adapter import WeComAdapter
+
+    monkeypatch.setenv("WECOM_RELAY_PORT", "seven")
+    monkeypatch.setattr(relay_server, "DEFAULT_PORT", 0)  # ephemeral port — never 7861 in a test
+    monkeypatch.setattr(relay_server, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+    monkeypatch.setattr(relay_client, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+    )
+    adapter._start_relay_server()
+
+    assert adapter._relay_server is not None
+    adapter._stop_relay_server()
+
+
+@pytest.mark.asyncio
+async def test_the_adapter_dispatch_maps_a_failed_send_to_an_error_answer(monkeypatch, tmp_path):
+    """fork 2026-10-26 (release fix): the production dispatch closure was never
+    exercised — a regression that reported success for a failed send would book a
+    delivery that never happened (silent message loss)."""
+    from unittest.mock import AsyncMock
+
+    from plugins.platforms.wecom.adapter import WeComAdapter
+
+    monkeypatch.setenv("WECOM_RELAY_PORT", "0")
+    monkeypatch.setattr(relay_server, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+    monkeypatch.setattr(relay_client, "rendezvous_path", lambda: tmp_path / "wecom-relay.json")
+
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "s3cret"})
+    )
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=False, error="send queue is down"))
+    adapter._start_relay_server()
+    assert adapter._relay_server is not None
+    try:
+        # the client call is synchronous — run it off the loop so the dispatch can run
+        result = await asyncio.to_thread(relay_client.try_relay_send, "g1", "report")
+        assert result == {"error": "send queue is down"}
+    finally:
+        adapter._stop_relay_server()
 
 
 @pytest.mark.asyncio
