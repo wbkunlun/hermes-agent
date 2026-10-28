@@ -110,6 +110,118 @@ def test_parse_inbound_group_targets_wechat_id():
     assert inbound.chat_id == "S:1688858099504500_8444250708322274;R:3284275877"
 
 
+class TestBoundedIdentifiers:
+    """fork 2026-10-28: the durable-admission contract refuses an identifier
+    that is empty, not a str, or longer than 1024 chars
+    (``hermes_state_runtime._text``). The WeWork webhook is unauthenticated and
+    hands its fields over verbatim, so an oversized field used to abort the
+    WHOLE inbound admission: ``RuntimeStoreError('invalid_params')`` -> the
+    message was dropped with no reply, and the webhook had already ACKed, so
+    WeWork never redelivered it.
+
+    Two identifiers reach that contract from this adapter:
+    ``request_id`` (derived from the message id) and ``principal_id`` (derived
+    from the chat id and the sender), so both are bounded here.
+    """
+
+    # The admission contract's own ceiling (hermes_state_runtime._text).
+    _MAX_IDENTIFIER = 1024
+
+    @staticmethod
+    def _payload(**overrides):
+        payload = {
+            "cmd": "hi",
+            "user": "brycehuang",
+            "userFullName": "Bryce Huang",
+            "wechatId": "S:1688857642682584_8444250708322274;S:1688851343262740_1688857642682584",
+            "fromGroup": "",
+            "sendTime": "t1",
+            "storeKey": "s1",
+        }
+        payload.update(overrides)
+        return payload
+
+    @staticmethod
+    def _adapter():
+        from gateway.config import PlatformConfig
+        from plugins.platforms.wework.adapter import WeWorkAdapter
+
+        return WeWorkAdapter(PlatformConfig(enabled=True, extra={"keyid": "k"}))
+
+    def test_an_oversized_store_key_yields_a_bounded_message_id(self):
+        """The message id becomes the admission request id - it must fit."""
+        inbound = self._adapter()._parse_inbound(self._payload(storeKey="x" * 5000))
+
+        assert inbound is not None
+        assert 0 < len(inbound.message_id) <= self._MAX_IDENTIFIER
+
+    def test_an_oversized_send_time_yields_a_bounded_message_id(self):
+        inbound = self._adapter()._parse_inbound(self._payload(sendTime="9" * 5000))
+
+        assert inbound is not None
+        assert 0 < len(inbound.message_id) <= self._MAX_IDENTIFIER
+
+    def test_two_different_oversized_store_keys_stay_distinct(self):
+        """Bounding must not collapse two different messages onto one id —
+        the admission would then treat the second as a replay and drop it."""
+        first = self._adapter()._parse_inbound(self._payload(storeKey="x" * 5000 + "a"))
+        second = self._adapter()._parse_inbound(self._payload(storeKey="x" * 5000 + "b"))
+
+        assert first is not None and second is not None
+        assert first.message_id != second.message_id
+
+    def test_the_same_oversized_payload_keeps_the_same_message_id(self):
+        """A redelivery of the SAME message must produce the SAME id, or the
+        admission sees a new input instead of a replay."""
+        first = self._adapter()._parse_inbound(self._payload(storeKey="x" * 5000))
+        second = self._adapter()._parse_inbound(self._payload(storeKey="x" * 5000))
+
+        assert first is not None and second is not None
+        assert first.message_id == second.message_id
+
+    def test_an_oversized_wechat_id_is_rejected_not_truncated(self):
+        """The chat id is the REPLY TARGET: truncating it would key the session
+        onto a conversation that does not exist and answer nobody. An absurd
+        value is rejected instead."""
+        inbound = self._adapter()._parse_inbound(self._payload(wechatId="S:" + "9" * 5000))
+
+        assert inbound is None
+
+    def test_an_oversized_sender_is_rejected_not_truncated(self):
+        """The sender is a reply target in a private chat AND part of the
+        admission identity."""
+        inbound = self._adapter()._parse_inbound(self._payload(user="u" * 5000))
+
+        assert inbound is None
+
+    def test_a_normal_payload_is_unchanged(self):
+        """The bound must not touch real traffic: a normal message keeps its
+        exact ids."""
+        inbound = self._adapter()._parse_inbound(self._payload())
+
+        assert inbound is not None
+        assert inbound.message_id == "t1_s1"
+        assert inbound.chat_id == "brycehuang"
+
+    def test_the_admission_identity_of_a_bounded_message_fits_the_contract(self):
+        """The end-to-end shape of the value that reaches _text(): the message
+        id is the request id, and the chat id plus the sender are the identity."""
+        import json
+
+        inbound = self._adapter()._parse_inbound(self._payload(storeKey="x" * 5000))
+
+        assert inbound is not None
+        request_id = inbound.message_id
+        identity = json.dumps(
+            ["default", "wework", inbound.chat_id, None, inbound.sender_user],
+            separators=(",", ":"),
+        )
+        principal_id = "messaging:" + identity
+
+        assert 0 < len(request_id) <= self._MAX_IDENTIFIER
+        assert 0 < len(principal_id) <= self._MAX_IDENTIFIER
+
+
 class TestControlPlaneWhitelistGate:
     """Platform (control-plane) whitelist REPLACES the env allow/policy
     config for BOTH DM senders and groups when CONTROL_PLANE_URL/AUTH are

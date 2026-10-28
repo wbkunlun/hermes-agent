@@ -17,6 +17,7 @@ Outbound (send API):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -152,6 +153,33 @@ def _looks_like_wechat_id(value: str) -> bool:
     if not v:
         return False
     return "R:" in v
+
+
+# fork 2026-10-28: the durable-admission contract (hermes_state_runtime._text)
+# refuses an identifier that is empty, not a str, or longer than 1024 chars.
+# The WeWork webhook is unauthenticated (0.0.0.0:13776 by default) and hands
+# us its fields verbatim, so an oversized field used to abort the WHOLE
+# inbound admission: RuntimeStoreError('invalid_params') -> the message was
+# dropped with no reply, and the webhook had already ACKed, so WeWork never
+# redelivered it. Bound every wire-supplied identifier at the edge.
+_MAX_ID_LEN = 256
+
+# fork 2026-10-28: same rate-limited shape as the control-plane drop log, so a
+# flood of malformed payloads cannot become a log flood.
+_OVERSIZED_ID_LOG_INTERVAL_S = 300.0
+_oversized_id_last_log = 0.0
+
+
+def _bounded_id(value: str) -> str:
+    """A wire-supplied identifier, length-bounded WITHOUT losing distinctness:
+    a shortened value keeps a hash of the FULL original, so two different long
+    ids never collapse onto one id (the dedup key and the message id stay
+    one-to-one with the message they came from)."""
+    raw = str(value or "").strip()
+    if len(raw) <= _MAX_ID_LEN:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:12]
+    return raw[: _MAX_ID_LEN - 13] + "#" + digest
 
 
 @dataclass
@@ -349,8 +377,25 @@ class WeWorkAdapter(BasePlatformAdapter):
         send_time = str(payload.get("sendTime") or "").strip()
         store_key = str(payload.get("storeKey") or "").strip()
 
-        # Unnamed groups may have an empty fromGroup, but their wechatId still looks
-        # like a group id (e.g. S:...;S:...). Treat those as group chats too.
+        # fork 2026-10-28: bound what the wire hands us BEFORE it becomes an
+        # identifier. The chat id and the sender are REPLY TARGETS - they must
+        # stay byte-exact, so an absurd value is rejected outright rather than
+        # truncated into a target that does not exist (a truncated target would
+        # answer nobody while the session keys onto a different conversation).
+        # sendTime/storeKey carry identity only, so they are bounded instead:
+        # the hash suffix keeps distinct messages distinct.
+        for field, value in (("wechatId", wechat_id), ("user", sender_user)):
+            if len(value) > _MAX_ID_LEN:
+                self._log_oversized_id(field=field, length=len(value))
+                return None
+        send_time = _bounded_id(send_time)
+        store_key = _bounded_id(store_key)
+
+        # fork 2026-10-28: a group is detected by the R: segment ONLY (see
+        # _looks_like_wechat_id). The previous comment here claimed a private
+        # wechatId ("S:..;S:..") also marks a group - that heuristic
+        # misclassifies every private chat as a group and routes the reply to
+        # an invalid target, so the comment contradicted the code below it.
         is_group = bool(from_group) or _looks_like_wechat_id(wechat_id)
         mentioned_bot = _truthy(payload.get("isAt"), False)
 
@@ -446,6 +491,23 @@ class WeWorkAdapter(BasePlatformAdapter):
             text=cmd,
             message_id=message_id,
             mentioned_bot=mentioned_bot,
+        )
+
+    def _log_oversized_id(self, *, field: str, length: int) -> None:
+        """Rate-limited visibility for an inbound whose identifier is longer
+        than the admission contract allows (fork 2026-10-28).
+
+        Same shape as the control-plane drop log: one line per 5 min, because
+        the webhook is unauthenticated and a flood of malformed payloads must
+        not become a log flood."""
+        global _oversized_id_last_log
+        now = time.time()
+        if now - _oversized_id_last_log < _OVERSIZED_ID_LOG_INTERVAL_S:
+            return
+        _oversized_id_last_log = now
+        logger.warning(
+            "[%s] dropped inbound: %s is %d chars (max %d) — not a WeWork id",
+            self.name, field, length, _MAX_ID_LEN,
         )
 
     def _log_cpwl_drop(self, *, is_group: bool, sender: str, chat_id: str, chat_name: str) -> None:
