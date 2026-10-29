@@ -1,0 +1,224 @@
+name: Gateway supervisord E2E
+
+# Validates the `hermes gateway run --external-supervisor` contract under a REAL
+# supervisord on a disposable runner:
+#   1. foreground ownership — exactly ONE gateway process, supervised;
+#   2. identify self-declares supervisor=external (control_socket._detect_supervisor);
+#   3. a plain client (connect_gateway) attaches to the supervised owner and does
+#      NOT spawn a competing unmanaged daemon;
+#   4. SIGKILL → supervisord autorestart pulls a FRESH pid up, still external;
+#   5. `hermes gateway restart` drains via SIGUSR1, exits back (exit 75) and the
+#      supervisor relaunches — the documented handback contract
+#      (website/docs/reference/cli-commands.md § restart; supervisord:
+#      autorestart=true).
+#
+# Dispatch-only debugging workflow: run it from the Actions tab. Never run this
+# topology on a developer machine (the gateway is a long-lived process; remote
+# runners are the sandbox). No messaging credentials are configured on the
+# runner home, so the gateway boots adapter-less.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supervisord:
+    name: gateway under supervisord
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+
+      - name: Install dependencies (+ supervisord into the venv)
+        uses: ./.github/actions/retry
+        with:
+          command: |
+            uv sync --locked --python 3.14 --extra all --group dev --extra anthropic
+            uv pip install --python .venv/bin/python supervisor
+
+      - name: Start the gateway under supervisord
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          export HERMES_HOME="$(mktemp -d "${RUNNER_TEMP}/hermes-gw-e2e-home.XXXXXX")"
+          echo "HERMES_HOME=$HERMES_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$HERMES_HOME/logs"
+          CONF="$HERMES_HOME/supervisord.conf"
+          cat > "$CONF" <<EOF
+          [unix_http_server]
+          file=$HERMES_HOME/supervisor.sock
+          chmod=0700
+
+          [supervisord]
+          logfile=$HERMES_HOME/logs/supervisord.log
+          pidfile=$HERMES_HOME/supervisord.pid
+          nodaemon=false
+
+          [rpcinterface:supervisor]
+          supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+          [supervisorctl]
+          serverurl=unix://$HERMES_HOME/supervisor.sock
+
+          [program:hermes-gateway]
+          command=$(which hermes) gateway run --external-supervisor -v
+          directory=$HERMES_HOME
+          autostart=true
+          autorestart=true
+          startsecs=10
+          startretries=5
+          stopsignal=TERM
+          stopwaitsecs=30
+          stopasgroup=true
+          killasgroup=true
+          redirect_stderr=true
+          stdout_logfile=$HERMES_HOME/logs/gateway-supervisor.log
+          stdout_logfile_maxbytes=20MB
+          environment=HERMES_HOME="$HERMES_HOME",HOME="$HOME",PATH="$(dirname "$(which hermes)"):/usr/local/bin:/usr/bin:/bin",LANG="C.UTF-8"
+          EOF
+          supervisord -c "$CONF"
+          sleep 2
+          supervisorctl -c "$CONF" status
+
+      - name: Wait for READY and assert identify reports supervisor=external
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          state=""
+          for i in $(seq 1 30); do
+            state=$(supervisorctl -c "$HERMES_HOME/supervisord.conf" status hermes-gateway | awk '{print $2}') || true
+            [ "$state" = "RUNNING" ] && break
+            sleep 2
+          done
+          if [ "$state" != "RUNNING" ]; then
+            supervisorctl -c "$HERMES_HOME/supervisord.conf" tail hermes-gateway || true
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from hermes_cli.gateway_runtime_discovery import query_identify
+          payload = query_identify(Path(os.environ["HERMES_HOME"]), timeout=10)
+          summary = {k: payload.get(k) for k in ("pid", "supervisor", "launch_supervisor", "profile", "code_version")}
+          print("identify:", summary)
+          sup = payload.get("supervisor") or payload.get("launch_supervisor")
+          assert sup == "external", f"expected supervisor=external, got {sup!r}"
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write(f"GW_PID={payload['pid']}\n")
+          PY
+
+      - name: Assert a plain client attaches without spawning a daemon
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python - <<'PY'
+          import asyncio
+          from hermes_cli.gateway_client import connect_gateway
+          async def main():
+              async with connect_gateway() as client:
+                  print("client attached to the supervised owner")
+          asyncio.run(main())
+          PY
+          n=$(pgrep -fc "gateway run --external-supervisor" || true)
+          echo "gateway processes: $n"
+          [ "$n" = "1" ] || { echo "expected exactly 1 gateway process, saw $n (client must not spawn)"; exit 1; }
+
+      - name: SIGKILL the gateway and assert supervisord autorestarts it
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          old="$GW_PID"
+          echo "killing gateway pid $old"
+          kill -9 "$old"
+          new=""
+          line=""
+          for i in $(seq 1 30); do
+            sleep 2
+            line=$(supervisorctl -c "$HERMES_HOME/supervisord.conf" status hermes-gateway || true)
+            case "$line" in
+              RUNNING*)
+                cand=$(printf '%s' "$line" | awk '{gsub(",", "", $4); print $4}')
+                if [ -n "$cand" ] && [ "$cand" != "$old" ]; then new="$cand"; break; fi ;;
+            esac
+          done
+          if [ -z "$new" ]; then echo "no fresh supervised pid appeared; last status: $line"; exit 1; fi
+          echo "autorestart: $old -> $new"
+          echo "GW_PID=$new" >> "$GITHUB_ENV"
+          sleep 5
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from hermes_cli.gateway_runtime_discovery import query_identify
+          payload = query_identify(Path(os.environ["HERMES_HOME"]), timeout=10)
+          assert (payload.get("supervisor") or payload.get("launch_supervisor")) == "external", payload
+          assert payload["pid"] == int(os.environ["GW_PID"]), (payload.get("pid"), os.environ["GW_PID"])
+          print("post-crash identify ok:", payload["pid"], payload.get("supervisor"))
+          PY
+
+      - name: hermes gateway restart hands back to supervisord (exit-75 contract)
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          old="$GW_PID"
+          hermes gateway restart
+          new=""
+          line=""
+          for i in $(seq 1 30); do
+            sleep 2
+            line=$(supervisorctl -c "$HERMES_HOME/supervisord.conf" status hermes-gateway || true)
+            case "$line" in
+              RUNNING*)
+                cand=$(printf '%s' "$line" | awk '{gsub(",", "", $4); print $4}')
+                if [ -n "$cand" ] && [ "$cand" != "$old" ]; then new="$cand"; break; fi ;;
+            esac
+          done
+          if [ -z "$new" ]; then echo "restart produced no fresh supervised pid; last status: $line"; exit 1; fi
+          echo "restart handback: $old -> $new"
+
+      - name: Dump topology and logs into the step summary
+        if: always()
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate 2>/dev/null || true
+          {
+            echo "### Gateway supervisord E2E"
+            echo ""
+            echo '```'
+            supervisorctl -c "$HERMES_HOME/supervisord.conf" status 2>&1 || true
+            echo '```'
+            echo ""
+            echo "<details><summary>gateway-supervisor.log (tail)</summary>"
+            echo ""
+            echo '```'
+            tail -60 "$HERMES_HOME/logs/gateway-supervisor.log" 2>/dev/null || true
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<details><summary>supervisord.log (tail)</summary>"
+            echo ""
+            echo '```'
+            tail -40 "$HERMES_HOME/logs/supervisord.log" 2>/dev/null || true
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Shut supervisord down
+        if: always()
+        run: |
+          supervisorctl -c "$HERMES_HOME/supervisord.conf" shutdown 2>&1 || true
