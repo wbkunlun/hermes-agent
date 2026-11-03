@@ -49,7 +49,9 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
-def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
+def load_user_config_effective(
+    config_path: Optional[Path] = None, *, fail_closed: bool = False, backup: bool = True,
+) -> dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -59,7 +61,12 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     last-good state); otherwise the last successfully parsed user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Cached on the user + managed file signatures and the values of every referenced env var.
+
+    ``backup=False`` keeps the read free of side effects: a successful parse no longer copies the
+    file into ``backups/`` nor sweeps legacy ``config.yaml.bak.*`` siblings out of the home. For
+    high-frequency readers such as the health probe — ``/health`` is polled every few seconds, and a
+    probe must not rewrite the operator's home."""
     from agent.safe_worker_policy import worker_config_snapshot
 
     # A frozen-policy worker is detached from the profile's files: the owner-supplied
@@ -98,7 +105,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                 # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
                 # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
                 # must not create backups/ inside that profile.
-                if config_path == _config.get_config_path():
+                if backup and config_path == _config.get_config_path():
                     from hermes_cli.config_backups import backup_config
                     backup_config(config_path, "good")
 

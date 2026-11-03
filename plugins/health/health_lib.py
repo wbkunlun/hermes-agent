@@ -456,24 +456,70 @@ def probe_platforms(home: Path, *, now_epoch: Optional[float] = None,
     return out
 
 
+# Why the model probe reports what it reports: the alarm text used to be one string for four
+# different states (missing file / unreadable / unparsable / no model key), so a corrupt
+# config.yaml was announced as "config.yaml 未配置模型" and sent operators to the wrong place.
+_MODEL_STATES = {
+    "ok": "",
+    "config-missing": "config.yaml 未配置模型：设置 MODEL_ID（或 config.yaml 的 model.default）",
+    "config-unreadable": "config.yaml 不可读：确认属主为 6001:6000 且容器内可读",
+    "config-unparsable": "config.yaml 解析失败：检查 YAML 语法（修复后重启容器）",
+    "model-absent": "config.yaml 未配置模型：设置 MODEL_ID（或 config.yaml 的 model.default）",
+    "model-unresolved": "config.yaml 的 model.default 是未展开的变量引用：确认引用的变量已注入",
+}
+
 def _configured_model(home: Path) -> str:
-    """model from config.yaml, mirroring gateway.run._resolve_gateway_model's
-    read (string, or mapping's default/model key) without importing the runner."""
-    # fork 2026-10-22 resync: read through the sanctioned raw reader (upstream's
-    # config_read_guard flags raw yaml.safe_load near config.yaml outside owner
-    # modules). read_user_config_raw swallows missing/unparseable files to {} —
-    # the same best-effort contract this probe needs.
+    """model from config.yaml, mirroring gateway.run._resolve_gateway_model's read.
+
+    ``gateway.run._resolve_gateway_model`` loads the EFFECTIVE config (``${VAR}`` expansion +
+    model-key canonicalization), so the raw file can disagree with the runtime in both directions:
+    ``model.name`` / ``model.model`` become ``default`` only on the effective read, and a raw read
+    cannot tell a broken file from an unset key. Read effective, and let every failure return ""
+    — ``_model_state`` names WHY (see ``_MODEL_STATES``); returning "" for a parse error is what
+    used to make a corrupt config.yaml read as "未配置模型"."""
     try:
-        from hermes_cli.config import read_user_config_raw
-        data = read_user_config_raw(Path(home) / "config.yaml")
+        from hermes_cli.config_effective import load_user_config_effective
+        # backup=False: /health is polled every few seconds, and this reader otherwise copies
+        # config.yaml into backups/ and sweeps legacy `config.yaml.bak.*` siblings out of the home.
+        data = load_user_config_effective(Path(home) / "config.yaml", fail_closed=True, backup=False)
     except Exception:
         return ""
     model_cfg = data.get("model") if isinstance(data, dict) else None
     if isinstance(model_cfg, str):
-        return model_cfg
+        return model_cfg.strip()
     if isinstance(model_cfg, dict):
-        return str(model_cfg.get("default") or model_cfg.get("model") or "")
+        return str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
     return ""
+
+def _model_state(home: Path) -> str:
+    """Why ``_configured_model`` came back empty (or not servable), for the remediation text.
+    Only consulted when there is no model — the healthy path pays a single read."""
+    path = Path(home) / "config.yaml"
+    if not path.exists():
+        return "config-missing"
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        data = load_user_config_effective(path, fail_closed=True, backup=False)
+    except (OSError, PermissionError):
+        return "config-unreadable"
+    except Exception:
+        return "config-unparsable"
+    model_cfg = data.get("model") if isinstance(data, dict) else None
+    if isinstance(model_cfg, str):
+        model = model_cfg.strip()
+    elif isinstance(model_cfg, dict):
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+    else:
+        model = ""
+    # An unresolved ${VAR} is non-empty but is sent to the endpoint as the literal text.
+    return ("model-unresolved" if "${" in model else "ok") if model else "model-absent"
+
+def _model_probe(home: Path) -> tuple[str, str]:
+    """``(configured model, state)`` — labelled from the same read the runtime performs."""
+    model = _configured_model(home)
+    if not model:
+        return "", _model_state(home)
+    return model, ("model-unresolved" if "${" in model else "ok")
 
 
 def _system_remediation(readiness: dict[str, Any]) -> str:
@@ -483,14 +529,25 @@ def _system_remediation(readiness: dict[str, Any]) -> str:
         entry = checks.get(name)
         return isinstance(entry, dict) and entry.get("status") != "ok"
 
+    def detail(name: str) -> str:
+        entry = checks.get(name)
+        return str(entry.get("detail") or "") if isinstance(entry, dict) else ""
+
     if bad("disk"):
         return "磁盘水位过高：清理 $HERMES_HOME（sessions/logs）"
     if bad("state_db"):
         return "state.db 不可读/损坏：查磁盘与容器重启历史，必要时按上游修复流程处理"
-    if bad("model"):
-        return "config.yaml 未配置模型：检查 model 配置"
+    model_state = detail("model")
+    # A config.yaml that cannot be read/parsed is blamed on the model by every downstream reader
+    # (an unparsable file yields no model), so name the real cause before the symptom. The model
+    # probe already classified the actual exception, so read that instead of re-deriving it from
+    # the config check's free-text detail (which is only a type name).
+    if bad("model") and model_state in {"config-unreadable", "config-unparsable"}:
+        return _MODEL_STATES[model_state]
     if bad("config"):
-        return "config.yaml 解析失败：检查语法"
+        return f"config.yaml 解析失败：检查 YAML 语法（{detail('config') or 'syntax'}）"
+    if bad("model"):
+        return _MODEL_STATES.get(model_state) or "config.yaml 未配置模型：检查 model 配置"
     return "系统检查异常：查看 /health/detail 的 system.checks 明细"
 
 
@@ -533,8 +590,10 @@ def probe_system(home: Path, *, runtime_status: Optional[dict[str, Any]] = None)
     try:
         from gateway.readiness import collect_runtime_readiness
         record = runtime_status if runtime_status is not None else _read_gateway_state(home)
+        configured_model, model_state = _model_probe(Path(home))
         readiness = collect_runtime_readiness(
-            configured_model=_configured_model(Path(home)), runtime_status=record or {})
+            configured_model=configured_model, runtime_status=record or {},
+            model_state=model_state)
         out["checks"] = readiness.get("checks", {})
         if readiness.get("status") != "ok":
             out["status"] = "degraded"

@@ -504,6 +504,68 @@ class TestSystemProbe:
         assert "elevated" in out["detail"] and "100" in out["detail"]
         assert "remediation" not in out
 
+class TestModelAttribution:
+    """The alarm text must name the real cause: a broken/unreadable config.yaml is not
+    "未配置模型" (2026-11-03 production alarm reported a parse problem as a missing model)."""
+
+    def test_scalar_model_reads_as_configured(self, lib, home):
+        (home / "config.yaml").write_text("model: glm-4.7\n", encoding="utf-8")
+        assert lib._model_probe(home) == ("glm-4.7", "ok")
+
+    def test_model_name_alias_is_canonicalized_like_the_runtime(self, lib, home):
+        # model.name / model.model only become model.default on the EFFECTIVE read; the raw
+        # read used here before reported "degraded" while the gateway resolved the model fine.
+        (home / "config.yaml").write_text(
+            "model:\n  provider: custom\n  name: glm-4.7\n  base_url: http://llm/v1\n", encoding="utf-8")
+        assert lib._model_probe(home) == ("glm-4.7", "ok")
+
+    def test_missing_file_is_its_own_state(self, lib, home):
+        assert lib._model_probe(home) == ("", "config-missing")
+
+    def test_unparsable_file_is_not_reported_as_a_missing_model(self, lib, home):
+        (home / "config.yaml").write_text("model:\n\tbad: 1\n", encoding="utf-8")
+        out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
+        assert out["checks"]["model"]["detail"] == "config-unparsable"
+        assert "解析失败" in out["remediation"]
+        assert "未配置模型" not in out["remediation"]
+
+    def test_unresolved_env_ref_is_flagged(self, lib, home, monkeypatch):
+        monkeypatch.delenv("UNSET_MODEL_ID", raising=False)
+        (home / "config.yaml").write_text(
+            "model:\n  provider: custom\n  default: ${UNSET_MODEL_ID}\n", encoding="utf-8")
+        out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
+        assert out["checks"]["model"]["detail"] == "model-unresolved"
+        assert "变量引用" in out["remediation"]
+
+    def test_absent_model_points_at_the_config_knob(self, lib, home):
+        (home / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
+        out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
+        assert out["checks"]["model"]["detail"] == "model-absent"
+        assert "MODEL_ID" in out["remediation"]
+
+    def test_probe_does_not_relocate_the_operators_backup_files(self, lib, home):
+        """/health is polled every few seconds by a monitor; a probe must not rewrite the home.
+
+        The effective reader the probe shares with the runtime copies config.yaml into backups/
+        and sweeps legacy ``config.yaml.bak.<ts>`` siblings there — but only for the ACTIVE home
+        (``get_config_path()``), so the probe is pointed at that path here. Same file, same call;
+        the only difference from production is that this test can watch the directory."""
+        cfg = home / "config.yaml"
+        cfg.write_text("model: glm-4.7\n", encoding="utf-8")
+        legacy = home / "config.yaml.bak.20260101-000000"
+        legacy.write_text("model: old\n", encoding="utf-8")
+
+        import hermes_cli.config as _config
+        original = _config.get_config_path
+        _config.get_config_path = lambda: cfg
+        try:
+            assert lib._model_probe(home) == ("glm-4.7", "ok")
+        finally:
+            _config.get_config_path = original
+
+        assert legacy.exists(), "the health probe moved the operator's backup into backups/"
+        assert not (home / "backups" / legacy.name).exists()
+
 
 # ---------------------------------------------------------------------------
 # Aggregate + payload build (Task 4)

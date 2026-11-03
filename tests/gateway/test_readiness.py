@@ -93,3 +93,26 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
     assert recovered["checks"]["session_store"] == {"status": "ok"}
 
 
+
+def test_model_state_classifies_why_the_model_is_missing(tmp_path, monkeypatch):
+    """Health renders its remediation from the check's ``detail``, so the probe must say WHY —
+    an unparsable config.yaml is not the same failure as a config.yaml with no model key."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    unparsable = collect_runtime_readiness(
+        configured_model="", runtime_status={"gateway_state": "running"},
+        model_state="config-unparsable")
+    assert unparsable["checks"]["model"] == {"status": "degraded", "detail": "config-unparsable"}
+
+    # A non-empty string that cannot serve a request (unexpanded ${VAR}) is still degraded.
+    unresolved = collect_runtime_readiness(
+        configured_model="${MODEL_ID}", runtime_status={"gateway_state": "running"},
+        model_state="model-unresolved")
+    assert unresolved["checks"]["model"]["status"] == "degraded"
+
+    # No classification supplied → the historical non-empty read still applies.
+    legacy = collect_runtime_readiness(
+        configured_model="glm-4.7", runtime_status={"gateway_state": "running"})
+    assert legacy["checks"]["model"] == {"status": "ok"}

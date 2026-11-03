@@ -97,17 +97,29 @@ def _probe_session_store(runtime_status: dict[str, Any], state_db_probe: dict[st
 def collect_runtime_readiness(
     *, configured_model: str, runtime_status: dict[str, Any] | None, active_api_runs: int = 0,
     process_completion_queue_depth: int = 0, active_delegations: int = 0,
+    model_state: str = "",
 ) -> dict[str, Any]:
     """Bounded readiness diagnostics, no runtime mutation.  Even authenticated, probes
-    expose status and counts only: never config values, credentials, paths, payloads."""
+    expose status and counts only: never config values, credentials, paths, payloads.
+
+    ``model_state`` names WHY the model is missing (``config-missing`` / ``config-unreadable`` /
+    ``config-unparsable`` / ``model-absent`` / ``model-unresolved``); it rides in the check's
+    ``detail`` so a remediation hint can point at the real cause instead of always claiming the
+    model is unset. It carries a fixed vocabulary, never a path or a value."""
     home = get_hermes_home()
     runtime = runtime_status if isinstance(runtime_status, dict) else {}
     state_db_probe = _probe_state_db(home)
+    # Callers that classify the failure pass ``model_state``; the status then follows that
+    # classification (an unexpanded ``${VAR}`` is a non-empty string that still cannot serve a
+    # request). Callers with only the string keep the historical non-empty check.
+    model_ok = (model_state == "ok") if model_state else bool(str(configured_model or "").strip())
+    model_probe = _check("ok" if model_ok else "degraded",
+                         None if model_ok else (model_state or "model-absent"))
     checks = {
         "state_db": state_db_probe,
         "session_store": _probe_session_store(runtime, state_db_probe),
         "config": _probe_config(home),
-        "model": _check("ok" if str(configured_model or "").strip() else "degraded"),
+        "model": model_probe,
         "disk": _probe_disk(home),
         "gateway": _probe_gateway(runtime),
         "background_queues": _check(
