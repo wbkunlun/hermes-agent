@@ -543,6 +543,54 @@ class TestModelAttribution:
         assert out["checks"]["model"]["detail"] == "model-absent"
         assert "MODEL_ID" in out["remediation"]
 
+    # -- key_env credential presence (model-no-credential) ------------------------
+    # A declared key_env that resolves to nothing makes every request carry the
+    # no-key-required placeholder and 401 — the model id still reads as configured,
+    # so without this state the alarm never fires.
+
+    def _write_key_env_cfg(self, home, *, key_env: bool):
+        cfg = "model:\n  provider: custom\n  default: glm-4.7\n  base_url: http://llm/v1\n"
+        if key_env:
+            cfg += "  key_env: HEALTH_TEST_MODEL_KEY\n"
+        (home / "config.yaml").write_text(cfg, encoding="utf-8")
+
+    def test_declared_key_env_without_a_value_is_not_ok(self, lib, home, monkeypatch):
+        monkeypatch.delenv("HEALTH_TEST_MODEL_KEY", raising=False)
+        self._write_key_env_cfg(home, key_env=True)
+        assert lib._model_probe(home) == ("glm-4.7", "model-no-credential")
+        assert lib._model_state(home) == "model-no-credential"
+        out = lib.probe_system(home, runtime_status={"gateway_state": "running"})
+        assert out["status"] == "degraded"
+        assert out["checks"]["model"]["detail"] == "model-no-credential"
+        assert "key_env" in out["remediation"]
+        assert "未配置模型" not in out["remediation"]
+
+    def test_declared_key_env_resolved_from_dotenv_is_ok(self, lib, home, monkeypatch):
+        monkeypatch.delenv("HEALTH_TEST_MODEL_KEY", raising=False)
+        self._write_key_env_cfg(home, key_env=True)
+        (home / ".env").write_text("HEALTH_TEST_MODEL_KEY=sk-dotenv\n", encoding="utf-8")
+        assert lib._model_probe(home) == ("glm-4.7", "ok")
+
+    def test_declared_key_env_resolved_from_process_env_is_ok(self, lib, home, monkeypatch):
+        monkeypatch.setenv("HEALTH_TEST_MODEL_KEY", "sk-process")
+        self._write_key_env_cfg(home, key_env=True)
+        assert lib._model_probe(home) == ("glm-4.7", "ok")
+
+    def test_no_key_env_declared_stays_ok(self, lib, home, monkeypatch):
+        # OAuth / keyless / anonymous endpoints name no env credential at all — a legal
+        # shape that must not alarm even though no key resolves.
+        monkeypatch.delenv("HEALTH_TEST_MODEL_KEY", raising=False)
+        self._write_key_env_cfg(home, key_env=False)
+        assert lib._model_probe(home) == ("glm-4.7", "ok")
+        assert lib._model_state(home) == "ok"
+
+    def test_blank_key_env_value_counts_as_missing(self, lib, home, monkeypatch):
+        # The runtime strips the resolved value; a whitespace-only variable is as dead as an
+        # unset one (upstream _key_env_secret warns on exactly this).
+        monkeypatch.setenv("HEALTH_TEST_MODEL_KEY", "   ")
+        self._write_key_env_cfg(home, key_env=True)
+        assert lib._model_probe(home) == ("glm-4.7", "model-no-credential")
+
     def test_probe_does_not_relocate_the_operators_backup_files(self, lib, home):
         """/health is polled every few seconds by a monitor; a probe must not rewrite the home.
 

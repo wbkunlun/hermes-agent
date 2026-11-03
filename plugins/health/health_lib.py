@@ -466,60 +466,90 @@ _MODEL_STATES = {
     "config-unparsable": "config.yaml 解析失败：检查 YAML 语法（修复后重启容器）",
     "model-absent": "config.yaml 未配置模型：设置 MODEL_ID（或 config.yaml 的 model.default）",
     "model-unresolved": "config.yaml 的 model.default 是未展开的变量引用：确认引用的变量已注入",
+    "model-no-credential": "model.key_env 指向的变量没有值：在 .env（或进程环境）为该变量设置 API key（修复后重启容器）",
 }
 
-def _configured_model(home: Path) -> str:
-    """model from config.yaml, mirroring gateway.run._resolve_gateway_model's read.
-
-    ``gateway.run._resolve_gateway_model`` loads the EFFECTIVE config (``${VAR}`` expansion +
-    model-key canonicalization), so the raw file can disagree with the runtime in both directions:
-    ``model.name`` / ``model.model`` become ``default`` only on the effective read, and a raw read
-    cannot tell a broken file from an unset key. Read effective, and let every failure return ""
-    — ``_model_state`` names WHY (see ``_MODEL_STATES``); returning "" for a parse error is what
-    used to make a corrupt config.yaml read as "未配置模型"."""
+def _model_section(home: Path) -> tuple[Any, str]:
+    """The ``model`` section from the same EFFECTIVE read the runtime performs, plus a state
+    name when the read itself failed ("" on success). ``${VAR}`` expansion + model-key
+    canonicalization mean the raw file can disagree with the runtime in both directions:
+    ``model.name`` / ``model.model`` become ``default`` only on the effective read, and a raw
+    read cannot tell a broken file from an unset key. Every failure returns ``(None, state)`` —
+    ``_MODEL_STATES`` names WHY; returning no model for a parse error is what used to make a
+    corrupt config.yaml read as "未配置模型"."""
     try:
         from hermes_cli.config_effective import load_user_config_effective
         # backup=False: /health is polled every few seconds, and this reader otherwise copies
         # config.yaml into backups/ and sweeps legacy `config.yaml.bak.*` siblings out of the home.
         data = load_user_config_effective(Path(home) / "config.yaml", fail_closed=True, backup=False)
-    except Exception:
-        return ""
-    model_cfg = data.get("model") if isinstance(data, dict) else None
+    except (OSError, PermissionError):
+        return None, "config-unreadable"
+    except Exception:  # health: allow BLE001 -- the parse error IS the finding: classified (not swallowed) into the state /health reports; a traceback log per poll would spam a persistently broken file
+        return None, "config-unparsable"
+    return (data.get("model") if isinstance(data, dict) else None), ""
+
+def _model_str(model_cfg: Any) -> str:
     if isinstance(model_cfg, str):
         return model_cfg.strip()
     if isinstance(model_cfg, dict):
         return str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
     return ""
 
-def _model_state(home: Path) -> str:
-    """Why ``_configured_model`` came back empty (or not servable), for the remediation text.
-    Only consulted when there is no model — the healthy path pays a single read."""
-    path = Path(home) / "config.yaml"
-    if not path.exists():
-        return "config-missing"
+def _configured_model(home: Path) -> str:
+    """model from config.yaml, mirroring gateway.run._resolve_gateway_model's read; every
+    failure returns "" — ``_model_state`` names WHY (see ``_MODEL_STATES``)."""
+    model_cfg, _ = _model_section(home)
+    return _model_str(model_cfg)
+
+def _key_env_unresolved(model_cfg: Any, home: Path) -> bool:
+    """True when the model block declares its credential as an env pointer
+    (``model.key_env`` / ``api_key_env``) that resolves to nothing anywhere the runtime could
+    see it: the process environment, the home's .env, the active secret scope, external secret
+    sources, the managed env. Upstream every custom rung substitutes ``no-key-required`` for
+    the empty key, so each request 401s while the model id itself still reads as configured —
+    exactly the shape this probe must not call ok. A block with no key_env at all stays False:
+    OAuth / keyless / anonymous endpoints are a legal configuration, not an alarm."""
+    if not isinstance(model_cfg, dict):
+        return False
+    key_env = str(model_cfg.get("key_env") or model_cfg.get("api_key_env") or "").strip()
+    if not key_env:
+        return False
     try:
-        from hermes_cli.config_effective import load_user_config_effective
-        data = load_user_config_effective(path, fail_closed=True, backup=False)
-    except (OSError, PermissionError):
-        return "config-unreadable"
-    except Exception:
-        return "config-unparsable"
-    model_cfg = data.get("model") if isinstance(data, dict) else None
-    if isinstance(model_cfg, str):
-        model = model_cfg.strip()
-    elif isinstance(model_cfg, dict):
-        model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
-    else:
-        model = ""
-    # An unresolved ${VAR} is non-empty but is sent to the endpoint as the literal text.
-    return ("model-unresolved" if "${" in model else "ok") if model else "model-absent"
+        from agent.secret_scope import current_secret_scope, load_env_file
+        from hermes_cli.env_loader import get_secret_source_values
+        from hermes_cli.managed_scope import load_managed_env
+        sources: list[Any] = [os.environ, load_env_file(Path(home) / ".env"),
+                              get_secret_source_values(home), load_managed_env()]
+        bound = current_secret_scope()
+        if bound is not None:
+            sources.append(bound)
+    except Exception:  # health: allow BLE001 -- cannot judge → cannot alarm: a resolver hiccup must degrade to "no finding", never take /health down (module contract: probes never raise)
+        return False
+    return not any(str(source.get(key_env) or "").strip() for source in sources)
+
+def _model_state(home: Path) -> str:
+    """Why ``_configured_model`` came back empty (or not servable), for the remediation text."""
+    model_cfg, read_state = _model_section(home)
+    if read_state:
+        return read_state
+    model = _model_str(model_cfg)
+    if not model:
+        # A model supplied purely by the managed overlay serves without a user file, so the
+        # missing-file verdict only applies when the read yielded nothing at all.
+        return "config-missing" if not (Path(home) / "config.yaml").exists() else "model-absent"
+    if "${" in model:
+        return "model-unresolved"
+    return "model-no-credential" if _key_env_unresolved(model_cfg, home) else "ok"
 
 def _model_probe(home: Path) -> tuple[str, str]:
     """``(configured model, state)`` — labelled from the same read the runtime performs."""
     model = _configured_model(home)
     if not model:
         return "", _model_state(home)
-    return model, ("model-unresolved" if "${" in model else "ok")
+    if "${" in model:
+        return model, "model-unresolved"
+    model_cfg, _ = _model_section(home)  # cached by file signature: a cheap second read
+    return model, ("model-no-credential" if _key_env_unresolved(model_cfg, home) else "ok")
 
 
 def _system_remediation(readiness: dict[str, Any]) -> str:

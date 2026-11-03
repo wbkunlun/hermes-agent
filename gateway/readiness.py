@@ -103,9 +103,9 @@ def collect_runtime_readiness(
     expose status and counts only: never config values, credentials, paths, payloads.
 
     ``model_state`` names WHY the model is missing (``config-missing`` / ``config-unreadable`` /
-    ``config-unparsable`` / ``model-absent`` / ``model-unresolved``); it rides in the check's
-    ``detail`` so a remediation hint can point at the real cause instead of always claiming the
-    model is unset. It carries a fixed vocabulary, never a path or a value."""
+    ``config-unparsable`` / ``model-absent`` / ``model-unresolved`` / ``model-no-credential``);
+    it rides in the check's ``detail`` so a remediation hint can point at the real cause instead
+    of always claiming the model is unset. It carries a fixed vocabulary, never a path or a value."""
     home = get_hermes_home()
     runtime = runtime_status if isinstance(runtime_status, dict) else {}
     state_db_probe = _probe_state_db(home)
