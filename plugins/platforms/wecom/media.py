@@ -33,6 +33,8 @@ ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
 UPLOAD_CHUNK_SIZE = 512 * 1024
 MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
+# 12-byte cache prefix + "_" leaves room under the 255-byte filesystem name limit
+_MAX_FILENAME_BYTES = 200
 
 _IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"), ((b"GIF87a", b"GIF89a"), ".gif"))
 _MIME_PREFIX_KINDS = (("image/", "image"), ("video/", "video"), ("audio/", "voice"))
@@ -88,7 +90,17 @@ class WeComMediaMixin:
         quote_type = str(quote.get("msgtype") or "").lower()
         if quote_type in ("image", "file"):
             _ref(quote_type, quote)
-        cached = [c for c in [await self._cache_media(kind, ref) for kind, ref in refs] if c]
+        # fork: one unreadable attachment must not abort _on_message — the exception then escapes
+        # into the WS receive loop and closes the connection, losing the whole message.
+        cached = []
+        for kind, ref in refs:
+            try:
+                c = await self._cache_media(kind, ref)
+            except Exception as exc:
+                logger.warning("[Wecom] Failed to cache inbound %s attachment; message kept without it: %s", kind, exc)
+                continue
+            if c:
+                cached.append(c)
         return [c[0] for c in cached], [c[1] for c in cached]
 
     async def _cache_media(self, kind: str, media: dict[str, Any]) -> Optional[tuple[str, str]]:
@@ -99,7 +111,7 @@ class WeComMediaMixin:
             except Exception as exc:
                 logger.debug("[%s] Failed to decode %s base64 media: %s", self.name, kind, exc)
                 return None
-            filename = str(media.get("filename") or media.get("name") or "wecom_file")
+            filename = self._bounded_filename(str(media.get("filename") or media.get("name") or "wecom_file"))
             return await self._store_media(kind, raw, self._detect_image_ext(raw), "", filename, mimetypes.guess_type(filename)[0] or "application/octet-stream", "")
         url = str(media.get("url") or "").strip()
         if not url:
@@ -118,7 +130,7 @@ class WeComMediaMixin:
             logger.debug("[%s] Failed to %s %s from %s: %s", self.name, step, kind, url, exc)
             return None
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
-        filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
+        filename = self._bounded_filename(self._guess_filename(url, headers.get("content-disposition"), content_type))
         # fork: WeCom video URLs often carry no usable filename/extension — sniff the
         # container magic so the cached file gets a playable .mp4/.webm suffix.
         if kind == "video" and "." not in filename:
@@ -182,6 +194,20 @@ class WeComMediaMixin:
             return match.group(1)
         name = Path(urlparse(url).path).name or "document"
         return name if "." in name else f"{name}{mimetypes.guess_extension(content_type) or '.bin'}"
+
+    @staticmethod
+    def _bounded_filename(filename: str) -> str:
+        """fork: percent-decode and cap the cache name. WeCom hands non-ASCII names URL-encoded
+        (``%E4%B8%80...``) — 9 bytes per char — so a long CJK name overflows the 255-byte
+        filesystem limit, raises ENAMETOOLONG and (pre-fix) killed the receive loop. Codec errors
+        are repaired because this also runs on outbound local paths, which may be already decoded."""
+        decoded = unquote(str(filename or ""), errors="replace")
+        suffix = Path(decoded).suffix
+        suffix = suffix if len(suffix.encode("utf-8")) <= 20 else ""
+        stem = decoded[:-len(suffix)] if suffix else decoded
+        budget = _MAX_FILENAME_BYTES - len(suffix.encode("utf-8"))
+        name = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore").rstrip(" .")
+        return f"{name or 'document'}{suffix}"
 
     @staticmethod
     def _decrypt_file_bytes(encrypted_data: bytes, aes_key: str) -> bytes:
@@ -298,7 +324,7 @@ class WeComMediaMixin:
         local_path = local_path if local_path.is_absolute() else (Path.cwd() / local_path).resolve()
         if not local_path.is_file():
             raise FileNotFoundError(f"Media file not found: {local_path}")
-        resolved_name = file_name or local_path.name
+        resolved_name = self._bounded_filename(file_name or local_path.name)
         return local_path.read_bytes(), self._normalize_content_type("", resolved_name), resolved_name
 
     async def _prepare_outbound_media(self, media_source: str, file_name: Optional[str] = None) -> dict[str, Any]:
