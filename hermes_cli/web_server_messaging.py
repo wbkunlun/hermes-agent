@@ -56,8 +56,8 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
 # the end alphabetically.
 _PLATFORM_ORDER: tuple[str, ...] = (  # fork 2026-10-10: wecom_callback removed, not listed
     "telegram", "discord", "slack", "mattermost", "matrix", "whatsapp", "signal", "bluebubbles",
-    "email", "sms", "dingtalk", "feishu", "google_chat", "wecom",
-    "weixin", "qqbot", "yuanbao", "api_server", "webhook",
+    "email", "sms", "dingtalk", "feishu", "google_chat", "wecom", "wecom_callback",
+    "weixin", "qqbot", "api_server", "webhook",
 )
 
 

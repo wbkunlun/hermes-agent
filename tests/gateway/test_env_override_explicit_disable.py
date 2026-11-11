@@ -3,8 +3,8 @@ in config.yaml must survive ``_apply_env_overrides`` when that platform's
 credentials are present in the environment.
 
 Before the fix, twelve credential-presence branches (weixin, whatsapp_cloud,
-email, sms, dingtalk, feishu, wecom, bluebubbles,
-qqbot, yuanbao) force-set ``enabled = True`` unconditionally, while Telegram /
+email, sms, dingtalk, feishu, wecom, wecom_callback, bluebubbles,
+qqbot) force-set ``enabled = True`` unconditionally, while Telegram /
 Discord / Slack routed through ``_enable_from_env`` and honored the
 ``_enabled_explicit`` marker.  These tests drive the real ``load_gateway_config``
 against a temp HERMES_HOME — real YAML I/O, no mocks of the code under test.
@@ -44,7 +44,6 @@ CRED_ENV = {
         "BLUEBUBBLES_PASSWORD": "bb-password",
     },
     "qqbot": {"QQ_APP_ID": "qq-app", "QQ_CLIENT_SECRET": "qq-secret"},
-    "yuanbao": {"YUANBAO_APP_ID": "yb-app", "YUANBAO_APP_SECRET": "yb-secret"},
     # control: the pattern that always honored the explicit disable
     "telegram": {"TELEGRAM_BOT_TOKEN": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"},
 }
@@ -52,7 +51,7 @@ CRED_ENV = {
 _PLATFORM_ENV_PREFIXES = (
     "TELEGRAM_", "DISCORD_", "SLACK_", "WEIXIN_", "WHATSAPP_", "HASS_", "EMAIL_",
     "TWILIO_", "DINGTALK_", "FEISHU_", "WECOM_", "BLUEBUBBLES_", "QQ_", "QQBOT_",
-    "YUANBAO_", "GATEWAY_RELAY", "SIGNAL_", "MATTERMOST_", "MATRIX_",
+    "GATEWAY_RELAY", "SIGNAL_", "MATTERMOST_", "MATRIX_",
 )
 
 def _isolate(monkeypatch, tmp_path, env):

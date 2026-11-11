@@ -41,7 +41,6 @@ _FEISHU_TOOLS = [
     "feishu_doc_read", "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
     "feishu_drive_reply_comment", "feishu_drive_add_comment",
 ]
-_YUANBAO_TOOLS = ["yb_query_group_info", "yb_query_group_members", "yb_send_dm", "yb_search_sticker", "yb_send_sticker"]
 
 
 def _ts(description, tools=(), includes=(), **extra):
@@ -166,7 +165,6 @@ TOOLSETS = {
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),
-    "yuanbao": _ts("Yuanbao platform tools - group info, member queries, DM, stickers", _YUANBAO_TOOLS),
     "feishu_doc": _ts("Read Feishu/Lark document content", ["feishu_doc_read"]),
     "feishu_drive": _ts("Feishu/Lark document comment operations (list, reply, add)", _FEISHU_TOOLS[1:]),
 
@@ -223,12 +221,7 @@ TOOLSETS = {
     # fork: extras=["send_message"] — the agent may notify a specific WeCom user
     # on request (tool registered in tools/send_message_tool.py, WeCom-scoped).
     "hermes-wecom": _bundle("WeCom bot toolset - enterprise WeChat messaging (full access)", ["send_message"]),
-    "hermes-yuanbao": {
-        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
-        "tools": _HERMES_CORE_TOOLS + _YUANBAO_TOOLS,
-        "module": "tools.yuanbao_tools",
-        "includes": [],
-    },
+    "hermes-wecom-callback": _bundle("WeCom callback toolset - enterprise self-built app messaging (full access)"),
     "hermes-sms": _bundle("SMS bot toolset - interact with Hermes via SMS (Twilio)"),
     "hermes-webhook": _ts("Webhook toolset - receive and process external webhook events", _HERMES_WEBHOOK_SAFE_TOOLS),
     "hermes-gateway": _ts(
@@ -238,8 +231,8 @@ TOOLSETS = {
             "hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack",
             "hermes-signal", "hermes-bluebubbles", "hermes-email",
             "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk",
-            "hermes-feishu", "hermes-wecom", "hermes-weixin",
-            "hermes-qqbot", "hermes-webhook", "hermes-yuanbao",
+            "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin",
+            "hermes-qqbot", "hermes-webhook",
         ],
     ),
 }
