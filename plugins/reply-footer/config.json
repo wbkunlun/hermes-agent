@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "platforms": ["wecom"],
+  "auto_disable_reply_badge": true,
+  "max_text_bytes": 20000,
+  "single_message_max_bytes": 4096,
+  "single_message_max_chars": 4000
+}

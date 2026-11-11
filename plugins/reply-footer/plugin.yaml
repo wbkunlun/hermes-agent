@@ -1,0 +1,20 @@
+name: reply-footer
+version: "0.1.0"
+description: >-
+  (fork, wehermes) Appends a Claude Code style usage footer to each final
+  reply — "<body>\n\n---\n📊 Model: X · Input N · Output N · Duration Ds ·
+  Turns N" — in the same WeCom message instead of a separate stats message.
+  post_api_request folds per-call usage (canonical input/output tokens,
+  per-call duration, turn-cumulative call count) into a per-turn bucket by
+  turn_id; transform_llm_output renders and appends the footer before the
+  final row persists. Skips when the text already carries the footer, or
+  when the whole message would exceed the WeCom single-message caps
+  (4000 chars / 4096 UTF-8 bytes). Config self-read from config.json
+  (mtime-cached) on every hook fire, so toggling enabled takes effect
+  immediately. When auto_disable_reply_badge is set and the reply-badge
+  plugin is present/enabled, reply-badge is folded into plugins.disabled
+  (effective next gateway restart). wecom only; all paths fail-open.
+author: "wehermes"
+hooks:
+  - post_api_request
+  - transform_llm_output
