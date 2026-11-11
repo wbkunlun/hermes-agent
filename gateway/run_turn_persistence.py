@@ -171,6 +171,10 @@ class GatewayTurnPersistenceMixin:
             response = strip_trailing_silence_marker(response)
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
+            # fork 2026-11-11 (DPMS 560807): wecom empty-turn fallback
+            if (not response and str(getattr(source.platform, "value", source.platform)) == "wecom"
+                    and _is_gateway_hidden_reasoning_incomplete_turn(agent_result)):
+                response = t("gateway.errors.no_response")
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
