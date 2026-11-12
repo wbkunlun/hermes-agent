@@ -41,6 +41,7 @@ import { getNestedValue, setNestedValue } from "@/lib/nested";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { AutoField } from "@/components/AutoField";
+import { FallbackAutofillField } from "@/components/fallback-autofill-field";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -174,11 +175,19 @@ export default function ConfigPage() {
         // (provider cards + guided setup/switch flow). Hide it from the
         // generic config form so the two surfaces don't fight; the schema
         // keeps the field for other consumers (Desktop settings).
+        //
+        // fallback_providers is a list of dicts: AutoField renders lists as a
+        // comma-joined string and would save that string back over the chain,
+        // destroying it in one edit — and the model section below already has
+        // a dedicated FallbackAutofillField. Excluded from the generic form
+        // for the same reason; the schema entry itself stays for other
+        // consumers (Desktop settings).
         const fields = { ...resp.fields } as Record<
           string,
           Record<string, unknown>
         >;
         delete fields["memory.provider"];
+        delete fields["fallback_providers"];
         setSchema(fields);
         setCategoryOrder(resp.category_order ?? []);
       })
@@ -651,6 +660,11 @@ export default function ConfigPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="grid gap-2 px-4 pb-4">
+                  {/* One-click fallback fill lives beside the model field
+                      (both sit in the "general" category); the chain itself is
+                      excluded from the generic form above. Profile follows the
+                      page's other calls via getManagementProfile. */}
+                  {activeCategory === "general" && <FallbackAutofillField />}
                   {renderFields(activeFields)}
                 </CardContent>
               </Card>

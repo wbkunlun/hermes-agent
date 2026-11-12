@@ -11,6 +11,8 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
+from pydantic import BaseModel
+
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_config import (
     _AUX_TASK_SLOTS, _UNSET, _apply_model_assignment_sync, _dashboard_code_skew_guard,
@@ -426,3 +428,126 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
                         reasoning_effort=reasoning_effort, prepared=prepared)
 
         return await asyncio.to_thread(_apply_assignment)
+
+
+class FallbackAutofillPayload(BaseModel):
+    """Body of POST /api/model/fallback/auto-fill: fill the fallback chain with the
+    first ``top_n`` models of ONE provider (the user's pick; NOT an aggregator-wide
+    "top 5 per lab" ranking). ``profile`` scopes the read/write like every /api/model route."""
+
+    provider: str
+    top_n: int = 5
+    profile: Optional[str] = None
+
+
+def _autofill_entry_for_row(provider_slug: str, model: str, row: dict, raw_cfg: dict) -> dict:
+    """``{provider, model}`` plus pointer fields for custom-endpoint rows.
+
+    Custom endpoints need ``base_url`` + ``key_env`` so runtime credential resolution
+    (``fallback_config.resolve_entry_api_key`` → ``agent.secret_scope.get_secret``) finds
+    the key — a plaintext ``api_key`` is never stored here. The ``key_env`` name matches
+    what the custom-endpoint CRUD routes write (``custom_endpoint_key_env``): an existing
+    ``key_env`` on the configured entry wins, else the pointer is derived from the entry's
+    stored ``providers:`` key, else from the slug's ``custom:`` suffix. No ``key_env`` can
+    be derived → the field is simply omitted (``resolve_entry_api_key`` then falls through
+    to the provider's standard credential resolution)."""
+    entry: dict = {"provider": provider_slug, "model": model}
+    base_url = str(row.get("api_url") or "").strip()
+    if not base_url:
+        return entry
+    entry["base_url"] = base_url
+    from hermes_cli.config import coerce_provider_id, custom_endpoint_key_env, find_provider_entry
+
+    providers = raw_cfg.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    lookups = [provider_slug]
+    if provider_slug.lower().startswith("custom:"):
+        lookups.append(provider_slug.split(":", 1)[1])
+    stored_key, provider_entry = None, None
+    for key in lookups:
+        stored_key, provider_entry = find_provider_entry(providers, key)
+        if provider_entry is not None:
+            break
+    key_env = str((provider_entry or {}).get("key_env") or "").strip()
+    if not key_env:
+        key_env = custom_endpoint_key_env(coerce_provider_id(stored_key)) if stored_key \
+            else custom_endpoint_key_env(lookups[-1])
+    if key_env:
+        entry["key_env"] = key_env
+    return entry
+
+
+@router.post("/api/model/fallback/auto-fill")
+async def autofill_fallback_chain(body: FallbackAutofillPayload, profile: Optional[str] = None):
+    """One-click fallback fill: take the first ``top_n`` models of the chosen provider
+    and append them to ``fallback_providers`` — the same write path ``hermes fallback
+    add`` uses (``fallback_cmd._write_chain``: writes ``fallback_providers``, pops the
+    legacy ``fallback_model`` key). Existing entries (hand-added cross-provider picks)
+    are ALWAYS kept; only missing entries are appended. Guards mirror the CLI's add:
+    the primary deployment is excluded (a provider cannot be a fallback for itself) and
+    duplicates are skipped. The chosen provider's own rows with no models → 422; an
+    unknown provider → 404.
+
+    Phase A (fetch, network I/O) runs OUTSIDE the config locks — same shape as
+    ``get_model_options``; Phase B is the standard ``config_write_scope`` +
+    ``config_mod._CONFIG_LOCK`` read-modify-write (same span as ``set_moa`` /
+    ``POST /api/model/set``)."""
+    provider = (body.provider or "").strip()
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider is required")
+    top_n = max(1, min(int(body.top_n or 5), 20))
+
+    with http_failure("POST /api/model/fallback/auto-fill failed", 500, detail="Failed to auto-fill fallback chain"):
+        # ── Phase A: fetch the provider's model rows (network I/O, no config lock held).
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        with _config_profile_scope(body.profile or profile):
+            payload = await run_in_threadpool(build_models_payload, load_picker_context())
+        row = next(
+            (r for r in payload.get("providers", [])
+             if str(r.get("slug", "")).lower() == provider.lower()),
+            None,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="provider not found in model options")
+        models = [str(m).strip() for m in (row.get("models") or []) if str(m).strip()]
+        if not models:
+            raise HTTPException(status_code=422, detail=f"provider {provider!r} has no model options")
+        models = models[:top_n]
+
+        # ── Phase B: read-modify-write the chain under the write-path locks.
+        from hermes_cli import config as config_mod
+        from hermes_cli.fallback_cmd import _extract_fallback_from_model_cfg, _identity, _read_chain, _write_chain
+
+        def _apply_autofill():
+            with config_write_scope(body.profile or profile), config_mod._CONFIG_LOCK:
+                # Strict read: a failed read must not be silently overwritten by the save.
+                raw_cfg = require_readable_config_before_write()
+                primary = _extract_fallback_from_model_cfg(raw_cfg.get("model"))
+                primary_ident = _identity(primary) if primary else None
+                chain = _read_chain(raw_cfg)  # merges legacy fallback_model; fresh copies
+                excluded: list[dict] = []
+
+                def _known(entry: dict) -> bool:
+                    ident = _identity(entry)
+                    return any(same_deployment(ident, _identity(existing)) for existing in chain)
+
+                added: list[dict] = []
+                for model in models:
+                    entry = _autofill_entry_for_row(provider, model, row, raw_cfg)
+                    if primary_ident is not None and same_deployment(primary_ident, _identity(entry)):
+                        excluded.append({"entry": entry, "reason": "same_deployment"})
+                    elif _known(entry):
+                        excluded.append({"entry": entry, "reason": "duplicate"})
+                    else:
+                        chain.append(entry)
+                        added.append(entry)
+                _write_chain(raw_cfg, chain)  # fallback_providers + pop legacy fallback_model
+                save_config(raw_cfg)
+                return added, excluded, chain
+
+        from agent.backend_identity import same_deployment
+        added, excluded, chain = await asyncio.to_thread(_apply_autofill)
+        return {"ok": True, "provider": provider, "requested": len(models),
+                "added": added, "excluded": excluded, "chain": chain}
