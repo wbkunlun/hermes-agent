@@ -19,7 +19,7 @@ import importlib
 import logging
 import os
 import threading
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from utils import env_var_enabled, is_truthy_value
 from agent.i18n import t
