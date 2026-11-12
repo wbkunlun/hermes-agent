@@ -2274,6 +2274,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     _model_cfg = _get_model_config()
     _primary_model = (_model_cfg.get("default") or "").strip()
     _primary_provider = (_model_cfg.get("provider") or "").strip()
+    cap = _configured_max_output_tokens(_model_cfg)
 
     try:
         runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
@@ -2284,7 +2285,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         # The entry's model is the one this agent must send (#112600). Carry the fallback notice so the
         # gateway can surface a user-visible provider switch (#74349); the caller must pop
         # ``_fallback_notice`` before forwarding kwargs to AIAgent.
-        return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
+        return {**_runtime_agent_kwargs(runtime, max_tokens=cap), "model": fallback_entry["model"],
                 "_fallback_notice": pre_agent_fallback_notice(
                     _primary_provider, _primary_model,
                     runtime.get("provider") or fallback_entry.get("provider") or "unknown",
@@ -2295,13 +2296,24 @@ def _resolve_runtime_agent_kwargs() -> dict:
         {k: v for k, v in capabilities.items() if isinstance(k, str) and isinstance(v, bool)}
         if isinstance(capabilities, dict) else {})
 
-    return {**_runtime_agent_kwargs(runtime), "capabilities": capabilities}
+    return {**_runtime_agent_kwargs(runtime, max_tokens=cap), "capabilities": capabilities}
 
 
-def _runtime_agent_kwargs(runtime: dict) -> dict:
+def _configured_max_output_tokens(model_cfg: dict) -> Optional[int]:
+    """fork 2026-11-11 model.max_output_tokens（上游已移除输出上限键；此为新增正键，resync 审计锚点）
+    Read ``model.max_output_tokens`` from the model config section: only a plain int > 0 counts.
+    Anything else (missing, bool, zero, negative, str/float) means "do not send" — keep the
+    provider's server-side default."""
+    cap = model_cfg.get("max_output_tokens")
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        return cap
+    return None
+
+
+def _runtime_agent_kwargs(runtime: dict, max_tokens: Optional[int] = None) -> dict:
     """AIAgent constructor kwargs shared by every runtime-provider resolution.
     ``request_overrides`` passes through as resolved so the provider's request body reaches each turn."""
-    return {
+    kwargs = {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -2311,6 +2323,9 @@ def _runtime_agent_kwargs(runtime: dict) -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
         "request_overrides": runtime.get("request_overrides")}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    return kwargs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2414,13 +2429,18 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Opti
     ``target_model`` is the model the override will actually send: the ladder's model-keyed rungs
     (Zen/Go relay + api_mode) must see it rather than config's ``default``, or a Go-only override
     resolves an api_mode/base_url the sent model cannot use (#112600)."""
-    from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+    from hermes_cli.runtime_provider import (
+        resolve_runtime_provider, format_runtime_provider_error, _get_model_config)
     try:
         runtime = resolve_runtime_provider(requested=provider, target_model=target_model or None)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
+    # fork 2026-11-11 model.max_output_tokens: inject here too so persisted-override session
+    # re-resolution (run_agent_cache) and api_server parse-failure fallback stay consistent
+    # with the direct path rather than silently dropping the cap.
+    cap = _configured_max_output_tokens(_get_model_config())
     return {
-        **_runtime_agent_kwargs(runtime),
+        **_runtime_agent_kwargs(runtime, max_tokens=cap),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "capabilities": dict(runtime.get("capabilities") or {})}
 

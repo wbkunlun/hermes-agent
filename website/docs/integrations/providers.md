@@ -1254,6 +1254,14 @@ Hermes no longer reads `model.max_tokens`, `HERMES_MAX_TOKENS`, provider output-
 settings, or `model_overrides.*.*.max_output_tokens`. Remove these legacy settings.
 Custom OpenAI-compatible endpoints receive no automatic catalog-sized output cap.
 Their server defaults apply; these can be lower than the model maximum.
+
+This fork adds one supported knob back under a new name: set `model.max_output_tokens`
+(an integer in the `model:` block of config.yaml) to cap the output of every main-loop
+LLM call. A positive value is sent as the request's output limit; a missing, zero, or
+invalid value means the parameter is not sent at all and the provider's server-side
+default applies. It is not an absolute ceiling for every call: internal tasks that carry
+their own ephemeral output budget (such as compression) keep that budget, and on the
+Anthropic wire the value is clamped to the model's context length minus one.
 A reply that degenerates into a repetition loop is still stopped: within about 130,000
 characters of the loop starting (visible or reasoning text), Hermes closes the stream
 and ends the turn with a "Repetition Detected" notice, so an uncapped endpoint cannot keep a

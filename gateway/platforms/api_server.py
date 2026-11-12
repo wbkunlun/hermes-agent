@@ -255,15 +255,21 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
     """gateway.run._resolve_runtime_agent_kwargs() for an explicit provider/model, so an API
     caller uses the same authenticated provider catalog without mutating config.yaml."""
     from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error, _get_model_config
+    from gateway.run import _configured_max_output_tokens  # delayed: avoids a circular import
     try:
         runtime = resolve_runtime_provider(requested=provider, target_model=target_model)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    return {
+    # fork 2026-11-11 model.max_output_tokens（上游已移除输出上限键；此为新增正键，resync 审计锚点）
+    request_kwargs = {
         **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "command")},
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool")}
+    cap = _configured_max_output_tokens(_get_model_config())
+    if cap is not None:
+        request_kwargs["max_tokens"] = cap
+    return request_kwargs
 
 
 def _request_agent_overrides(
