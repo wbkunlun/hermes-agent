@@ -18,6 +18,7 @@ import hashlib
 import importlib
 import logging
 import os
+import re
 import threading
 from typing import Any, Optional
 
@@ -886,6 +887,24 @@ _ACTION_GATE = _GateSpec(
 )
 
 
+# fork 2026-11-13 (DPMS 561213): mirrors the self-termination patterns in
+# tools/approval_detection.py (DANGEROUS_PATTERNS). Erring broad is the upstream rule for an
+# approval gate — an extra prompt is cheap, a killed gateway is not.
+_SELF_TERMINATION_RE = re.compile(
+    r"\b(?:pkill|killall)\b[^\n]*\b(?:hermes|gateway|cli\.py)\b"
+    r"|\bkill\b[^\n]*[$(`]\s*(?:pgrep|pidof)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_self_termination(command: str, pattern_key: str = "") -> bool:
+    """True when the command — or the detector's own label for it — targets the running
+    gateway. Such commands must not be auto-approved by the guardian LLM."""
+    if "self-termination" in (pattern_key or "").lower():
+        return True
+    return bool(_SELF_TERMINATION_RE.search(command or ""))
+
+
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                 pattern_keys: list[str], session_key: str, *,
                 human_present: bool) -> tuple[dict | None, bool]:
@@ -898,6 +917,16 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     counts toward the denial breaker even when an owner may override it. ESCALATE follows the
     normal, potentially persistent manual behavior.
     """
+    # fork 2026-11-13 (DPMS 561213): a kill aimed at the gateway itself must never be
+    # auto-approved by the guardian LLM. Production 2026-11-11: `kill hermes/gateway
+    # process` was smart-approved and ran (exit -15) — one stray pgrep match in an
+    # unattended session takes the gateway down. These need an explicit human approval.
+    if _is_self_termination(command, pattern_key):
+        logger.warning(
+            "Smart approval skipped for a self-termination command (%s) — explicit approval required",
+            pattern_key or "self-termination",
+        )
+        return None, False
     verdict = _smart_verdict(command, description, pattern_key, pattern_keys, session_key)
     if verdict == "approve":
         _reset_denials(session_key)

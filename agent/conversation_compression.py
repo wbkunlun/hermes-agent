@@ -1898,6 +1898,32 @@ class _CompressionLockLeaseRefresher:
                 break
 
 
+# fork 2026-11-13 (DPMS 561213): the auto-lower notice is per-session, so a gateway serving
+# many sessions wrote the identical line on every session start (production 2026-11-09..11:
+# 36 WARNING lines, a quarter of the whole log). Warn once per fingerprint per process; the
+# per-session user-facing notice below is unchanged.
+_WARNED_AUX_CONTEXT_FINGERPRINTS: set[tuple[str, int, int]] = set()
+
+
+def _warn_aux_context_mismatch(aux_model: str, aux_context: int, old_threshold: int,
+                                new_threshold: int) -> None:
+    """Warn once per (aux model, aux context, old threshold) per process; repeat hits debug."""
+    fingerprint = (str(aux_model or ""), int(aux_context), int(old_threshold))
+    if fingerprint in _WARNED_AUX_CONTEXT_FINGERPRINTS:
+        logger.debug(
+            "Auxiliary compression model %s context %d is still below the main model's threshold %d "
+            "(session threshold auto-lowered to %d) — already warned for this combination.",
+            aux_model, aux_context, old_threshold, new_threshold,
+        )
+        return
+    _WARNED_AUX_CONTEXT_FINGERPRINTS.add(fingerprint)
+    logger.warning(
+        "Auxiliary compression model %s has %d token context, below the main model's compression threshold of %d "
+        "tokens — auto-lowered session threshold to %d to keep compression working.", aux_model, aux_context,
+        old_threshold, new_threshold,
+    )
+
+
 def _emit_feasibility_notice(agent: Any, msg: str) -> None:
     """Store + emit a feasibility verdict once per distinct text: every main-runtime change re-probes, and an
     unchanged verdict must not re-warn on each `/model --once` restore or fallback cycle (#114707)."""
@@ -1979,11 +2005,9 @@ def _lower_threshold_to_aux_context(
             f"{recomputed_threshold:,} tokens, still above the compression model's {aux_context:,}.)"
         )
     _emit_feasibility_notice(agent, msg)
-    logger.warning(
-        "Auxiliary compression model %s has %d token context, below the main model's compression threshold of %d "
-        "tokens — auto-lowered session threshold to %d to keep compression working.", aux_model, aux_context,
-        old_threshold, new_threshold,
-    )
+    # fork 2026-11-13 (DPMS 561213): warn once per (aux model, aux context, old threshold)
+    # per process — see _warn_aux_context_mismatch above.
+    _warn_aux_context_mismatch(aux_model, aux_context, old_threshold, new_threshold)
 
 
 def _aux_inherits_main_route(agent: Any, aux_model: str, aux_base_url: str) -> bool:

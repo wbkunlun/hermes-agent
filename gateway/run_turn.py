@@ -169,6 +169,17 @@ from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 
 
+def _final_send_duplicate_risk(stream_consumer: Any) -> bool:
+    """Whether a normal final send could duplicate what the stream consumer already pushed.
+
+    A consumer that never delivered anything (no frame, no final) cannot duplicate: the
+    normal send is then the only delivery. fork 2026-11-13 (DPMS 561213) — production
+    2026-11-09..11 logged 12 duplicate-send warnings with zero real duplicates, all of
+    them from consumers that had delivered nothing.
+    """
+    return bool(getattr(stream_consumer, "already_sent", False))
+
+
 class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
@@ -1200,9 +1211,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
     @staticmethod
     async def _await_stream_task(stream_task) -> None:
-        """Give the stream consumer task 5s to flush, then cancel it."""
+        """Give the stream consumer task a flush budget above the platform ack wait, then cancel it."""
         try:
-            await asyncio.wait_for(stream_task, timeout=5.0)
+            # fork 2026-11-13 (DPMS 561213): 17s > the wecom final-frame ack wait
+            # (_REPLY_ACK_TIMEOUT = 15.0s, plugins/platforms/wecom/streaming.py). The old 5s
+            # budget cancelled the consumer mid-ack, so the final frame never got acked and
+            # the normal send raced it — the very race the duplicate-send warning points at.
+            await asyncio.wait_for(stream_task, timeout=17.0)
         except (TimeoutError, asyncio.CancelledError):
             stream_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -2006,12 +2021,26 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # the decision inputs ("signal never set" vs "ack-pending race"). Skipped for consumers
             # never fed the final's deltas (interim-only wiring, #105341) — they cannot have raced
             # the normal final send, so the warning would be a guaranteed false positive.
-            logger.warning(
-                "Normal final-send NOT suppressed despite active stream consumer for session %s: "
-                "streamed=%s previewed=%s content_delivered=%s transformed=%s final_len=%d — "
-                "possible duplicate send (see wecom ack-timeout RCA).",
-                _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
-            )
+            # fork 2026-11-13 (DPMS 561213): the consumer existing is not the risk — a
+            # consumer that never delivered anything is. Production 2026-11-09..11 logged
+            # 12 of these with zero real duplicate sends (all four delivery flags False and
+            # nothing pushed through the consumer), so the warning fired on every normal
+            # turn. Keep it for the case that can duplicate (frames already delivered);
+            # demote the rest to INFO.
+            if _final_send_duplicate_risk(_sc):
+                logger.warning(
+                    "Normal final-send NOT suppressed despite active stream consumer for session %s: "
+                    "streamed=%s previewed=%s content_delivered=%s transformed=%s final_len=%d — "
+                    "possible duplicate send (see wecom ack-timeout RCA).",
+                    _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
+                )
+            else:
+                logger.info(
+                    "Normal final send for session %s after an idle stream consumer "
+                    "(nothing delivered through it: streamed=%s previewed=%s content_delivered=%s "
+                    "transformed=%s final_len=%d) — no duplicate risk.",
+                    _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
+                )
 
     def _run_agent_bind_turn_wiring(
         self, turn_ctx: TurnContext, turn_runner: TurnRunner, source: SessionSource,

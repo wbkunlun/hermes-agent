@@ -356,6 +356,39 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         agent, messages, st.current_turn_user_idx, finish_reason="length",
         parts=st.truncated_response_parts,
     )
+    # fork 2026-11-13 (DPMS 561213): every continuation attempt burned the budget on
+    # reasoning and produced no visible text — the turn ended on the canned sentinel
+    # below and the whole round was thrown away (production 2026-11-11: three turns
+    # delivered a 274-char apology instead of the work). Hand the turn to the configured
+    # fallback model FIRST — same shape as the content-filter failover in this module —
+    # and keep the sentinel only when no fallback is left. The reasoning-off override
+    # stays set for that attempt: reasoning is what ate the budget.
+    if (
+        not partial_response
+        and filled is None
+        and getattr(agent, "_fallback_index", 0) < len(getattr(agent, "_fallback_chain", ()) or ())
+        and agent._try_activate_fallback(reason=FailoverReason.incomplete_response)
+    ):
+        logger.warning(
+            "%sNo visible text after %d continuation attempts — switched to fallback",
+            agent.log_prefix, n,
+        )
+        agent._vprint(
+            f"{agent.log_prefix}↻ No visible text after {n} continuation attempts — "
+            f"switching to fallback {agent.model} ({agent.provider})", diagnostic=True,
+        )
+        for _frag in messages:
+            if isinstance(_frag, dict):
+                _frag.pop("_length_continuation_fragment", None)
+                _frag.pop("_length_continuation_nudge", None)
+        agent._session_messages = messages
+        st.length_continue_retries = 0
+        st.truncated_response_parts = []
+        st.retry_count = 0
+        st.compression_attempts = 0
+        _retry.primary_recovery_attempted = False
+        _retry.restart_with_rebuilt_messages = True
+        return st.done("break")
     # The one-shot reasoning-off override must not leak into the next turn.
     agent._ephemeral_reasoning_off = False
     agent._vprint(

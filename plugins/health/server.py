@@ -26,12 +26,20 @@ def make_handler(*, build_detail: Builder, logger: logging.Logger) -> type:
 
         def _respond(self, code: int, body: dict[str, Any], head_only: bool = False) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            if not head_only:
-                self.wfile.write(payload)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if not head_only:
+                    self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                # fork 2026-11-13 (DPMS 561213): the prober hung up before we answered —
+                # routine for a health check with a short client timeout. It is not a
+                # health failure, so it must not surface as an ERROR with a stack trace
+                # (production 2026-11-11: two BrokenPipe traces were the only ERROR of
+                # the whole three-day log).
+                logger.debug("health: prober disconnected before the response was written")
 
         def _dispatch(self, head_only: bool = False) -> None:
             try:
@@ -40,11 +48,16 @@ def make_handler(*, build_detail: Builder, logger: logging.Logger) -> type:
                     body = {"status": detail.get("status"), "checked_at": detail.get("checked_at")}
                 else:
                     body = detail
-                self._respond(503 if detail.get("status") == "down" else 200, body, head_only)
             except Exception:
+                # fork 2026-11-13 (DPMS 561213): building the payload and writing the
+                # response are separate failures — a client that hung up mid-write used
+                # to be reported here as "payload build failed" (a lie) and then answered
+                # with a 500 that could not be written either.
                 logger.exception("health: payload build failed")
                 self._respond(500, {"status": "unknown", "error": "health payload build failed"},
                               head_only)
+                return
+            self._respond(503 if detail.get("status") == "down" else 200, body, head_only)
 
         def do_GET(self) -> None:
             if self.path.split("?", 1)[0] in _KNOWN_PATHS:

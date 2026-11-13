@@ -99,7 +99,16 @@ def _validate_batch_ops(operations, default_name, tool_error):
                            f"{', '.join(sorted(_BATCH_OP_ACTIONS))}; delete must be sole.")
         nm = op.get("name") or default_name
         if not nm:
-            return fail(i, " needs a 'name' (the skill it targets).")
+            # fork 2026-11-13 (DPMS 561213): the bare message taught the model nothing —
+            # the same op shape failed on three consecutive days (production 2026-11-09..11,
+            # 8 calls, some turns retrying it three times). Echo the offending operation and
+            # a copy-pasteable correct shape.
+            _shown = json.dumps(op, ensure_ascii=False)[:200]
+            return fail(i, " needs a 'name' (the skill it targets). "
+                           f"Got: {_shown}. Correct shape: "
+                           '{"action": "patch", "name": "<skill-dir>", '
+                           '"old_string": "...", "new_string": "..."} — every operation '
+                           'must carry its own name unless a top-level "name" is given.')
         # Reject a misfiled op here, before any sibling is applied: a runtime failure on
         # op[1] would first apply op[0] and then roll the whole batch back.
         if (shape_err := _op_shape_error(act, op)) is not None:

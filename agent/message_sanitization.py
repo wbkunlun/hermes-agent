@@ -227,6 +227,25 @@ def _rebalance_json_closers(raw: str) -> str | None:
     return "".join(out) + "".join(_JSON_CLOSERS[ch] for ch in reversed(stack))
 
 
+def _ends_inside_json_string(raw: str) -> bool:
+    """True when ``raw`` ends inside an unterminated JSON string value — the signature of a
+    tool_call argument payload the model's output cap cut in half mid-value."""
+    in_string = False
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        i += 1
+    return in_string
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Repair malformed tool_call argument JSON (truncation, trailing commas, Python ``None``,
     control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING."""
@@ -239,6 +258,11 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     if raw_stripped == "None":
         logger.warning("Sanitized Python-None tool_call arguments for %s", tool_name)
         return "{}"
+
+    # fork 2026-11-13 (DPMS 561213): the dominant cause of unrepairable arguments is the
+    # model's output cap cutting a long payload (a whole-file write, a long script) mid-value.
+    # "Unrepairable" alone reads like corruption; name the truncation and the remedy.
+    cut_mid_value = _ends_inside_json_string(raw_stripped)
 
     # Pass 0: strict=False accepts literal control chars inside strings (the most common
     # local-model case) and re-serialises to wire-valid JSON.
@@ -277,6 +301,15 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
             "Repaired control-char-laced tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], escaped[:80],
         )
         return escaped
+
+    if cut_mid_value:
+        logger.warning(
+            "Truncated tool_call arguments for %s (%d chars, JSON cut mid-value at the model's "
+            "output cap) — replaced with empty object; retry with smaller arguments "
+            "(write long payloads in chunks)",
+            tool_name, len(raw_stripped),
+        )
+        return "{}"
 
     logger.warning(
         "Unrepairable tool_call arguments for %s — replaced with empty object (was: %s)",
