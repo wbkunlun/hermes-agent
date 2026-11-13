@@ -60,6 +60,19 @@ class ChatSendQueueMixin:
         try:
             while True:
                 coro_factory, future = await queue.get()
+                if future.cancelled() or future.done():
+                    # fork 2026-11-13 (DPMS 561213): the waiter (gateway stream flush,
+                    # approval timeout, ...) gave up on this item before it left the queue.
+                    # A detached send would land AFTER the caller's fallback delivery and
+                    # the user reads the reply twice (production 2026-11-13 17:49: the
+                    # finalize frame sat behind the token bucket, the gateway timed out and
+                    # normal-sent, then this frame arrived — same text, two messages).
+                    logger.info(
+                        "[%s] Dropping cancelled %s send for %s — waiter gone, caller handled delivery",
+                        self.name, "control" if is_control else "normal", chat_key,
+                    )
+                    queue.task_done()
+                    continue
                 try:
                     wait = self._bucket_try_consume(chat_key, is_control)
                     if wait > 0:

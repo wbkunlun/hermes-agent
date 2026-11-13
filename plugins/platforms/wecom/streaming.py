@@ -87,6 +87,12 @@ class WeComStreamMixin:
 
     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
     _REPLY_ACK_TIMEOUT = 15.0  # official REPLY_SEND_TIMEOUT_MS; shorter widened the double-send race
+    # fork 2026-11-13 (DPMS 561213): finalize frames must settle before the gateway's stream
+    # flush budget (17s) cancels the consumer, else the flag stays unset and the gateway
+    # normal-sends on top of the (later-landing) bubble final. The send-queue drops the
+    # cancelled item, so past this bound the finalize declines cleanly and the reply is
+    # delivered exactly once by the gateway's regular send.
+    _FINALIZE_QUEUE_WAIT_SECONDS = 12.0
 
     async def _send_reply_queued(self, reply_req_id: str, body: dict[str, Any], *, is_final: bool = False, skip_if_pending: bool = False) -> dict[str, Any]:
         """aibot_respond_msg with per-req_id ack tracking: is_final drains the pending ack then awaits its own;
@@ -313,7 +319,27 @@ class WeComStreamMixin:
             return False
         inner = lambda: self._send_stream_frame_inner(text, chat=chat, reply_to=reply_to, finalize=finalize, turn_id=turn_id)
         # Finalize counts toward 30/min → control lane; intermediates are unmetered (no queue).
-        return await self._enqueue_chat_send(chat, inner, is_control=True) if finalize else await inner()
+        if not finalize:
+            return await inner()
+        try:
+            # fork 2026-11-13 (DPMS 561213): a finalize frame sitting in the control-lane
+            # queue past the gateway's stream-flush budget detaches from its caller — the
+            # gateway stops waiting (final_response_sent stays unset) and delivers the
+            # reply via the normal send, then the queued frame lands afterwards and the
+            # user reads the same reply twice (production 2026-11-13 17:49,
+            # hm-832fbfdf-68f: the frame sat behind the token bucket's rate-limit sleep).
+            # Bound the wait BELOW the gateway's flush budget and decline cleanly past it;
+            # the send-queue drops the cancelled item so the detached frame never lands.
+            return await asyncio.wait_for(
+                self._enqueue_chat_send(chat, inner, is_control=True),
+                timeout=self._FINALIZE_QUEUE_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            logger.info(
+                "[%s] finalize frame queued >%.0fs for chat %s — declining; gateway regular send delivers the reply exactly once",
+                self.name, self._FINALIZE_QUEUE_WAIT_SECONDS, chat,
+            )
+            return False
 
     def _locate_turn(self, chat: str, reply_to: Optional[str], finalize: bool, turn_id: Optional[str]) -> Optional[StreamTurn]:
         """Find or create the StreamTurn (None = unavailable); a turn locks to its creation req_id."""
