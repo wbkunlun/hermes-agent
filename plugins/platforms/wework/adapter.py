@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac  # fork 2026-11-16 (DPMS 561213): constant-time webhook token compare
 import logging
 import os
 import time
@@ -237,6 +238,11 @@ class WeWorkAdapter(BasePlatformAdapter):
             _env_str("WEWORK_WEBHOOK_PATH") or extra.get("webhookPath") or extra.get("path") or DEFAULT_WEBHOOK_PATH
         ).strip() or DEFAULT_WEBHOOK_PATH
 
+        # fork 2026-11-16 (DPMS 561213): optional inbound webhook auth. Empty
+        # (the default) keeps the webhook exactly as before — unauthenticated.
+        # When set, a POST must carry X-Webhook-Token or Authorization: Bearer.
+        self._webhook_token = (_env_str("WEWORK_WEBHOOK_TOKEN") or extra.get("webhookToken") or "").strip()
+
         self._text_chunk_limit = int(
             _env_str("WEWORK_TEXT_CHUNK_LIMIT") or extra.get("textChunkLimit") or extra.get("text_chunk_limit") or DEFAULT_TEXT_CHUNK_LIMIT
         )
@@ -346,9 +352,31 @@ class WeWorkAdapter(BasePlatformAdapter):
             self._http_client = None
 
     async def _handle_health(self, request: web.Request) -> web.Response:
+        # fork 2026-11-16 (DPMS 561213): exempt from WEWORK_WEBHOOK_TOKEN auth.
+        # It is a liveness probe and carries no sensitive data.
         return web.json_response({"status": "ok", "platform": "wework"})
 
+    def _webhook_authorized(self, request: web.Request) -> bool:
+        # fork 2026-11-16 (DPMS 561213): empty token = auth disabled (default,
+        # identical to the previous behaviour): zero work, no header lookups.
+        token = self._webhook_token
+        if not token:
+            return True
+        supplied = request.headers.get("X-Webhook-Token", "")
+        if not supplied:
+            auth = request.headers.get("Authorization", "")
+            scheme, _, value = auth.partition(" ")
+            if scheme.lower() == "bearer":
+                supplied = value.strip()
+        return bool(supplied) and hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
+
     async def _handle_webhook(self, request: web.Request) -> web.Response:
+        # fork 2026-11-16 (DPMS 561213): authenticate BEFORE parsing the body,
+        # so an unauthenticated request costs no JSON parsing.
+        if not self._webhook_authorized(request):
+            logger.warning("[%s] webhook rejected: unauthorized request from %s", self.name, request.remote)
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
         try:
             body = await request.json()
         except Exception:
