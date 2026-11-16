@@ -258,6 +258,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # reclaims the session in ~20s. Env still overrides for deployments that want
         # the old damping.
         self._kicked_backoff_seconds = max(5.0, env_float("HERMES_WECOM_KICKED_BACKOFF_SECONDS", 20.0))
+        # fork 2026-11-16 (DPMS 561213): the server closes the WS at a 600s heartbeat cap
+        # (258/265 production closes landed on ~600s) — that close is NOT a displacement.
+        # disconnected_event handler exempts connections that held this long.
+        self._wecom_heartbeat_cap_seconds = max(300.0, env_float("HERMES_WECOM_HEARTBEAT_CAP_SECONDS", 600.0))
         # fork 2026-10-26 (batch 4B): budgeted fast reconnect — the dead window's bulk
         # was the unconditional listen-loop backoff [2,5,10,30,60]. A connection that
         # held ≥90s earns FAST_RECONNECT_BUDGET quick retries; a flapping link climbs
@@ -978,25 +982,40 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             event = body.get("event") if isinstance(body.get("event"), dict) else {}
             event_type = str(event.get("eventtype") or body.get("event_type") or "")
             if event_type == "disconnected_event":
-                self._kicked_at_monotonic = time.monotonic()
-                # fork 2026-10-26: recycle the zombie socket NOW — the server displaces the
-                # subscription before it CLOSEs the socket, and every send in that gap passes
-                # _require_ws and eats a REAL 846609 (2026-10 cron report). Closing here puts
-                # the listen loop on its reconnect path immediately; the kicked floor still
-                # spaces the re-subscribe (mutual-kick damping unchanged). req_id caches die
-                # with the displaced session — purge them too instead of waiting for a send
-                # to discover it (mirror of the 846609 path).
-                self._last_chat_req_ids.clear()
-                self._reply_req_ids.clear()
-                self._schedule_recycle("disconnected_event")
-                logger.warning(
-                    "[%s] Displaced by a newer WeCom WS subscription (disconnected_event) — "
-                    "official docs allow ONE live connection per bot; a duplicate gateway "
-                    "instance or an out-of-process standalone/ephemeral send opened a "
-                    "competing connection. Reconnecting no sooner than %.0fs "
-                    "(HERMES_WECOM_KICKED_BACKOFF_SECONDS).",
-                    self.name, self._kicked_backoff_seconds,
-                )
+                # fork 2026-11-16 (DPMS 561213): a connection that held up to the server's
+                # heartbeat cap was closed by the server itself, not displaced — no kicked
+                # floor, and the req_id maps survive (purging them on every 10-min heartbeat
+                # close broke reply routing for long turns: 20min-class delivery delays).
+                # Fast reconnect only; the socket is still dead, so the recycle stands.
+                connected_at = self._connected_at_monotonic
+                uptime = None if connected_at is None else time.monotonic() - connected_at
+                if uptime is not None and uptime >= 0.9 * self._wecom_heartbeat_cap_seconds:
+                    self._schedule_recycle("server heartbeat-cap close")
+                    logger.info(
+                        "[%s] WeCom WS closed by server heartbeat cap (uptime≈%.0fs) — "
+                        "normal fast reconnect, keeping req_id maps",
+                        self.name, uptime,
+                    )
+                else:
+                    self._kicked_at_monotonic = time.monotonic()
+                    # fork 2026-10-26: recycle the zombie socket NOW — the server displaces the
+                    # subscription before it CLOSEs the socket, and every send in that gap passes
+                    # _require_ws and eats a REAL 846609 (2026-10 cron report). Closing here puts
+                    # the listen loop on its reconnect path immediately; the kicked floor still
+                    # spaces the re-subscribe (mutual-kick damping unchanged). req_id caches die
+                    # with the displaced session — purge them too instead of waiting for a send
+                    # to discover it (mirror of the 846609 path).
+                    self._last_chat_req_ids.clear()
+                    self._reply_req_ids.clear()
+                    self._schedule_recycle("disconnected_event")
+                    logger.warning(
+                        "[%s] Displaced by a newer WeCom WS subscription (disconnected_event) — "
+                        "official docs allow ONE live connection per bot; a duplicate gateway "
+                        "instance or an out-of-process standalone/ephemeral send opened a "
+                        "competing connection. Reconnecting no sooner than %.0fs "
+                        "(HERMES_WECOM_KICKED_BACKOFF_SECONDS).",
+                        self.name, self._kicked_backoff_seconds,
+                    )
             # Route aibot events (e.g. enter_chat welcome) to the handler.
             await self._on_event(payload)
             return
