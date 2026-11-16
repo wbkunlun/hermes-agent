@@ -41,7 +41,7 @@ import threading
 import time
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 

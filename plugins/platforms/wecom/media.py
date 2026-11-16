@@ -3,7 +3,6 @@ native send (image/video/voice/file)."""
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import logging
@@ -12,7 +11,7 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
 from agent.i18n import t

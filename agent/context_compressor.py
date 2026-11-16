@@ -9,10 +9,12 @@ import json
 import logging
 import sqlite3
 import re
-import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence
+
+# Re-exports consumed by sibling agent/gateway modules.
+__all__ = ["outbound_retired_image_ids", "retryable_user_text"]
 
 from agent.image_eviction_policy import images_all_within_many_image_limit, latched_retire_count, outbound_image_retire_count, outbound_retired_image_ids
 from agent.compression_marker import (

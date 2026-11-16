@@ -36,7 +36,7 @@ import json
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from plugins.platforms.wecom.cli import WecomCliError, cli_bin, run_cli
 from tools.registry import tool_error, tool_result

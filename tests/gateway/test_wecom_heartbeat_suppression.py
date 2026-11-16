@@ -22,7 +22,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway import run_turn as gateway_run_turn
 from gateway.run import GatewayRunner
 from plugins.platforms.wecom.stream_delivery import WeComStreamDelivery
 

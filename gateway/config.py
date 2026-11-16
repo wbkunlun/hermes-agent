@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from typing import Dict, List, Optional, Any, Callable
+from typing import Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home

@@ -2,44 +2,18 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 import asyncio
-import dataclasses
-import inspect
-import json
-import os
-import queue
-import threading
 import time
 from agent.i18n import t
 from agent.turn_failure_copy import (
     FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, OPEN_TURN_TAIL_ROLES, PARTIAL_FAILED_TURN_NOTICE,
 )
-from agent.session_activity import format_iteration_progress
-from contextlib import nullcontext, suppress
-from contextvars import copy_context
+from contextlib import suppress
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
-from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.event import MessageEvent
-from gateway.session import (
-    SessionSource, _session_key_namespace, build_channel_continuity_note,
-    build_session_context,
-)
 from gateway.session_detached import detached_route_of
-from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import TurnContext
 from gateway.warning_notifications import diagnostic_wake_muted
-from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
-from hermes_constants import get_hermes_home_override
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from utils import base_url_hostname
-
-if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
-    from gateway.run import GatewayRunner
-    from gateway.run_turn_runner import TurnRunner
+from typing import Optional
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")

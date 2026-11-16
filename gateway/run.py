@@ -9,6 +9,7 @@ try:
 except ModuleNotFoundError as exc:  # a partial ``hermes update`` can leave the bootstrap unregistered
     if exc.name != "hermes_bootstrap" and not "hermes_bootstrap".startswith(f"{exc.name}."):
         raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
+    hermes_bootstrap = None  # side-effect-only import; declare the name so the module namespace is defined
 
 import asyncio
 import concurrent.futures
@@ -19,7 +20,6 @@ import os
 import re
 import shlex
 import site
-import uuid
 import sys
 import signal
 import threading
@@ -29,7 +29,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Tuple, cast
+from typing import Callable, Dict, List, Optional, Any, cast
 
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
@@ -958,7 +958,6 @@ def _warm_turn_machinery_sync() -> int:
     TTL cache), the local Python toolchain probe (#106064), and the default route's context-window
     metadata (#105986) — a catalog HTTP probe that must not sit between the first inbound turn and its
     inference request. Context files remain lazy because they need the active turn's agent."""
-    import run_agent  # heavy import graph, cached in sys.modules
     import model_tools
 
     # Warm the schemas the turn will actually build: the profile's own toolsets (`video`, `image_gen`
@@ -2141,13 +2140,14 @@ os.environ["HERMES_QUIET"] = "1"  # gateway runs quiet: no debug output, cwd use
 # flip interactive sessions into ask-mode (approval prompts would become silent pending_approval).
 
 # Terminal cwd: config.yaml terminal.cwd is canonical (bridged above); MESSAGING_CWD is legacy fallback.
-from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
 
 from gateway.config import (
     ChannelOverride, Platform, GatewayConfig, PlatformConfig, _getenv, load_gateway_config)
 from gateway.session import (
     AsyncSessionStore, SessionStore, SessionSource, SessionContext, build_session_key,
     profile_from_session_key_namespace)
+from gateway.delivery import DeliveryRouter
+from gateway.turn_lease import SessionTurnLeaseRegistry
 # Telegram topic routing (#22773, regression fixed #52060): a
 # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is ambiguous — a forum-style topic in a
 # private chat and a genuine Bot API channel Direct-Messages topic share the same shape and need OPPOSITE
@@ -2155,8 +2155,6 @@ from gateway.session import (
 # rationale); ``thread_id`` goes in ``route_metadata`` so the anchorless cron send bypasses the
 # DeliveryRouter's private-chat reply-anchor requirement. Compute the routed metadata ONCE so both the text
 # send (via DeliveryRouter) and the media send agree.
-from gateway.delivery import DeliveryRouter
-from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.session_state import SessionState, legacy_dict_property
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -2169,6 +2167,9 @@ from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_ver
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin, _own_policy_envs
+
+# Re-exports consumed by sibling gateway modules (gateway.run is the shared hub for these).
+__all__ = ["DeliveryRouter", "Dict", "List", "SessionStore", "SessionTurnLeaseRegistry", "_resolve_gateway_exit_verdict", "signal"]
 from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
@@ -2875,7 +2876,11 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
         return {}
 
 
-from gateway.session_worker_construct import checkpoint_agent_kwargs as _checkpoint_agent_kwargs
+
+
+from gateway.session_worker_construct import checkpoint_agent_kwargs
+
+_checkpoint_agent_kwargs = checkpoint_agent_kwargs  # re-export: other modules import this from gateway.run
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
@@ -5003,8 +5008,7 @@ def _refresh_host_gateway_record(runner) -> None:
 # Bootstrap phases bound on the facade: ``_host_attach_or_none`` reads the replace step through this
 # module, and the lifecycle tests patch/drive these phases as ``gateway.run`` attributes.
 from gateway.run_bootstrap import (
-    _start_gateway_make_shutdown_signal_handler, _start_gateway_replace_existing_instance,
-    _start_gateway_shutdown_tail, _start_gateway_start_cron_and_housekeeping,
+    _start_gateway_replace_existing_instance,
 )
 
 

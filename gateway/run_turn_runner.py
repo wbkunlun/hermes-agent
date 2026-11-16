@@ -7,18 +7,12 @@ keeps intercepting them at call time.
 
 from __future__ import annotations
 
-import asyncio
-import dataclasses
-import json
 import logging
 import os
-import queue
-import re
 import threading
 import time
 from contextlib import suppress
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
@@ -28,9 +22,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.turn_context import TurnContext
-from hermes_cli.config import cfg_get
 from hermes_cli.plugins_dispatch import stream_held
-from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -371,7 +363,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 stts,
             ) if sc is not None
         ]
-        stream_delta_cb = None
         local_viewer_route = getattr(ctx.source, "platform", None) == Platform.LOCAL
         if delta_sinks or self._approval_owner is not None:
             def stream_delta_cb(text: Optional[str]) -> None:
@@ -392,6 +383,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     # only. The agent must treat it as undelivered, else a stream that dies here is
                     # stitched as a "partial delivery" nobody received (classic -q parity).
                     raise _NoStreamConsumer()
+        else:
+            stream_delta_cb = None
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
@@ -926,7 +919,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.session_api_turn import api_execution
         api = api_execution.get()
         if api is not None and api['history'] is not None:
-            from gateway.run import _collect_history_media_paths
             history = api['history']
             tail = history[-1] if history else None
             if api.get('resume_unanswered') and isinstance(tail, dict) and tail.get('role') == 'user':

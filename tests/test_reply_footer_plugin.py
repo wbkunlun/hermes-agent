@@ -207,7 +207,6 @@ class TestAutoDisableReplyBadge:
         assert [h for h, _ in ctx.hooks] == ["post_api_request", "transform_llm_output"]
 
     def test_badge_enabled_in_config_gets_disabled(self, plugin, monkeypatch, tmp_path):
-        import os
         home = tmp_path / "home"
         (home / "plugins").mkdir(parents=True)
         (home / "config.yaml").write_text("plugins:\n  enabled:\n    - reply-badge\n    - health\n", encoding="utf-8")

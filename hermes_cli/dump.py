@@ -84,7 +84,7 @@ def _get_git_commit_date(project_root: Path) -> str:
     if project_root.resolve() != get_project_root():
         return ""
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from hermes_cli.version_info import get_version_info  # deferred: keeps dump cheap on non-dump paths
         commit_date = get_version_info().commit_date

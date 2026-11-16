@@ -27,7 +27,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 # Each path segment must look like a CLI service name.  This blocks anything
 # shell-shaped or path-shaped from ever reaching argv, independent of the

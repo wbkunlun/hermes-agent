@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone, UTC
+from datetime import datetime, UTC
 from pathlib import Path
 from collections.abc import Collection
 from typing import Any, Optional

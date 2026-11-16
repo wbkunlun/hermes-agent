@@ -88,7 +88,9 @@ def patch_inventory(monkeypatch, inventory_rows):
         inventory, "load_picker_context", lambda: object(), raising=True,
     )
 
-    def _fake_build(ctx):
+    def _fake_build(ctx, **_kwargs):
+        # **_kwargs: the route may pass builder flags (the dropdown's provider universe);
+        # the fake payload is the same either way.
         return {"providers": copy.deepcopy(inventory_rows), "model": "", "provider": ""}
 
     monkeypatch.setattr(inventory, "build_models_payload", _fake_build, raising=True)
@@ -240,6 +242,46 @@ def test_configpage_excludes_fallback_providers_from_generic_form():
     text = (repo_root / "web" / "src" / "pages" / "ConfigPage.tsx").read_text(encoding="utf-8")
     assert 'delete fields["fallback_providers"];' in text
     assert 'delete fields["memory.provider"];' in text  # same exclusion block
+
+
+def test_provider_visible_in_the_dropdown_can_be_filled(monkeypatch, client, config_state):
+    """The provider dropdown is fed by GET /api/model/options, which asks for the FULL
+    provider universe (``include_unconfigured=1`` plus the picker's ``for_picker=True``: a
+    provider whose credential pool is exhausted stays visible there). Auto-fill must read
+    the SAME universe — otherwise the user picks a provider the dropdown shows and gets a
+    404 "provider not found"."""
+    from hermes_cli import inventory
+
+    def _build(_ctx, **kwargs):
+        rows = []
+        if kwargs.get("include_unconfigured"):
+            # canonical provider the user never configured: skeleton row, no models
+            rows.append({"slug": "canonical-unconfigured", "name": "Unconfigured", "models": []})
+        if kwargs.get("for_picker"):
+            # credential pool entirely exhausted -> hidden outside picker mode
+            rows.append({"slug": "pool-exhausted", "name": "Exhausted", "models": ["e1", "e2"]})
+        return {"providers": rows, "model": "", "provider": ""}
+
+    monkeypatch.setattr(inventory, "build_models_payload", _build, raising=True)
+    config_state["fallback_providers"] = []
+
+    resp = client.post(AUTO_FILL_PATH, json={"provider": "pool-exhausted", "top_n": 5})
+    assert resp.status_code == 200, resp.text
+    assert [e["model"] for e in resp.json()["chain"]] == ["e1", "e2"]
+
+
+def test_chain_entries_use_the_canonical_provider_slug(client, config_state):
+    """The chain stores the provider id the inventory knows (``row["slug"]``), not the raw
+    request string: "PROV-A" must not land in config.yaml as a non-canonical id (the
+    runtime resolves provider ids, and "CUSTOM:Foo" would also break the custom-endpoint
+    key_env derivation, which keys off the lowercase "custom:" prefix)."""
+    config_state["fallback_providers"] = []
+
+    resp = client.post(AUTO_FILL_PATH, json={"provider": "PROV-A", "top_n": 2})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["provider"] == "prov-a"
+    assert [e["provider"] for e in data["chain"]] == ["prov-a", "prov-a"]
 
 
 def test_unknown_provider_returns_404(client):

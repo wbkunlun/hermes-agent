@@ -14,7 +14,7 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 Builder = Callable[[], dict[str, Any]]
 _KNOWN_PATHS = ("/health", "/health/detail")

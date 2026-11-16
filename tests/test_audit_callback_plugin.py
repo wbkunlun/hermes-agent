@@ -855,7 +855,6 @@ class TestPostBatch:
         assert any("400" in r.message for r in caplog.records)
 
     def test_5xx_retries_then_gives_up(self, plugin, monkeypatch):
-        import httpx
         monkeypatch.setattr(plugin.time, "sleep", lambda *_: None)
         client = _SeqClient([_FakeResp(500), _FakeResp(500), _FakeResp(500)])
         events = self._two_event_body(plugin)

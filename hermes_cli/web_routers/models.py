@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException
 
 from pydantic import BaseModel
 
-from hermes_cli.web_deps import LateState, late
+from hermes_cli.web_deps import late
 from hermes_cli.web_server_config import (
     _AUX_TASK_SLOTS, _UNSET, _apply_model_assignment_sync, _dashboard_code_skew_guard,
     _plugin_aux_tasks, _prepare_main_assignment,
@@ -503,7 +503,16 @@ async def autofill_fallback_chain(body: FallbackAutofillPayload, profile: Option
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
         with _config_profile_scope(body.profile or profile):
-            payload = await run_in_threadpool(build_models_payload, load_picker_context())
+            # SAME provider universe the dropdown offers: GET /api/model/options asks for
+            # include_unconfigured=1 and builds in picker mode (a provider whose credential
+            # pool is exhausted stays visible there). Reading a narrower universe here would
+            # 404 a provider the user can plainly see in the dropdown.
+            # fast_custom_probe=False keeps the full custom-endpoint discovery budget the
+            # options endpoint also uses (for_picker=True alone would cut it to 1.5s).
+            payload = await run_in_threadpool(
+                build_models_payload, load_picker_context(),
+                include_unconfigured=True, for_picker=True, fast_custom_probe=False,
+            )
         row = next(
             (r for r in payload.get("providers", [])
              if str(r.get("slug", "")).lower() == provider.lower()),
@@ -511,6 +520,10 @@ async def autofill_fallback_chain(body: FallbackAutofillPayload, profile: Option
         )
         if row is None:
             raise HTTPException(status_code=404, detail="provider not found in model options")
+        # The chain stores the id the inventory knows (row["slug"]), not the request string:
+        # the runtime resolves provider ids, and the custom-endpoint key_env derivation keys
+        # off the lowercase "custom:" prefix.
+        provider = str(row.get("slug") or "").strip() or provider
         models = [str(m).strip() for m in (row.get("models") or []) if str(m).strip()]
         if not models:
             raise HTTPException(status_code=422, detail=f"provider {provider!r} has no model options")

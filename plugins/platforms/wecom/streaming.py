@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("plugins.platforms.wecom.adapter")
 
@@ -89,7 +89,7 @@ class WeComStreamMixin:
     _REPLY_ACK_TIMEOUT = 15.0  # official REPLY_SEND_TIMEOUT_MS; shorter widened the double-send race
     # fork 2026-11-13 (DPMS 561213): finalize frames must settle before the gateway's stream
     # flush budget (17s) cancels the consumer, else the flag stays unset and the gateway
-    # normal-sends on top of the (later-landing) bubble final. The send-queue drops the
+    # normal-sends on top of the (later-landing) bubble final. The send-queue skips the
     # cancelled item, so past this bound the finalize declines cleanly and the reply is
     # delivered exactly once by the gateway's regular send.
     _FINALIZE_QUEUE_WAIT_SECONDS = 12.0

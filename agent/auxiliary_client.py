@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Callable, NamedTuple, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.local_prompt_progress import (
@@ -53,8 +53,6 @@ from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 # `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
 # so in-module calls, `auxiliary_client.OpenAI` reads and
 # `patch("agent.auxiliary_client.OpenAI")` all keep working.
-if TYPE_CHECKING:
-    from openai import OpenAI
 
 _OPENAI_CLS_CACHE: Optional[type] = None
 
@@ -2153,7 +2151,7 @@ def _read_codex_singleton_token() -> Optional[str]:
 def _resolve_api_key_provider() -> tuple[Optional[OpenAI], Optional[str]]:
     """Try each API-key provider in PROVIDER_REGISTRY order; (client, model) or (None, None)."""
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
+        from hermes_cli.auth import resolve_api_key_provider_credentials
     except ImportError:
         logger.debug("Could not import PROVIDER_REGISTRY for API-key fallback")
         return None, None

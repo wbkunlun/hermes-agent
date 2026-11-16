@@ -3,7 +3,6 @@ from hermes_state import AsyncSessionDB, SessionDB
 
 from datetime import datetime
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 

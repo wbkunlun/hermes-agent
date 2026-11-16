@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+
 import threading
 from collections import OrderedDict
 from pathlib import Path

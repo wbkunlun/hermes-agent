@@ -4,7 +4,7 @@ import json as _json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, NoReturn, Optional, Set
+from typing import NoReturn, Optional
 
 from hermes_cli.cli_output import print_info as _print_info
 from hermes_cli.colors import Colors, color
@@ -16,23 +16,50 @@ from hermes_cli.toolset_scope import (
     _TOOLSET_PLATFORM_RESTRICTIONS, toolset_allowed_for_platform as _toolset_allowed_for_platform)
 from hermes_cli.toolset_validation import parse_platform_toolsets_value
 # Re-exports: keep ``hermes_cli.tools_config.X`` callers and test patch targets resolving.
-from hermes_cli.tools_config_cua import (
-    _post_setup_no_window_flags, _cua_driver_cmd, _cua_version_summary, _resolved_cua_driver_cmd, _cua_driver_env,
-    _cua_driver_contract_status, _cua_driver_install_ready)
 from hermes_cli.tools_config_post_setup import (
     _ensure_browser_use_cli, _run_post_setup, valid_post_setup_keys, run_post_setup_command, _POST_SETUP_INSTALLED,
-    _post_setup_already_installed, _module_installed, _POST_SETUP_READY)
+    _post_setup_already_installed, _POST_SETUP_READY)
 from hermes_cli.tools_config_providers import (
     _plugin_image_gen_providers, _plugin_video_gen_providers, _plugin_web_search_providers, _plugin_browser_providers,
-    _plugin_tts_providers, web_provider_capabilities, _visible_providers, provider_readiness_status,
+    web_provider_capabilities, _visible_providers, provider_readiness_status,
     _toolset_needs_configuration_prompt, _configure_tool_category, _web_tier_matches, _is_provider_active,
-    _detect_active_provider_index, IMAGEGEN_BACKENDS, _plugin_image_gen_catalog, _plugin_video_gen_catalog,
-    _configure_imagegen_model, _configure_imagegen_model_for_plugin, _configure_videogen_model_for_plugin,
+    IMAGEGEN_BACKENDS, _plugin_image_gen_catalog, _plugin_video_gen_catalog,
+    _configure_imagegen_model, _configure_imagegen_model_for_plugin, _configure_simple_requirements,
     _select_plugin_image_gen_provider, _select_plugin_video_gen_provider, STT_MODEL_CATALOG, _configure_stt_model,
-    _write_provider_config, apply_provider_selection, _configure_provider, _reconfigure_provider,
-    _configure_vision_backend, _configure_vision_provider_model, _configure_simple_requirements)
+    _write_provider_config, apply_provider_selection)
 from hermes_cli.tools_config_mcp import (
-    _configure_mcp_tools_interactive, _apply_toolset_change, _apply_mcp_change, tools_disable_enable_command)
+    _configure_mcp_tools_interactive, _apply_toolset_change, tools_disable_enable_command)
+
+__all__ = [
+    "IMAGEGEN_BACKENDS",
+    "STT_MODEL_CATALOG",
+    "_POST_SETUP_INSTALLED",
+    "_POST_SETUP_READY",
+    "_apply_toolset_change",
+    "_configure_imagegen_model",
+    "_configure_imagegen_model_for_plugin",
+    "_configure_stt_model",
+    "_ensure_browser_use_cli",
+    "_is_provider_active",
+    "_plugin_browser_providers",
+    "_plugin_image_gen_catalog",
+    "_plugin_image_gen_providers",
+    "_plugin_video_gen_catalog",
+    "_plugin_video_gen_providers",
+    "_plugin_web_search_providers",
+    "_post_setup_already_installed",
+    "_run_post_setup",
+    "_select_plugin_image_gen_provider",
+    "_select_plugin_video_gen_provider",
+    "_web_tier_matches",
+    "_write_provider_config",
+    "apply_provider_selection",
+    "provider_readiness_status",
+    "run_post_setup_command",
+    "tools_disable_enable_command",
+    "valid_post_setup_keys",
+    "web_provider_capabilities",
+]
 
 
 def _pip_install(
@@ -891,7 +918,6 @@ def _estimate_tool_tokens() -> dict[str, int]:
     scope = hermes_home_key()
     _tool_token_cache = _tool_token_cache or {}
     try:
-        import model_tools
         from tools.registry import registry
         cache_key = (scope, registry._generation)
     except Exception:
@@ -929,7 +955,6 @@ def _prompt_toolset_checklist(platform_label: str, enabled: set[str], platform: 
         for ts_key, ts_label, ts_desc in effective]
     pre_selected = {i for i, (ts_key, _, _) in enumerate(effective) if ts_key in enabled}
 
-    status_fn = None
     if tool_tokens:
         ts_keys = [ts_key for ts_key, _, _ in effective]
 
@@ -940,6 +965,8 @@ def _prompt_toolset_checklist(platform_label: str, enabled: set[str], platform: 
                 all_tools.update(resolve_toolset(ts_keys[idx]))
             total = sum(tool_tokens.get(name, 0) for name in all_tools)
             return f"Est. tool context: ~{total / 1000:.1f}k tokens" if total >= 1000 else f"Est. tool context: ~{total} tokens"
+    else:
+        status_fn = None
 
     chosen = curses_checklist(
         f"Tools for {platform_label}", labels, pre_selected, cancel_returns=pre_selected, status_fn=status_fn,
