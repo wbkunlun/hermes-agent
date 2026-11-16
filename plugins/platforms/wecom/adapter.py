@@ -44,6 +44,8 @@ from gateway.platforms.send_targets import StandaloneSendPolicy, parse_nonempty
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.learned_chats import LearnedChatsMixin
 from plugins.platforms.wecom.group_pending import GroupPendingMixin
+from plugins.platforms.wecom.reply_lane import reply_lane
+from plugins.platforms.wecom.stream_delivery import overflow_indicator
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
     WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
@@ -163,6 +165,18 @@ def _content_of(container: dict[str, Any], key: str) -> str:
     return str(_dict_or_empty(container, key).get("content") or "").strip()
 
 
+def _overflow_bubble_body(part: Any) -> str:
+    """A queued overflow bubble as text, without the framing this delivery added: the ``（i/N）``
+    prefix and the splitter's `` (i/N)`` suffix — and, where that suffix ended the bubble, the
+    space before it (the next line is the reply's own text)."""
+    text = part.decode("utf-8") if isinstance(part, (bytes, bytearray)) else str(part)
+    text = re.sub(r" \(\d+/\d+\)$", "", _OVERFLOW_MARKER_RE.sub("", text, count=2))
+    return text
+
+
+_OVERFLOW_MARKER_RE = re.compile("^（\\d+/\\d+）\\n")
+
+
 class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, LearnedChatsMixin, GroupPendingMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
@@ -232,6 +246,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._pending_responses: dict[str, asyncio.Future] = {}
         self._reply_queues: dict[str, ReplyQueue] = {}
         self._dedup, self._reply_req_ids = MessageDeduplicator(max_size=DEDUP_MAX_SIZE), {}
+        # fork 2026-11-16 (DPMS 561213): chat -> its last sealed stream turn, the anchor an
+        # overflow reply continues in follow-up bubbles (streaming.extend_stream_bubble).
+        self._last_stream_turn_by_chat: dict[str, Any] = {}
         # Text batching (clients split long messages ~4000 chars); attachment-only frames are held
         # for the merge window so the trailing text callback joins the same event (official: 800ms).
         self._text_batch_delay_seconds = env_float("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", 0.6)
@@ -1151,6 +1168,12 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         is_group = str(body.get("chattype") or "").lower() == "group"
         if not self._admit_inbound(is_group, chat_id, sender_id):
             return
+        # fork 2026-11-16 (DPMS 561213): a fresh inbound makes the chat's last sealed stream
+        # stale — it no longer addresses the authoritative reply slot, so its pending overflow
+        # bubbles must not be finished from here any more.
+        _last_turn = self._last_stream_turn_by_chat.get(chat_id)
+        if _last_turn is not None:
+            _last_turn.req_id_fresh = False
         # Post-policy: cache req_id so sends can fall back to passive reply (required in groups).
         self._remember_chat_req_id(chat_id, req_id)
         # fork: flush any pending group redeliveries — pre-turn reply frames on a fresh req_id are
@@ -1735,8 +1758,64 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # a single-chunk report may be corrected off one chunk's delivery — otherwise a
         # 1-of-N delivery would stamp the execution 'delivered' and hide the lost chunks.
         chunk_execution_id = execution_id if len(chunks) == 1 else None
-        return await send_chunks(chunks, lambda chunk: self._enqueue_chat_send(
-            chat_id, lambda: self._send_inner(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=chunk_execution_id), is_control=is_control))
+        # fork 2026-11-16 (DPMS 561213): every part of ONE reply queues in the same order on the
+        # per-chat queue; the reply lane keeps this reply's sends from being overtaken by another
+        # reply to the same chat, and letting queued overflow bubbles go first (see reply_lane.py).
+        async with reply_lane(chat_id):
+            return await send_chunks(chunks, lambda chunk: self._send_reply_part(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=chunk_execution_id))
+
+    async def _send_reply_part(self, chat_id: str, content: str, reply_to: Optional[str], *, force_proactive: bool = False, is_control: bool = False, is_redelivery: bool = False, execution_id: Optional[str] = None) -> SendResult:
+        """fork 2026-11-16 (DPMS 561213): one queued part of a reply — behind its overflow bubbles.
+
+        When the stream delivery of THIS turn queued overflow bubbles (the reply overflowed the
+        frame), they go out before this part, in order (a refused bubble and every bubble after it
+        are regular-sent by the adapter's seal). The gateway sends the body only when it was
+        not handed to those bubbles (no overflow claim), so a part is never filtered against them:
+        a short part that merely appears inside the reply text is still the gateway's own content."""
+        chat = str(chat_id or "").strip()
+        consumer = self._overflow_drain_target(chat)
+        if consumer is not None:
+            pending = await consumer.harvest_overflow()
+            if pending:
+                await self.send_overflow_bubbles(chat, pending)
+        return await send_chunks([content], lambda chunk: self._enqueue_chat_send(
+            chat, lambda: self._send_inner(chat, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=execution_id), is_control=is_control))
+
+    # ------------------------------------------------------------------
+    # Overflow bubbles (fork 2026-11-16, DPMS 561213)
+    # ------------------------------------------------------------------
+    # A reply too long for the final stream frame is sent as sealed follow-up bubbles of its
+    # bubble (WeComStreamDelivery.attach_overflow). Its sends carry them first; the consumer's
+    # run loop flushes whatever a send did not take once the reply is finished.
+
+    @staticmethod
+    def _overflow_drain_target(chat_id: str) -> Optional[Any]:
+        """The reply consumer published for the turn this send belongs to (StreamConsumerPublication)."""
+        from gateway.platforms.helpers import current_stream_consumer
+        consumer = current_stream_consumer()
+        if consumer is None or getattr(consumer, "chat_id", None) != chat_id:
+            return None
+        return consumer if isinstance(getattr(consumer, "overflow_parts", None), list) else None
+
+    async def send_overflow_bubbles(self, chat_id: str, pending: list) -> None:
+        """Seal already-taken overflow bubbles (bytes) of a reply, oldest first. The first the
+        stream refuses, and every bubble after it, goes out through the regular send as
+        segments, in order and numbered."""
+        draft = getattr(self, "extend_stream_bubble", None)
+        for index, part in enumerate(pending):
+            async with reply_lane(chat_id):  # one lane entry per bubble: never overtakes a frame
+                sealed = callable(draft) and await draft(chat_id, _overflow_bubble_body(part))
+            if sealed:
+                continue
+            logger.warning("[%s] overflow bubble %d/%d refused for chat %s — regular-sending it and the rest",
+                           self.name, index + 1, len(pending), chat_id)
+            rest = pending[index:]
+            for offset, remaining in enumerate(rest):
+                body = _overflow_bubble_body(remaining)
+                marker = overflow_indicator(offset + 1, len(rest)) + "\n" if len(rest) > 1 else ""
+                for segment in self._markdown_segments(body) or [body]:
+                    await self.send(chat_id, marker + segment)
+            return
 
     def _is_group_chat(self, chat_id: str) -> bool:
         """fork: single source of truth for group-ness — inbound-learned set UNION

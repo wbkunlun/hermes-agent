@@ -4,6 +4,7 @@ compilation, and fence-aware markdown chunking."""
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -13,10 +14,44 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any, MutableMapping, Optional
-from gateway.platforms.event import MessageEvent
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+
+# fork 2026-11-16 (DPMS 561213): the stream consumer the gateway publishes on its context while
+# it decides delivery for the current turn (see gateway/run_turn.py). Platform adapters read it to
+# let a turn's not-yet-delivered artifacts (WeCom's overflow bubbles) go out with its own sends.
+_CURRENT_STREAM_CONSUMER: contextvars.ContextVar = contextvars.ContextVar("hermes_stream_consumer", default=None)
+
+
+class StreamConsumerPublication:
+    """fork 2026-11-16 (DPMS 561213): publish a turn's stream consumer for the CURRENT context.
+
+    *turn* is the turn's TurnContext: each read resolves the consumer, so one publication covers the
+    whole turn whose consumer is created part-way through it."""
+
+    def __init__(self, turn: Any) -> None:
+        self.turn = turn
+
+    def __enter__(self) -> Any:
+        self.token = _CURRENT_STREAM_CONSUMER.set(self.turn)
+        return self.turn
+
+    def __exit__(self, *_exc: object) -> None:
+        _CURRENT_STREAM_CONSUMER.reset(self.token)
+
+
+def published_stream_consumer(turn: Any) -> Any:
+    """The stream consumer belonging to the published *turn* (None outside a published turn)."""
+    if turn is None or turn is not _CURRENT_STREAM_CONSUMER.get():
+        return None
+    holder = getattr(turn, "stream_consumer_holder", None)
+    return holder[0] if isinstance(holder, (list, tuple)) and holder else None
+
+
+def current_stream_consumer() -> Any:
+    return published_stream_consumer(_CURRENT_STREAM_CONSUMER.get())
 
 
 class MessageDeduplicator:

@@ -23,7 +23,7 @@ from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, describe_proxy_error, safe_proxy_url_for_log
 from gateway.platforms.event import MessageEvent
-from gateway.platforms.helpers import typing_metadata_for_turn
+from gateway.platforms.helpers import StreamConsumerPublication, typing_metadata_for_turn
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, persisted_user_metadata_for_event,
     reply_expected_metadata,
@@ -161,6 +161,7 @@ def hygiene_no_commit_reason(agent) -> str:
 from gateway.run_turn_prepare import GatewayTurnPrepareMixin
 from gateway.run_background import GatewayBackgroundMixin
 from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
+from gateway.run_turn_wecom_overflow import _wecom_overflow_claimed  # fork 2026-11-16 (DPMS 561213)
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 
 
@@ -207,6 +208,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        return await self._handle_message_with_agent_scoped(
+            event, source, _quick_key, run_generation)
+
+    async def _handle_message_with_agent_scoped(self, event, source, _quick_key: str, run_generation: int):
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -1658,6 +1663,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
+        # fork 2026-11-16 (DPMS 561213): a WeCom reply finished with its overflow bubbles already
+        # carries the body — the first-response lane must not send it a second time.
+        _overflow_claimed = not _already_streamed and _wecom_overflow_claimed(_sc)
+        if _overflow_claimed:
+            _already_streamed = True
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         _silent = False
         if self._is_intentional_silence(_delivery_result, first_response):
@@ -1689,10 +1699,12 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 session_key or "?",
             )
             try:
+                # A claimed reply still needs this lane for its MEDIA: uploads (text_already_delivered
+                # is the lane's own send suppression; already_sent is stamped by its success below).
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
-                    text_already_delivered=_already_streamed,
+                    text_already_delivered=_already_streamed and not _overflow_claimed,
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
@@ -2209,6 +2221,22 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
+        # fork 2026-11-16 (DPMS 561213): publish the turn context for every send this turn makes, the
+        # delivery decision (attached overflow bubbles) included; the publication unwinds with it.
+        with StreamConsumerPublication(turn_ctx):
+            return await self._run_agent_with_turn_context(
+                turn_ctx, turn_runner, _cleanup_adapter, disp, AIAgent, message=message, source=source,
+                session_key=session_key, run_generation=run_generation,
+                event_message_id=event_message_id, message_type=message_type,
+                scheduled_heartbeat=scheduled_heartbeat,
+            )
+
+    async def _run_agent_with_turn_context(
+        self, turn_ctx: TurnContext, turn_runner: Any, _cleanup_adapter: Any, disp: GatewayRunner._RunAgentDisplay,
+        AIAgent: Any, *, message: str, source: SessionSource, session_key: Optional[str],
+        run_generation: Optional[int], event_message_id: Optional[str], message_type: Any,
+        scheduled_heartbeat: bool,
+    ) -> Any:
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )

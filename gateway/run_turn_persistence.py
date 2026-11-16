@@ -13,7 +13,10 @@ from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
 from gateway.session_detached import detached_route_of
 from gateway.warning_notifications import diagnostic_wake_muted
+from gateway.run_turn_wecom_overflow import _wecom_overflow_claimed, _wecom_delivery_consumer
+from gateway.platforms.helpers import current_stream_consumer as _published_stream_consumer
 from typing import Optional
+
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -641,6 +644,12 @@ class GatewayTurnPersistenceMixin:
     ):
         """``_hmwa_deliver_turn_response``, then, for a usage-window refusal, the limit offer: the limit
         sentence is the reply, and the button follows it once it lands."""
+        # fork 2026-11-16 (DPMS 561213): the reply is complete — a WeCom reply drawn as overflow
+        # bubbles learns its payload FIRST and rides the footer in its last bubble; the regular send
+        # then stands cancelled (already_sent) and no trailing footer send is made.
+        await self._hmwa_attach_wecom_overflow(agent_result, source, response, footer_line, intentional_silence)
+        if _wecom_overflow_claimed(_published_stream_consumer()):
+            footer_line = ""
         delivered = await self._hmwa_deliver_turn_response(
             event, source, session_entry, session_key, run_generation,
             agent_result, agent_messages, response, footer_line, intentional_silence,
@@ -651,6 +660,51 @@ class GatewayTurnPersistenceMixin:
             self._schedule_usage_limit_offer(event, agent_result["usage_limit"], session_key=session_key,
                                              generation=run_generation)
         return delivered
+
+    async def _hmwa_attach_wecom_overflow(self, agent_result, source, response, footer_line, intentional_silence) -> None:
+        """fork 2026-11-16 (DPMS 561213): hand the completed reply payload to a WeCom overflow delivery.
+
+        The delivery decides what it still owes (the rest of the reply, the segment/media tail,
+        footer included) and queues it as sealed bubbles of the reply. It also marks the reply
+        delivered, which cancels the redundant regular send — the original "one reply, two
+        messages" — and makes a trailing footer unnecessary."""
+        try:
+            consumer = _published_stream_consumer()
+            if not _wecom_delivery_consumer(consumer) or agent_result.get("failed"):
+                return
+            adapter = self._delivery_adapter_for(source)
+            if adapter is None:
+                return
+            if adapter is not getattr(consumer, "adapter", None):
+                transport = getattr(consumer, "adapter", None)
+                # The consumer is built with a transport (the delivery's stream frames through it)
+                # and the gateway answers through the adapter the same chat's sends go through.
+                # Same transport = one delivery channel: the bubbles ride the gateway's sends.
+                if getattr(adapter, "transport", None) is not transport:
+                    # Published for this turn but another bot answers the chat: no send of ours would
+                    # carry its bubbles, so the regular send delivers the body and the tail after it.
+                    detach = getattr(consumer, "detach_overflow", None)
+                    if callable(detach):
+                        detach()
+                    if not intentional_silence and footer_line:
+                        response = f"{response}\n\n{footer_line}" if response else footer_line
+                    return
+            body = str(response or "")
+            if not intentional_silence and footer_line and body:
+                body = f"{body}\n\n{footer_line}"
+            consumer.attach_overflow(body)
+            # The reply's close-out: a hand-over that lands after the consumer's run loop (a late
+            # final payload) leaves bubbles no send will carry — they go out here, in order. When
+            # the run loop is still going it seals them itself before the gateway's own sends.
+            flush = getattr(consumer, "flush_pending_overflow", None)
+            if callable(flush):
+                await flush()
+            if consumer.delivery_claimed:  # published by WeComStreamDelivery.attach_overflow
+                # Same outcome as the streamed-final branch: the body is on screen, the regular
+                # send is what would duplicate it.
+                agent_result["already_sent"] = True
+        except Exception as _e:  # the overflow decision must never fail a turn that was delivered
+            logger.debug("wecom overflow attach failed: %s", _e)
 
     async def _ledger_uncertain_streamed_final(self, event, session_key, response, adapter) -> None:
         """A stream send of this answer timed out after the request left and was counted as shown: on
@@ -690,6 +744,12 @@ class GatewayTurnPersistenceMixin:
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
+        # fork 2026-11-16 (DPMS 561213): a WeCom reply delivered as overflow bubbles carries its
+        # own MEDIA: tail — a media re-scan or a regular send here would duplicate it.
+        if _wecom_overflow_claimed(_published_stream_consumer()):
+            with suppress(Exception):
+                event._streamed_final_response = str(response or "")
+            return None
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.

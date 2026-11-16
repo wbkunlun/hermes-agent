@@ -66,6 +66,15 @@ class StreamTurn:
         self.start_time = time.monotonic()
         self.last_sent_content: str = ""  # content ACTUALLY sent; final frame must differ or WeCom drops it
         self._intermediate_frames_sent: int = 0
+        # fork 2026-11-16 (DPMS 561213): the req_id is still the LATEST inbound of the chat. The
+        # adapter clears it when the next inbound arrives by plain assignment (no shared object
+        # mutation — this turn may be written from the send path's thread). A STALE (False) marker
+        # never becomes fresh again: the frame would open a bubble on an already-answered req_id.
+        self.req_id_fresh: bool = True
+        # fork 2026-11-16 (DPMS 561213): index of the follow-up bubble this turn's OVERFLOW delivery
+        # continues in (extend_stream_bubble). Only overflow follow-ups advance it; the original
+        # turn's intermediates/finalize always address stream_id.
+        self.continuation: int = 0
         self.keepalive_handle: Optional[asyncio.TimerHandle] = None  # cancel on EVERY turn-exit path
 
 
@@ -242,6 +251,66 @@ class WeComStreamMixin:
     def _find_active_turn_for_chat(self, chat_id: str) -> Optional[StreamTurn]:
         return next((t for t in self._stream_turns.values() if t.chat_id == chat_id and not t.finalized), None)
 
+    def _find_overflow_anchor(self, chat_id: str) -> Optional[StreamTurn]:
+        """fork 2026-11-16 (DPMS 561213): the turn an overflow bubble may continue — the chat's
+        sealed turn whose req_id is still the latest inbound, else a live unfinalized turn."""
+        anchor = getattr(self, "_last_stream_turn_by_chat", {}).get(chat_id)
+        if anchor is not None and anchor.req_id_fresh and not anchor.expired:
+            return anchor
+        turn = self._find_active_turn_for_chat(chat_id)
+        return turn if turn is not None and turn.req_id_fresh else None
+
+    async def extend_stream_bubble(self, chat_id: str, text: str) -> bool:
+        """fork 2026-11-16 (DPMS 561213): deliver one follow-up bubble of an OVERFLOW reply as a
+        sealed ``msgtype: stream`` frame opened and finished in a single call.
+
+        Reason: finalize declines once the final display exceeds MAX_STREAM_CONTENT_LENGTH (the
+        adapter byte-truncates frames), and the reply then went out through the regular send —
+        leaving the half-drawn bubble on screen next to a second, complete message. Sending the
+        full reply as ordered bubbles keeps ONE channel: bubble N is sealed before bubble N+1
+        opens, so nothing is duplicated and nothing is lost. ``text`` must fit the frame budget.
+
+        *text* is str (the frames' unit): callers holding bytes decode UTF-8 first. Returns False
+        (the caller regular-sends the bubble, and every bubble after it, in order) when there is
+        no usable turn to continue, the stream is unavailable, or the frame does not land.
+        The turn's ``continuation`` advances only when the FIRST frame landed — a bubble the wire
+        refused must not leave a half-opened stream id behind for the next one to reuse."""
+        chat = (chat_id or "").strip()
+        if not chat or not text:
+            return False
+        if not isinstance(text, str):
+            text = bytes(text).decode("utf-8", errors="replace")
+        turn = self._find_overflow_anchor(chat)
+        if turn is None:
+            return False
+        # The overflow steps of one reply arrive in order, so a per-turn counter is enough.
+        stream_id = f"{turn.stream_id}_c{turn.continuation + 1}"
+
+        async def send() -> bool:
+            await self._send_stream_reply(turn.req_id, stream_id, text, finish=False)
+            turn.continuation += 1
+            await self._send_stream_reply(turn.req_id, stream_id, text, finish=True)
+            return True
+
+        try:
+            return await asyncio.wait_for(
+                self._enqueue_chat_send(chat, send, is_control=True),
+                timeout=self._FINALIZE_QUEUE_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            logger.info("[%s] overflow bubble %s queued >%.0fs for chat %s — falling back for the remainder",
+                        self.name, stream_id, self._FINALIZE_QUEUE_WAIT_SECONDS, chat)
+            return False
+        except WeComStreamExpiredError:
+            self._stream_expired_chats.add(chat)
+            logger.info("[%s] overflow bubble %s: stream expired for chat %s — falling back for the remainder",
+                        self.name, stream_id, chat)
+            return False
+        except Exception as exc:
+            logger.info("[%s] overflow bubble %s failed for chat %s (%s) — falling back for the remainder",
+                        self.name, stream_id, chat, exc)
+            return False
+
     def _arm_keepalive(self, turn: StreamTurn, *, turn_id: Optional[str]) -> None:
         """Arm the keep-alive timer if enabled and not already armed (idempotent)."""
         if not self._stream_keepalive_enabled or turn.finalized or turn.expired or turn.keepalive_handle is not None:
@@ -382,6 +451,9 @@ class WeComStreamMixin:
         # A final frame identical to the last intermediate is silently dropped — differ via ZWSP.
         final_text = text + "\u200b" if text and text == turn.last_sent_content else text
         await self._send_stream_reply(turn.req_id, turn.stream_id, final_text, finish=True)
+        # fork 2026-11-16 (DPMS 561213): keep the sealed turn as the chat's overflow anchor —
+        # the run loop's overflow delivery continues this reply in further bubbles.
+        getattr(self, "_last_stream_turn_by_chat", {})[chat] = turn
         turn.finalized = True
         self._stream_turns.pop(f"{chat}:{turn_id or turn.req_id}", None)
         return True
