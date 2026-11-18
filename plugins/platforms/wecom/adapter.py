@@ -44,6 +44,8 @@ from gateway.platforms.send_targets import StandaloneSendPolicy, parse_nonempty
 from plugins.platforms.wecom.send_queue import ChatSendQueueMixin
 from plugins.platforms.wecom.learned_chats import LearnedChatsMixin
 from plugins.platforms.wecom.group_pending import GroupPendingMixin
+# fork 2026-11-18 (DPMS 561213): the content-keyed dedup of inbound re-deliveries.
+from plugins.platforms.wecom.inbound_dedup import WeComInboundDedupMixin
 from plugins.platforms.wecom.reply_lane import reply_lane
 from plugins.platforms.wecom.stream_delivery import overflow_indicator
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
@@ -177,7 +179,9 @@ def _overflow_bubble_body(part: Any) -> str:
 _OVERFLOW_MARKER_RE = re.compile("^（\\d+/\\d+）\\n")
 
 
-class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, LearnedChatsMixin, GroupPendingMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
+# fork 2026-11-18 (DPMS 561213): WeComInboundDedupMixin answers a re-delivered callback from the
+# reply already delivered instead of running the agent again.
+class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, LearnedChatsMixin, GroupPendingMixin, OwnAccessPolicyMixin, WeComInboundDedupMixin, BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
     ALLOW_ALL_ENV_PREFIX = "WECOM"
@@ -246,6 +250,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._pending_responses: dict[str, asyncio.Future] = {}
         self._reply_queues: dict[str, ReplyQueue] = {}
         self._dedup, self._reply_req_ids = MessageDeduplicator(max_size=DEDUP_MAX_SIZE), {}
+        # fork 2026-11-18 (DPMS 561213): the content-keyed dedup for the callbacks that carry no
+        # msgid (the platform's re-delivery shape) — see plugins/platforms/wecom/inbound_dedup.py.
+        self._init_content_dedup()
         # fork 2026-11-16 (DPMS 561213): chat -> its last sealed stream turn, the anchor an
         # overflow reply continues in follow-up bubbles (streaming.extend_stream_bubble).
         self._last_stream_turn_by_chat: dict[str, Any] = {}
@@ -1151,16 +1158,28 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         if not isinstance(body, dict):
             return
         req_id = self._payload_req_id(payload)
-        msg_id = str(body.get("msgid") or req_id or uuid.uuid4().hex)
         sender = _dict_or_empty(body, "from")
         sender_id = str(sender.get("userid") or "").strip()
-        if self._dedup.is_duplicate(msg_id):
+        chat_id = str(body.get("chatid") or sender_id).strip()
+        # fork 2026-11-18 (DPMS 561213): the dedup key of the inbound.
+        # A callback WITH a msgid keeps its msgid (the platform's own id — unchanged behaviour).
+        # A callback WITHOUT one (the platform's re-delivery shape, production hm-5958d932-1f3) is
+        # keyed by its CONTENT, so the re-delivery of ONE user message is recognisable as such
+        # instead of running the agent a second time for it.
+        raw_msgid = str(body.get("msgid") or "").strip()
+        msg_id = raw_msgid or str(req_id or uuid.uuid4().hex)
+        content_key = None if raw_msgid else self._content_key_for(body, sender_id, chat_id)
+        if content_key is not None:
+            if await self._handle_content_keyed_inbound(
+                content_key=content_key, msg_id=msg_id, chat_id=chat_id, sender_id=sender_id, req_id=req_id
+            ):
+                return
+        elif self._dedup.is_duplicate(msg_id):
             # INFO: a msgid redelivered after a processing exception is dropped for the TTL.
             logger.info("[%s] Duplicate message %s ignored (dedup drop) req_id=%s sender=%r chattype=%r", self.name, msg_id, req_id, sender.get("userid") if sender else None, body.get("chattype"))
             return
         if req_id:
             bounded_put(self._reply_req_ids, msg_id, req_id, DEDUP_MAX_SIZE)
-        chat_id = str(body.get("chatid") or sender_id).strip()
         logger.info("[%s] Inbound callback: chattype=%r chatid=%r sender=%r msgtype=%r has_chatid=%s", self.name, body.get("chattype"), body.get("chatid"), sender_id, body.get("msgtype"), bool(body.get("chatid")))
         if not chat_id:
             logger.info("[%s] Missing chat id, skipping message; body_keys=%s", self.name, list(body.keys()))
@@ -1747,6 +1766,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         force_proactive = bool(metadata.pop("force_proactive_send", False))
         # fork: a flushed pending entry must never re-stash on failure (redelivery loop guard).
         is_redelivery = bool(metadata.pop("is_redelivery", False))
+        # fork 2026-11-18 (DPMS 561213): an overflow bubble is a PART of a reply the stream already
+        # presented — that reply is already on file, and a fragment must not overwrite it.
+        is_reply_overflow = bool(metadata.pop("is_reply_overflow", False))
         # fork 2026-10-26 (batch 3): a cron queued delivery carries its execution id — a
         # parked redelivery that later succeeds corrects the settled-failed ledger row.
         execution_id = str(metadata.pop("execution_id", "") or "") or None
@@ -1762,7 +1784,15 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         # per-chat queue; the reply lane keeps this reply's sends from being overtaken by another
         # reply to the same chat, and letting queued overflow bubbles go first (see reply_lane.py).
         async with reply_lane(chat_id):
-            return await send_chunks(chunks, lambda chunk: self._send_reply_part(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=chunk_execution_id))
+            result = await send_chunks(chunks, lambda chunk: self._send_reply_part(chat_id, chunk, reply_to, force_proactive=force_proactive, is_control=is_control, is_redelivery=is_redelivery, execution_id=chunk_execution_id))
+        # fork 2026-11-18 (DPMS 561213): remember the reply that was delivered, so a re-delivery
+        # of the SAME inbound can be answered with this text instead of running the agent again.
+        # ``reply_to`` is the inbound's own message id (the gateway's reply anchor), so the reply
+        # is filed under its own message and never under another one's. A re-delivery's own send
+        # (is_redelivery) records nothing: its text is already on file under its key.
+        if result.success and not is_redelivery and not is_reply_overflow:
+            self._record_delivered_reply(chat_id, content, req_id=reply_to)
+        return result
 
     async def _send_reply_part(self, chat_id: str, content: str, reply_to: Optional[str], *, force_proactive: bool = False, is_control: bool = False, is_redelivery: bool = False, execution_id: Optional[str] = None) -> SendResult:
         """fork 2026-11-16 (DPMS 561213): one queued part of a reply — behind its overflow bubbles.
@@ -1814,7 +1844,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
                 body = _overflow_bubble_body(remaining)
                 marker = overflow_indicator(offset + 1, len(rest)) + "\n" if len(rest) > 1 else ""
                 for segment in self._markdown_segments(body) or [body]:
-                    await self.send(chat_id, marker + segment)
+                    # fork 2026-11-18 (DPMS 561213): is_reply_overflow — a bubble of a reply
+                    # already on file; never recorded, or the fragment would overwrite the full
+                    # reply the re-delivery replay waits for.
+                    await self.send(chat_id, marker + segment, metadata={"is_reply_overflow": True})
             return
 
     def _is_group_chat(self, chat_id: str) -> bool:

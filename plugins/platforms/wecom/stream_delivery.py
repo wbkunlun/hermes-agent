@@ -612,6 +612,9 @@ class WeComStreamDelivery:
             # The seal closes the bubble NOW (the gateway withholds the regular send for a claimed
             # reply, so nothing else would finish a stream left open); it claims the reply too.
             await self._close_bubble()
+            # fork 2026-11-18 (DPMS 561213): the sealed bubbles carry the whole reply — file it,
+            # so a re-delivery of the same inbound replays it instead of running the agent again.
+            self._record_delivered_reply()
             return
         # Set the flag ONLY when the finalize frame actually went through. The
         # adapter's Layer 2 clock fallback (stream age >= 330s, keep-alive off
@@ -626,6 +629,20 @@ class WeComStreamDelivery:
             # (attach_overflow) and sealed by the reply's close-out — or by a send of this reply,
             # which carries it first. Only the tail may be queued: the reply it drew is on screen.
             self._displayed_reply = self.accumulated_text
+            # fork 2026-11-18 (DPMS 561213): the bubble carries the reply — remember it, so a
+            # re-delivery of THIS inbound replays the same text instead of running the agent again.
+            self._record_delivered_reply()
+
+    def _record_delivered_reply(self) -> None:
+        """fork 2026-11-18 (DPMS 561213): tell the adapter what this bubble delivered.
+
+        The adapter files it under the content key of the inbound this reply answers, so a
+        re-delivery of that inbound replays this text instead of running the agent again. The
+        adapter resolves the key from the stream turn the reply was drawn in.
+        """
+        recorder = getattr(self.adapter, "_record_delivered_reply", None)
+        if callable(recorder):
+            recorder(self.chat_id, self.accumulated_text)
 
     async def flush_pending_overflow(self) -> None:
         """Seal the overflow bubbles this reply still has queued — the reply's ONE close-out door.
@@ -680,7 +697,10 @@ class WeComStreamDelivery:
                 _, body = _split_overflow_marker(body)
                 marker = overflow_indicator(left + 1, len(rest)) if len(rest) > 1 else ""
                 try:
-                    await adapter.send(chat, marker + body, metadata={"force_proactive_send": True})
+                    # fork 2026-11-18 (DPMS 561213): is_reply_overflow — a bubble of a reply
+                    # already on file; never recorded, or the fragment would overwrite the full
+                    # reply the re-delivery replay waits for.
+                    await adapter.send(chat, marker + body, metadata={"force_proactive_send": True, "is_reply_overflow": True})
                 except Exception as exc:
                     logger.warning("[wecom-stream] overflow fallback send failed for chat %s: %s", chat, exc)
             return

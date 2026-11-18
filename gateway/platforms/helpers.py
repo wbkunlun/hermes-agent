@@ -80,6 +80,21 @@ class MessageDeduplicator:
                 self._seen = dict(sorted(self._seen.items(), key=lambda item: item[1])[-self._max_size:])
         return False
 
+    def seen_at(self, msg_id: str) -> Optional[float]:
+        """fork 2026-11-18 (DPMS 561213): return when *msg_id* was FIRST seen, without registering it.
+
+        ``None`` when the id was never seen or its TTL has expired — an expired id is dropped
+        from the cache, exactly as ``is_duplicate`` treats it as new. The age of a key comes from
+        here, never from the key itself.
+        """
+        seen_at = self._seen.get(msg_id) if msg_id else None
+        if seen_at is None:
+            return None
+        if time.time() - seen_at < self._ttl:
+            return seen_at
+        del self._seen[msg_id]
+        return None
+
     def contains(self, msg_id: str) -> bool:
         """Return whether *msg_id* is live in the cache without inserting it."""
         seen_at = self._seen.get(msg_id) if msg_id else None
@@ -115,6 +130,12 @@ def carry_inbound_dedup(predecessor: Any, adapter: Any) -> None:
         current = getattr(adapter, name, None)
         if isinstance(previous, MessageDeduplicator) and isinstance(current, MessageDeduplicator) and current is not previous:
             current.absorb(previous)
+    # fork 2026-11-18 (DPMS 561213): an adapter may keep dedup state beside its MessageDeduplicator
+    # caches (WeCom's content-key maps) that this generic sweep cannot know about — give it the
+    # same hand-over chance ``hand_over_held_inbound`` gives held inbound.
+    carry = getattr(adapter, "carry_content_dedup_state", None)
+    if callable(carry):
+        carry(predecessor)
 
 
 def hand_over_held_inbound(source: Any, target: Any) -> None:
