@@ -82,12 +82,16 @@ class _FakeTransport(WeComStreamMixin, ChatSendQueueMixin):
         self._stream_keepalive_enabled = STREAM_KEEPALIVE_ENABLED_DEFAULT
         self._stream_safe_duration_seconds = STREAM_SAFE_DURATION_SECONDS
 
-    def __init__(self, *, refuse_bubble_at=None, finish_blows_up_at=None):
+    def __init__(self, *, refuse_bubble_at=None, finish_blows_up_at=None, drop_intermediate_at=None):
         self.refuse_bubble_at = refuse_bubble_at  # 1-based: this overflow bubble is refused
         self.bubble_refused = False
         self.bubbles_opened = 0
         self.bubble_finishes = 0
         self.finish_blows_up_at = finish_blows_up_at  # 1-based: this finish frame blows up
+        # fork 2026-11-18 (DPMS 561213): 1-based CONTENT frame (seed excluded) that never lands —
+        # the wire drops it; send_stream_frame still reports the stream alive.
+        self.drop_intermediate_at = drop_intermediate_at
+        self.intermediates_seen = 0
         self._stream_turns, self._stream_expired_chats, self._last_stream_turn_by_chat = {}, set(), {}
         self._last_chat_req_ids = {}
         self._chat_queues, self._chat_workers = {}, {}
@@ -166,6 +170,10 @@ class _FakeAdapter(_SealSurface):
 
     async def send_stream_frame(self, text, *, finalize=False, chat_id=None, **kw):
         return await self.transport.send_stream_frame(text, finalize=finalize, chat_id=chat_id)
+
+    def last_landed_stream_frame_content(self, chat_id):
+        # fork 2026-11-18 (DPMS 561213): the durability probe, forwarded to the wire.
+        return self.transport.last_landed_stream_frame_content(chat_id)
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         return await self.transport.send(chat_id, content)
@@ -312,6 +320,10 @@ async def _answer_frame(transport, stream_id, content, finish):
         transport._record("bubble-closed", content)
         return {"errcode": 0}
     if not finish:
+        if content != "<think></think>":  # the seed is not a content frame
+            transport.intermediates_seen += 1
+            if transport.drop_intermediate_at == transport.intermediates_seen:
+                raise RuntimeError("transport dropped this intermediate frame — the bytes never landed")
         transport.opened_streams.add(stream_id)
         transport._record("frame", content)
         return {"errcode": 0}

@@ -283,6 +283,12 @@ class WeComStreamDelivery:
         # A send of this reply carries the bubbles queued BEFORE it (adapter._send_reply_part);
         # whatever a send queues after it is the reply's close-out flush (run()).
         self._overflow_owned = False
+        # fork 2026-11-18 (DPMS 561213): the answer text a frame actually LANDED on screen — the
+        # cumulative progressive draws (intermediate push / final frame / sealed head), snapshotted
+        # at display-build so deltas arriving mid-send never count before they show. The gateway's
+        # final-send suppression consults it (has_durably_delivered_text): a bubble that drew the
+        # whole answer must never be followed by the same answer as a second message.
+        self._durable_text = ""
 
 
     # ------------------------------------------------------------------
@@ -356,6 +362,32 @@ class WeComStreamDelivery:
             return parts
         # Not claimed: no bubble was sealed short, so nothing is owed beyond what is on screen —
         # only a final frame that normally drew the whole reply leaves nothing to queue here.
+        # fork 2026-11-18 (DPMS 561213): except when the bubble drew the answer progressively and
+        # the finalize frame never landed (queue-budget decline, stream expiry, wire error, flush
+        # cancel). What the bubble already shows must not go out again inside the regular send's
+        # full text: only the part past the drawn snapshot is queued as this reply's continuation,
+        # and the reply is CLAIMED so the gateway's regular send — which would repeat the drawn
+        # part — stands cancelled (production hm-5958d932-1f3: 1190 chars on screen, then
+        # "Sending response (1190 chars)" again 14s later).
+        if not self._delivery_claimed and self._durable_text and not self._displayed_reply:
+            shown = self._durable_text
+            if _norm_for_match(body) == _norm_for_match(shown):
+                # Every character the hand-over carries is already in the bubble — queue nothing.
+                # The gateway's own suppression (has_durably_delivered_text) cancels the send.
+                logger.info("[wecom-stream] finalize_decision=bubble_shows_all_no_overflow body_len=%d — nothing to queue, regular send suppressed by the gateway", len(body))
+                return []
+            if body.startswith(shown):
+                fresh = body[len(shown):].lstrip("\n")
+                if not fresh.strip():
+                    logger.info("[wecom-stream] finalize_decision=bubble_shows_all_no_overflow body_len=%d — nothing to queue, regular send suppressed by the gateway", len(body))
+                    return []
+                parts = self._frame_overflow_reply(fresh, head="")
+                self._delivery_claimed = True  # the send of the drawn part would be a duplicate
+                self._overflow_queued_for = body
+                logger.info("[wecom-stream] finalize_decision=remainder_as_overflow drawn_len=%d body_len=%d bubbles=%d — regular send cancelled", len(shown), len(body), len(parts))
+                return parts
+            # The hand-over is not what the bubble drew (transformed reply): fall through — the
+            # legacy branches below deliver it as the regular send's own copy plus a tail.
         if body == self._displayed_reply:
             return []
         transformed = bool(body) and body != self.overflow_text
@@ -396,6 +428,21 @@ class WeComStreamDelivery:
             return None
         shown = f"{self.overflow_body}\n\n{self.overflow_tail}" if self.overflow_tail else self.overflow_body
         return _norm_for_match(shown) == _norm_for_match(final_text)
+
+    def has_durably_delivered_text(self, final_text: str) -> bool:
+        """fork 2026-11-18 (DPMS 561213): the gateway stream-consumer contract — is *final_text*
+        already on screen whole? WeCom frames are cumulative, so the last landed frame drew every
+        answer character up to its snapshot; equality (or the final being a subset of it) answers
+        "delivered". A partial draw answers False: the remainder is attach_overflow's to deliver
+        (queue the continuation + claim), and the regular send stays the safety net should that
+        hand-over fail — a prefix must never suppress and then lose the tail.
+
+        The upstream GatewayStreamConsumer got this hook for the failed-finalize family
+        (#51828 / #33793); without it every finalize decline/expiry/wire error re-sent what the
+        bubble had progressively drawn (production hm-5958d932-1f3: 1190 chars, twice)."""
+        wanted = _norm_for_match(final_text or "")
+        shown = _norm_for_match(self._durable_text)
+        return bool(wanted) and bool(shown) and (shown == wanted or wanted in shown)
 
     def detach_overflow(self) -> None:
         """fork 2026-11-16 (DPMS 561213): the regular send takes over — the overflow delivery gives up.
@@ -567,9 +614,12 @@ class WeComStreamDelivery:
 
             # Throttle elapsed — push the latest display if it changed.
             if time.monotonic() - self.last_push_time >= STREAM_THROTTLE_INTERVAL:
-                display = self._display()
+                # fork 2026-11-18 (DPMS 561213): snapshot the answer the display is built from; a
+                # landed frame makes exactly that snapshot durable (see _push_intermediate).
+                answer = self.accumulated_text
+                display = self._display(answer=answer)
                 if display != self.last_pushed_display:
-                    await self._push_intermediate(display)
+                    await self._push_intermediate(display, answer)
 
     def _drain_done(self) -> bool:
         """Drain all queued signals; return True if a finish signal was seen."""
@@ -591,10 +641,14 @@ class WeComStreamDelivery:
         # fork 2026-11-16 (DPMS 561213): the overflow bubbles carry what the regular send would
         # (the gateway's final response, segments and footer included), so a long reply stays ONE
         # channel with nothing sent twice.
-        self._overflow_full = self.overflow_text = self.accumulated_text
+        # fork 2026-11-18 (DPMS 561213): snapshot BEFORE building the display — every "what did
+        # the final frame draw" record (overflow anchor, displayed reply, durable text) describes
+        # the snapshot, never the accumulated text deltas that land while the frame is on the wire.
+        answer = self.accumulated_text
+        self._overflow_full = self.overflow_text = answer
         if not self._error_mode:
             self.thinking_lines.append("✨ 回复完成")
-        display = self._display(finished=True, fold_think=True)
+        display = self._display(finished=True, fold_think=True, answer=answer)
         # fork 2026-09-30 (audit 2026-09-29 module-2 H4): if even the folded display exceeds the
         # frame budget the adapter byte-truncates it (keep-head) and marking the turn
         # delivered would silently lose the tail.
@@ -611,7 +665,9 @@ class WeComStreamDelivery:
             )
             # The seal closes the bubble NOW (the gateway withholds the regular send for a claimed
             # reply, so nothing else would finish a stream left open); it claims the reply too.
-            await self._close_bubble()
+            sealed = await self._close_bubble()
+            if sealed is None:
+                logger.info("[wecom-stream] finalize_decision=seal_failed_unclaimed chars=%d — no seal frame landed; the gateway's regular send remains the fallback", size)
             # fork 2026-11-18 (DPMS 561213): the sealed bubbles carry the whole reply — file it,
             # so a re-delivery of the same inbound replays it instead of running the agent again.
             self._record_delivered_reply()
@@ -628,10 +684,18 @@ class WeComStreamDelivery:
             # it cannot render goes out as one follow-up bubble, queued by the gateway's hand-over
             # (attach_overflow) and sealed by the reply's close-out — or by a send of this reply,
             # which carries it first. Only the tail may be queued: the reply it drew is on screen.
-            self._displayed_reply = self.accumulated_text
+            self._displayed_reply = answer
             # fork 2026-11-18 (DPMS 561213): the bubble carries the reply — remember it, so a
             # re-delivery of THIS inbound replays the same text instead of running the agent again.
+            self._durable_text = answer
             self._record_delivered_reply()
+            logger.info("[wecom-stream] finalize_decision=final_frame_delivered chars=%d", len(display))
+        else:
+            # fork 2026-11-18 (DPMS 561213): the finish frame did not land (decline / expiry /
+            # wire error) but the progressive frames may already have drawn the whole answer —
+            # the gateway decides from what is durably on screen (has_durably_delivered_text),
+            # never blindly re-sends.
+            logger.info("[wecom-stream] finalize_decision=final_frame_not_delivered chars=%d durable_chars=%d", len(display), len(self._durable_text))
 
     def _record_delivered_reply(self) -> None:
         """fork 2026-11-18 (DPMS 561213): tell the adapter what this bubble delivered.
@@ -748,6 +812,9 @@ class WeComStreamDelivery:
                 # display budget, whose line-break preference may cut a line earlier (drawn twice).
                 self._set_sealed_source(self.accumulated_text[len(head):])
                 self._claim_delivery()
+                # fork 2026-11-18 (DPMS 561213): the seal frame LANDED with the head — exactly the
+                # head is on screen (the continuation owes the rest).
+                self._durable_text = head
                 return True
         if await self._send_frame(_OVERFLOW_SEAL, finish=True):
             logger.info("[wecom-stream] bubble sealed without content; the full reply follows in overflow bubbles")
@@ -792,7 +859,7 @@ class WeComStreamDelivery:
         self.overflow_parts.extend(framed)
         return framed
 
-    async def _push_intermediate(self, display: str) -> None:
+    async def _push_intermediate(self, display: str, answer: Optional[str] = None) -> None:
         """Send an intermediate frame (open/updated bubble) with the running indicator."""
         if self._disabled:
             return
@@ -801,6 +868,23 @@ class WeComStreamDelivery:
             # Only record on success so a failed frame is retried on the next
             # tick (the adapter's next cumulative frame overwrites it anyway).
             self.last_pushed_display = display
+            # fork 2026-11-18 (DPMS 561213): the frame LANDED — the answer it drew is on screen
+            # whole (frames are cumulative), which is what the gateway's final-send suppression
+            # reads (has_durably_delivered_text). Snapshot, never live accumulated text: deltas
+            # arriving while this frame was on the wire are the NEXT frame's durability.
+            # send_stream_frame returns True for a dropped intermediate as well (a wire error
+            # keeps the stream alive), so the record is confirmed against the turn's actual
+            # last-landed content: a dropped frame leaves durability at the last landed frame
+            # and the finalize hand-over covers the difference — it must never overcount.
+            landed = getattr(self.adapter, "last_landed_stream_frame_content", None)
+            if landed is not None and landed(self.chat_id) != text:
+                logger.info(
+                    "[wecom-stream] finalize_decision=frame_dropped_not_durable chat=%s drawn_chars=%d — the send was dropped by the adapter, durability stays at the last landed frame",
+                    self.chat_id,
+                    len(answer if answer is not None else self.accumulated_text),
+                )
+            else:
+                self._durable_text = self.accumulated_text if answer is None else answer
         self.last_push_time = time.monotonic()
 
     async def _send_frame(self, text: str, finish: bool) -> bool:
@@ -842,12 +926,15 @@ class WeComStreamDelivery:
     # ------------------------------------------------------------------
     # Display helper
     # ------------------------------------------------------------------
-    def _display(self, finished: bool = False, fold_think: bool = False) -> str:
+    def _display(self, finished: bool = False, fold_think: bool = False, answer: Optional[str] = None) -> str:
+        # fork 2026-11-18 (DPMS 561213): *answer* pins the reply text the display is built from —
+        # the caller snapshots it before building so the frame it sends and the durability record
+        # describe the same characters (deltas landing mid-send belong to the NEXT frame).
         return _build_display_content(
             self.thinking_lines,
             self.thinking_buf,
             self.chat_record_url,
-            self.accumulated_text,
+            self.accumulated_text if answer is None else answer,
             finished=finished,
             fold_think=fold_think,
         )

@@ -1875,7 +1875,22 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
             if reply_req_id:
                 try:
                     response = await self._send_reply_markdown(reply_req_id, content)
-                except (TimeoutError, RuntimeError) as passive_err:
+                except TimeoutError:
+                    # fork 2026-11-18 (DPMS 561213): TimeoutError here is ONLY the ack wait
+                    # (_send_reply_correlated raises past asyncio.wait_for AFTER _send_json put
+                    # the bytes on the wire) — WeCom rendered the reply and the ack is merely
+                    # late/never (official late-ack semantics; the stream final already treats
+                    # it as delivered, streaming._send_reply_queued). A proactive fallback
+                    # re-send would be the same reply a SECOND time (14 historical "Passive
+                    # reply failed ()" DMs). Report delivered-assumed; a real loss is the
+                    # redelivery ledger's to catch. RuntimeError (an errcode refusal —
+                    # 846604/846608 expired, nothing delivered) keeps the fallback below.
+                    logger.warning(
+                        "[%s] Passive reply ack timeout (chat=%s req_id=%s) — bytes already sent, treating as delivered (no proactive fallback)",
+                        self.name, chat_id, reply_req_id,
+                    )
+                    return SendResult(success=True, message_id=uuid.uuid4().hex[:12], raw_response={"errcode": 0, "errmsg": "ack_timeout_assumed_delivered", "ack_pending": True})
+                except RuntimeError as passive_err:
                     if is_group_chat:
                         # fork 2026-10-06: passive reply died (stale req_id after a resubscribe) — the
                         # official aibot_send_msg delivers to groups too (chat_type=2); try it, then park.

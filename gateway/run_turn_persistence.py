@@ -686,19 +686,29 @@ class GatewayTurnPersistenceMixin:
                     detach = getattr(consumer, "detach_overflow", None)
                     if callable(detach):
                         detach()
+                    logger.info(
+                        "finalize_decision=wecom_overflow_detached_other_transport chat=%s — regular send delivers (another bot answers this chat)",
+                        getattr(source, "chat_id", "") or "?",
+                    )
                     if not intentional_silence and footer_line:
                         response = f"{response}\n\n{footer_line}" if response else footer_line
                     return
             body = str(response or "")
             if not intentional_silence and footer_line and body:
                 body = f"{body}\n\n{footer_line}"
-            consumer.attach_overflow(body)
+            queued = consumer.attach_overflow(body)
             # The reply's close-out: a hand-over that lands after the consumer's run loop (a late
             # final payload) leaves bubbles no send will carry — they go out here, in order. When
             # the run loop is still going it seals them itself before the gateway's own sends.
             flush = getattr(consumer, "flush_pending_overflow", None)
             if callable(flush):
                 await flush()
+            # fork 2026-11-18 (DPMS 561213): the attach outcome is the decisive point of the
+            # delivery — what was queued, and whether the regular send stands cancelled.
+            logger.info(
+                "finalize_decision=wecom_overflow_attached chat=%s body_len=%d bubbles=%d claimed=%s",
+                getattr(source, "chat_id", "") or "?", len(body), len(queued), consumer.delivery_claimed,
+            )
             if consumer.delivery_claimed:  # published by WeComStreamDelivery.attach_overflow
                 # Same outcome as the streamed-final branch: the body is on screen, the regular
                 # send is what would duplicate it.
@@ -747,10 +757,22 @@ class GatewayTurnPersistenceMixin:
         # fork 2026-11-16 (DPMS 561213): a WeCom reply delivered as overflow bubbles carries its
         # own MEDIA: tail — a media re-scan or a regular send here would duplicate it.
         if _wecom_overflow_claimed(_published_stream_consumer()):
+            logger.info(
+                "finalize_decision=deliver_skip_overflow_claimed session=%s — bubbles carry the reply",
+                session_entry.session_id,
+            )
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
             return None
         if agent_result.get("already_sent") and not agent_result.get("failed"):
+            # fork 2026-11-18 (DPMS 561213): the streamed final was confirmed delivered — the body
+            # never goes out; only the media re-scan, the uncertain ledger and the held-back footer.
+            logger.info(
+                "finalize_decision=deliver_skip_already_sent session=%s chars=%d (media_rescan=%s footer=%s)",
+                session_entry.session_id, len(str(response or "")),
+                bool(response and adapter and not agent_result.get("media_already_delivered")),
+                bool(_footer_line and adapter and not _intentional_silence),
+            )
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):
@@ -769,6 +791,12 @@ class GatewayTurnPersistenceMixin:
                 event._streamed_final_response = str(response or "")
             return None
 
+        # fork 2026-11-18 (DPMS 561213): nothing claimed or confirmed — this response goes out as
+        # the regular send ("[Wecom] Sending response (N chars)" follows it).
+        logger.info(
+            "finalize_decision=deliver_normal_send session=%s chars=%d",
+            session_entry.session_id, len(str(response or "")),
+        )
         return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own

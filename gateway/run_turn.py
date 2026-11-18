@@ -1983,7 +1983,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             return
         _sk = session_key or "?"
         if not _transformed and (_streamed or _content_delivered):
-            logger.info("Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).", _sk, _streamed, _previewed, _content_delivered)
+            logger.info("finalize_decision=suppress_streamed_delivery for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).", _sk, _streamed, _previewed, _content_delivered)
             # A stream send counted as shown on a timeout may be lost: the ledger resends it marked.
             response["already_sent"], response["delivery_uncertain"] = True, getattr(_sc, "delivery_uncertain", False) is True
         elif not _transformed and _stale_finalized and _sc is not None:
@@ -1992,10 +1992,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _sc_msg_id = _sc.message_id
             if getattr(_sc, "_turn_split_delivery", False):
                 logger.info(
-                    "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
+                    "finalize_decision=stale_split_normal_send for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
                     _sk,
                 )
             elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
+                logger.info("finalize_decision=stale_reconcile_edit for session %s (message_id=%s).", _sk, _sc_msg_id)
                 await edit_streamed_message(
                     _sc, source, response, _final, sk=_sk,
                     ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
@@ -2004,11 +2005,12 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 )
             else:
                 logger.info(
-                    "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
+                    "finalize_decision=stale_no_edit_normal_send for session %s with no editable message; delivering complete response via normal final send (#71643).",
                     _sk,
                 )
         elif _transformed and _sc is not None:
             # Transformed after streaming: edit the streamed message instead of sending a duplicate.
+            logger.info("finalize_decision=transformed_reconcile_edit for session %s (message_id=%s).", _sk, _sc.message_id)
             if _sc.message_id:
                 await edit_streamed_message(
                     _sc, source, response, response["final_response"], sk=_sk,
@@ -2019,6 +2021,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         elif not _transformed and owns_reconcilable_preview(_sc, getattr(source, "chat_id", ""), _final):
             # Unconfirmed final, one real preview on screen (a flood-frozen bubble, a cancelled
             # consumer): finish it in place; a plain final send would post the answer twice.
+            logger.info("finalize_decision=preview_edit_in_place for session %s.", _sk)
             await edit_streamed_message(
                 _sc, source, response, _sc._clean_for_display(_final), sk=_sk,
                 ok=("Finished streamed preview %s in place for session %s (final not confirmed).", _sc.message_id, _sk),
@@ -2037,18 +2040,33 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # demote the rest to INFO.
             if _final_send_duplicate_risk(_sc):
                 logger.warning(
-                    "Normal final-send NOT suppressed despite active stream consumer for session %s: "
+                    "finalize_decision=normal_send_duplicate_risk for session %s: "
                     "streamed=%s previewed=%s content_delivered=%s transformed=%s final_len=%d — "
                     "possible duplicate send (see wecom ack-timeout RCA).",
                     _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
                 )
             else:
                 logger.info(
-                    "Normal final send for session %s after an idle stream consumer "
+                    "finalize_decision=normal_send_idle_consumer for session %s "
                     "(nothing delivered through it: streamed=%s previewed=%s content_delivered=%s "
                     "transformed=%s final_len=%d) — no duplicate risk.",
                     _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
                 )
+        elif _sc is not None:
+            # fork 2026-11-18 (DPMS 561213): interim-only wiring (#105341) — the consumer never
+            # carried the final's deltas, so it cannot have raced the normal send.
+            logger.info(
+                "finalize_decision=normal_send_interim_only_consumer for session %s (final_len=%d).",
+                _sk, len(_final),
+            )
+        else:
+            # fork 2026-11-18 (DPMS 561213): no stream consumer at all — the regular send is the
+            # only delivery. This was silent before: the production 14s finalize window had no
+            # decision trail from "response ready" to "[Wecom] Sending response".
+            logger.info(
+                "finalize_decision=normal_send_no_consumer for session %s (final_len=%d).",
+                _sk, len(_final),
+            )
 
     def _run_agent_bind_turn_wiring(
         self, turn_ctx: TurnContext, turn_runner: TurnRunner, source: SessionSource,

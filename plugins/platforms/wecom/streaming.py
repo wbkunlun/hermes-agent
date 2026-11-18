@@ -277,6 +277,15 @@ class WeComStreamMixin:
     def _find_active_turn_for_chat(self, chat_id: str) -> Optional[StreamTurn]:
         return next((t for t in self._stream_turns.values() if t.chat_id == chat_id and not t.finalized), None)
 
+    def last_landed_stream_frame_content(self, chat_id: str) -> str:
+        """fork 2026-11-18 (DPMS 561213): what the chat's active stream turn last actually LANDED
+        on the wire, or "" when no live turn exists. ``send_stream_frame`` returns True for a
+        dropped intermediate too (a wire error keeps the stream alive), so a consumer's
+        durability bookkeeping — what the bubble provably shows the user — reads this instead of
+        trusting the return value; ``last_sent_content`` is set only after a frame went out."""
+        turn = self._find_active_turn_for_chat(chat_id)
+        return turn.last_sent_content if turn is not None else ""
+
     def _find_overflow_anchor(self, chat_id: str) -> Optional[StreamTurn]:
         """fork 2026-11-16 (DPMS 561213): the turn an overflow bubble may continue — the chat's
         sealed turn whose req_id is still the latest inbound, else a live unfinalized turn."""
@@ -430,9 +439,15 @@ class WeComStreamMixin:
                 timeout=self._FINALIZE_QUEUE_WAIT_SECONDS,
             )
         except TimeoutError:
+            # fork 2026-11-18 (DPMS 561213): the finish frame never left the queue — but the
+            # progressive frames may already have drawn the whole answer in the bubble. The
+            # gateway decides from what is durably on screen (has_durably_delivered_text):
+            # fully drawn → the regular send is suppressed; partially drawn → only the
+            # remainder goes out. "The regular send delivers the reply" is no longer the
+            # contract — re-sending what the bubble shows is the duplicate this fork fixes.
             logger.info(
-                "[%s] finalize frame queued >%.0fs for chat %s — declining; gateway regular send delivers the reply exactly once",
-                self.name, self._FINALIZE_QUEUE_WAIT_SECONDS, chat,
+                "[%s] finalize_decision=finalize_queue_decline chat=%s wait>%.0fs — finish frame not sent; gateway suppresses/trim the regular send from what the bubble durably drew",
+                self.name, chat, self._FINALIZE_QUEUE_WAIT_SECONDS,
             )
             return False
 
