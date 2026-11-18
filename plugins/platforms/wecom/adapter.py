@@ -50,9 +50,10 @@ from plugins.platforms.wecom.reply_lane import reply_lane
 from plugins.platforms.wecom.stream_delivery import overflow_indicator
 from plugins.platforms.wecom.media import WeComMediaMixin, APP_CMD_SEND
 from plugins.platforms.wecom.streaming import (
-    WeComStreamMixin, ReplyQueue, StreamTurn, APP_CMD_RESPONSE,
+    WeComStreamMixin, ReplyQueue, StreamTurn, PendingStreamSeed, APP_CMD_RESPONSE,
     STREAM_NOT_SUBSCRIBED_ERRCODE, MAX_STREAM_CONTENT_LENGTH,
     STREAM_SAFE_DURATION_SECONDS, STREAM_KEEPALIVE_INTERVAL_SECONDS, STREAM_KEEPALIVE_ENABLED_DEFAULT,
+    STREAM_EARLY_ACK_ENABLED_DEFAULT,
 )
 
 
@@ -332,12 +333,18 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, Learne
         self._stream_safe_duration_seconds = _extra_float("stream_safe_duration_seconds", STREAM_SAFE_DURATION_SECONDS)
         self._stream_keepalive_enabled = bool(extra.get("stream_keepalive_enabled", STREAM_KEEPALIVE_ENABLED_DEFAULT))
         self._stream_keepalive_interval_seconds = _extra_float("stream_keepalive_interval_seconds", STREAM_KEEPALIVE_INTERVAL_SECONDS)
+        # fork 2026-11-18 (DPMS 561213): send_typing seeds the turn's reply flow at acceptance —
+        # the earliest answer a WS callback can get (off by default, like the keep-alive).
+        self._stream_early_ack_enabled = bool(extra.get("stream_early_ack_enabled", STREAM_EARLY_ACK_ENABLED_DEFAULT))
         # fork: stable device id across restarts (WECOM_DEVICE_ID) keeps the subscription
         # identity — a fresh random hex per boot can trigger server-side session churn.
         self._device_id = os.getenv("WECOM_DEVICE_ID") or uuid.uuid4().hex
         self._last_chat_req_ids: dict[str, str] = {}
         # Turns keyed f"{chat_id}:{req_id|turn_id}"; expired chats clear on the next inbound req_id.
         self._stream_turns: dict[str, StreamTurn] = {}
+        # fork 2026-11-18 (DPMS 561213): chat -> its send_typing seed awaiting the turn's
+        # StreamTurn (streaming.py); bounded by the chat count, cleared at the chat's next inbound.
+        self._pending_stream_seeds: dict[str, PendingStreamSeed] = {}
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups: passive reply first, proactive aibot_send_msg fallback (fork 2026-10-06)
         # fork: (enqueue_time, content) lists per group chat awaiting the next inbound req_id.
         # The learned classification persists to wecom_learned_chats.json (fork 2026-10-08, see

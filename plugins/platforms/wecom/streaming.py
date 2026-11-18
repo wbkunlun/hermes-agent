@@ -32,6 +32,14 @@ MAX_INTERMEDIATE_FRAMES = 85
 STREAM_SAFE_DURATION_SECONDS = 330.0
 STREAM_KEEPALIVE_INTERVAL_SECONDS = 120.0
 STREAM_KEEPALIVE_ENABLED_DEFAULT = False
+# fork 2026-11-18 (DPMS 561213): with this on, ``send_typing`` opens the chat's reply flow at turn
+# acceptance — an invisible <think></think> respond frame on the inbound req_id. A respond frame is
+# the ONLY answer the WS aibot vocabulary can give a callback (there is no ack-only frame), so this
+# is the earliest possible answer: the platform's re-delivery clock sees the callback answered
+# before the model's first token, instead of at the consumer's first output. Off by default like
+# the keep-alive: the consumer's own seed at first output is the previous behaviour, and one extra
+# frame per turn is a deliberate choice.
+STREAM_EARLY_ACK_ENABLED_DEFAULT = False
 
 
 class WeComStreamExpiredError(RuntimeError):
@@ -76,6 +84,24 @@ class StreamTurn:
         # turn's intermediates/finalize always address stream_id.
         self.continuation: int = 0
         self.keepalive_handle: Optional[asyncio.TimerHandle] = None  # cancel on EVERY turn-exit path
+
+
+@dataclass
+class PendingStreamSeed:
+    """fork 2026-11-18 (DPMS 561213): the chat's ``send_typing`` seed until a StreamTurn adopts it.
+
+    The seed IS a respond frame on the inbound req_id (the early callback ack), so the slot holds
+    what the eventual StreamTurn must inherit to keep ONE bubble per turn: the req_id and the
+    stream_id the seed went out on. ``state`` moves one way: ``pending`` → ``adopted`` (the turn's
+    StreamTurn took the stream over) or ``sealed`` (no turn ever came; the thinking bubble was
+    closed with an empty finish frame). An adopted slot STAYS in the registry as the turn's
+    one-seed-per-turn latch — it clears when the chat's NEXT inbound starts a new turn."""
+    chat_id: str
+    req_id: str
+    stream_id: str
+    created_at: float  # time.monotonic() domain, like StreamTurn.start_time
+    seal_handle: Optional[asyncio.TimerHandle] = None  # the orphan seal; cancelled on adoption
+    state: str = "pending"
 
 
 def _stream_of(body: dict[str, Any]) -> dict[str, Any]:
@@ -429,7 +455,13 @@ class WeComStreamMixin:
             logger.debug("[%s] send_stream_frame: " + why, self.name, chat, suffix)
             return None
         key = f"{chat}:{turn_id or req_id}"
-        turn = (None if turn_id else self._stream_turns.get(key)) or StreamTurn(chat, req_id)
+        turn = None if turn_id else self._stream_turns.get(key)
+        if turn is None:
+            turn = StreamTurn(chat, req_id)
+            # fork 2026-11-18 (DPMS 561213): the turn the seed was waiting for — it inherits the
+            # seed's stream (ONE bubble for the whole turn) and its seeded flag, so the inner
+            # path sends no second <think></think> (a double seed is errcode 6000).
+            self._adopt_pending_stream_seed(turn, chat, req_id, turn_id)
         self._stream_turns[key] = turn
         logger.debug("[%s] send_stream_frame: created new turn %s (%s) for chat %s", self.name, turn.stream_id, f"turn_id={turn_id}, req_id={req_id}" if turn_id else f"req_id={req_id}", chat)
         return turn
@@ -505,6 +537,143 @@ class WeComStreamMixin:
         del chat_type, metadata
         return True
 
+    # ------------------------------------------------------------------
+    # The pending seed slot (fork 2026-11-18, DPMS 561213)
+    # ------------------------------------------------------------------
+    # send_typing opens the turn's reply flow with an invisible <think></think> seed (the early
+    # callback ack); the slot below holds what the turn's StreamTurn must inherit until it is
+    # created — and what gets sealed when no turn ever comes.
+
+    def _adopt_pending_stream_seed(self, turn: StreamTurn, chat: str, req_id: str, turn_id: Optional[str]) -> None:
+        """A fresh StreamTurn takes over the chat's typing seed: same stream, no second seed."""
+        slots = getattr(self, "_pending_stream_seeds", None)
+        if not isinstance(slots, dict):
+            return  # a bare stream mixin (no adapter init) has no seed registry: nothing to adopt
+        slot = slots.get(chat)
+        if slot is None or slot.state != "pending" or slot.req_id != req_id:
+            return
+        if time.monotonic() - slot.created_at > self._stream_keepalive_interval_seconds:
+            return  # stale: its seal either fired already or is about to
+        if slot.seal_handle is not None:
+            try:
+                slot.seal_handle.cancel()
+            except Exception:
+                pass
+            slot.seal_handle = None
+        slot.state = "adopted"  # stays as the latch: ONE seed per turn until the chat's next inbound
+        turn.stream_id = slot.stream_id
+        turn.seeded = True  # the <think></think> is already out — a second one is a 6000 double seed
+        # The consumer path arms the keep-alive when it seeds; adoption replaces that seed, so it
+        # arms here (idempotent, and a no-op while the keep-alive is disabled).
+        self._arm_keepalive(turn, turn_id=turn_id)
+        logger.debug("[%s] send_typing seed %s adopted by the turn of chat %s", self.name, slot.stream_id, chat)
+
+    def _clear_pending_stream_seed(self, chat_id: str) -> None:
+        """Drop the chat's seed slot: a newer inbound supersedes it, or the seed never landed."""
+        slots = getattr(self, "_pending_stream_seeds", None)
+        if not isinstance(slots, dict):
+            return
+        slot = slots.pop(chat_id, None)
+        if slot is not None and slot.seal_handle is not None:
+            try:
+                slot.seal_handle.cancel()
+            except Exception:
+                pass
+
+    def _arm_pending_seed_seal(self, slot: PendingStreamSeed) -> None:
+        """An un-adopted seed closes at the first keep-alive interval (an empty finish frame, the
+        ``_close_empty_native_bubble`` precedent): a turn that never streams leaves no orphan
+        “thinking” bubble behind."""
+        try:
+            slot.seal_handle = asyncio.get_running_loop().call_later(
+                self._stream_keepalive_interval_seconds, self._on_pending_seed_seal_fire, slot.chat_id
+            )
+        except RuntimeError:
+            pass  # no running loop — nothing can keep the adapter alive past this call anyway
+
+    def _on_pending_seed_seal_fire(self, chat_id: str) -> None:
+        slot = self._pending_stream_seeds.get(chat_id)
+        if slot is not None:
+            slot.seal_handle = None
+        if slot is None or slot.state != "pending":
+            return  # adopted while the timer lagged: the bubble belongs to the turn now
+        try:
+            asyncio.ensure_future(self._seal_pending_stream_seed(chat_id))
+        except RuntimeError:
+            pass
+
+    async def _seal_pending_stream_seed(self, chat_id: str) -> None:
+        """Close an un-adopted seed's bubble with an empty finish frame; the slot is spent."""
+        slot = self._pending_stream_seeds.get(chat_id)
+        if slot is None or slot.state != "pending":
+            return
+        # Before the await: an adoption racing this seal must never take a finished stream.
+        slot.state = "sealed"
+        try:
+            # A finish frame rides the control lane like every finalize (order before the next reply).
+            await asyncio.wait_for(
+                self._enqueue_chat_send(
+                    chat_id,
+                    lambda: self._send_stream_reply(slot.req_id, slot.stream_id, "", finish=True),
+                    is_control=True,
+                ),
+                timeout=self._FINALIZE_QUEUE_WAIT_SECONDS,
+            )
+            logger.debug("[%s] Sealed the un-adopted typing seed of chat %s (stream %s)", self.name, chat_id, slot.stream_id)
+        except WeComStreamExpiredError:
+            logger.info("[%s] Pending seed seal for chat %s: stream already expired — bubble is gone server-side", self.name, chat_id)
+        except TimeoutError:
+            logger.info("[%s] Pending seed seal queued >%.0fs for chat %s — giving up (best-effort close)", self.name, self._FINALIZE_QUEUE_WAIT_SECONDS, chat_id)
+        except Exception as exc:
+            logger.info("[%s] Pending seed seal failed for chat %s: %s", self.name, chat_id, exc)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """No-op: the stream consumer's seed frame triggers WeCom typing; repeated calls would open orphan streams."""
-        del chat_id, metadata
+        """fork 2026-11-18 (DPMS 561213): with ``stream_early_ack_enabled``, the chat's FIRST typing
+        call of a turn opens the reply flow — an invisible ``<think></think>`` seed on the chat's
+        inbound req_id. A respond frame is the only answer the WS aibot vocabulary can give a
+        callback (there is no ack-only frame; ping→pong answers pings only), and the gateway types
+        at EVERY turn start (``base._keep_typing`` → here) long before the stream consumer seeds —
+        so the platform's re-delivery clock sees the callback answered at turn acceptance, not at
+        the model's first token. ONE seed per turn: the slot is adopted by the turn's StreamTurn
+        (same bubble), or sealed with an empty finish frame at the first keep-alive interval.
+        Heartbeat turns never reach here (``base._start_typing_refresh`` excludes them). Off by
+        default: the consumer's own seed at first output keeps serving — the previous behaviour."""
+        del metadata
+        if not getattr(self, "_stream_early_ack_enabled", False):
+            return  # the legacy no-op: typing is handled by the stream consumer's seed
+        chat = (chat_id or "").strip()
+        if not chat:
+            return
+        try:
+            current_req_id = self._resolve_stream_req_id(chat, None)
+            slot = self._pending_stream_seeds.get(chat)
+            if slot is not None and current_req_id:
+                if slot.req_id == current_req_id:
+                    return  # this turn already holds a seed (pending, adopted, or sealed)
+                self._clear_pending_stream_seed(chat)  # a newer inbound: its turn seeds afresh
+            if not current_req_id or chat in self._stream_expired_chats:
+                return
+            if self._find_active_turn_for_chat(chat) is not None:
+                return  # busy follow-up: never a second bubble mid-turn
+            slot = PendingStreamSeed(
+                chat_id=chat, req_id=current_req_id,
+                stream_id=f"stream_{uuid.uuid4().hex[:12]}", created_at=time.monotonic(),
+            )
+            # Registered BEFORE the await: the consumer's StreamTurn may be created while the frame
+            # is in flight, and it must find the slot to adopt (one bubble for the whole turn).
+            self._pending_stream_seeds[chat] = slot
+            response = await self._send_stream_reply(slot.req_id, slot.stream_id, "<think></think>", finish=False)
+            if slot.state != "pending":
+                return  # adopted mid-send — the seal (if armed later) would close the turn's bubble
+            if response.get("skipped"):
+                # An ack is pending on this req_id; the seed did not land. Retry on the next
+                # typing refresh (2s) instead of sealing a bubble that never opened.
+                self._clear_pending_stream_seed(chat)
+                return
+            self._arm_pending_seed_seal(slot)
+        except Exception as exc:
+            # Typing must never break the turn (base._keep_typing bounds each call anyway).
+            logger.debug("[%s] send_typing early-ack seed failed (chat=%s): %s", self.name, chat, exc)
+            slot = getattr(self, "_pending_stream_seeds", {}).get(chat)
+            if slot is not None and slot.state == "pending":
+                self._clear_pending_stream_seed(chat)
