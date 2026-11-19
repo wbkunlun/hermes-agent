@@ -390,6 +390,21 @@ class WeComStreamDelivery:
             # legacy branches below deliver it as the regular send's own copy plus a tail.
         if body == self._displayed_reply:
             return []
+        # fork 2026-11-19 (DPMS 561213): the final frame landed and drew the body; the hand-over
+        # adds a tail the bubble never showed (a plugin footer appended after the last frame).
+        # The gateway sends ONLY that tail — its delta — so queueing it here would deliver it
+        # twice (the bubble's copy plus the gateway's). Nothing is queued and the reply stays
+        # unclaimed: the body is on screen, the tail is the gateway's to send.
+        if self._displayed_reply and body.startswith(self._displayed_reply):
+            fresh = body[len(self._displayed_reply):].lstrip("\n")
+            if not fresh.strip():
+                return []
+            logger.info(
+                "[wecom-stream] finalize_decision=delta_tail_left_to_the_gateway drawn_len=%d body_len=%d "
+                "tail_len=%d — the gateway's delta send carries it",
+                len(self._displayed_reply), len(body), len(fresh),
+            )
+            return []
         transformed = bool(body) and body != self.overflow_text
         if transformed:
             self._displayed_reply = ""  # not what is on screen: this delivery is its only copy
@@ -443,6 +458,16 @@ class WeComStreamDelivery:
         wanted = _norm_for_match(final_text or "")
         shown = _norm_for_match(self._durable_text)
         return bool(wanted) and bool(shown) and (shown == wanted or wanted in shown)
+
+    @property
+    def durable_answer_text(self) -> str:
+        """fork 2026-11-19 (DPMS 561213): the ANSWER text this bubble proved it drew — the
+        gateway's "what is already on screen" record for a platform that cannot edit a sent
+        message (WeCom). A reply rewritten after the stream (a plugin footer appended to it) must
+        send only what the bubble never showed; this is what that difference is measured
+        against. The frame's own decoration (the think block, the session link) is NOT part of it
+        — it would make every reply look like a different one."""
+        return self._durable_text
 
     def detach_overflow(self) -> None:
         """fork 2026-11-16 (DPMS 561213): the regular send takes over — the overflow delivery gives up.

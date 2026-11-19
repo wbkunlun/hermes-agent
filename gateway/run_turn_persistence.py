@@ -764,6 +764,33 @@ class GatewayTurnPersistenceMixin:
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
             return None
+        # fork 2026-11-19 (DPMS 561213): the reply's body is already on screen (the bubble drew
+        # it) and the platform cannot edit what it sent — only the tail the bubble never drew may
+        # go out, never the body a second time. The tail is measured against the text that is
+        # ACTUALLY going out here (the shaped reply plus the runtime footer), not against the
+        # agent's final text: the footer must ride along with it.
+        _remainder = agent_result.get("_final_unshown_remainder")
+        if _remainder is not None and response and not agent_result.get("already_sent"):
+            from gateway.run_turn import _durable_on_screen_text, _unshown_remainder
+            _shown = _durable_on_screen_text(_published_stream_consumer())
+            _out = _unshown_remainder(response, _shown) if _shown.strip() else None
+            if _out is None:
+                _out = _remainder
+            if not _out.strip():
+                # Everything this reply carries is on screen already: the plain send is cancelled.
+                agent_result["already_sent"] = True
+                logger.info(
+                    "finalize_decision=deliver_suppress_already_shown session=%s on_screen_chars=%d — "
+                    "the bubble already shows the whole reply.",
+                    session_entry.session_id, len(_shown),
+                )
+            else:
+                logger.info(
+                    "finalize_decision=deliver_delta_send session=%s delta_chars=%d on_screen_chars=%d — "
+                    "only the tail the bubble never drew goes out.",
+                    session_entry.session_id, len(_out), len(_shown),
+                )
+                return _out
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             # fork 2026-11-18 (DPMS 561213): the streamed final was confirmed delivered — the body
             # never goes out; only the media re-scan, the uncertain ledger and the held-back footer.

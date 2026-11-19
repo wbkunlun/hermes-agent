@@ -274,6 +274,9 @@ class _Gateway(GatewayTurnPersistenceMixin):
     def _note_bot_reply(self, source):
         self.bot_replies += 1
 
+    async def _deliver_media_from_response(self, response, event, adapter, thread_metadata=None):
+        return None  # the harness carries no media pipeline
+
 
 class _Source:
     chat_id = CHAT
@@ -348,6 +351,62 @@ async def test_no_streaming_keeps_the_regular_send():
     assert delivery.attach_overflow(FULL) == []
     assert not _wecom_overflow_claimed(delivery)  # the regular send delivers, exactly as before
     assert transport.of("frame") == [] and transport.of("send") == []
+
+
+# ---------------------------------------------------------------------------
+# (f) fork 2026-11-19 (DPMS 561213): the TRANSFORMED final — a plugin footer appended to
+#      the reply after the stream — whose body the bubble already shows must not go out
+#      again as a plain message. Production hm-5958d932-1f3 (2026-11-19 09:08): the final
+#      frame landed ("final_frame_delivered chars=229" — the 193-char reply inside the
+#      bubble's own decoration) and the gateway sent the same 193 chars again ("[Wecom]
+#      Sending response (193 chars)"). The reply is presented exactly once.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_transformed_final_already_shown_is_presented_once():
+    from gateway.platforms.helpers import StreamConsumerPublication
+
+    transport = _FakeTransport()
+    delivery = WeComStreamDelivery(adapter=_FakeAdapter(transport), chat_id=CHAT)
+    delivery.stream_deltas_enabled = True
+    task = asyncio.create_task(delivery.run())
+    await async_wait_until(
+        lambda: len(transport.of("frame")) >= 2, timeout=5.0,
+        what="the open bubble frame (seed + open)",
+    )
+    delivery.on_delta(P1)
+    await async_wait_until(
+        lambda: bool(transport.of("frame")) and P1.strip() in transport.of("frame")[-1],
+        timeout=5.0, what="the frame carrying the body",
+    )
+    # The plugin rewrote the reply (the footer) before the stream sealed: the final frame
+    # draws the WHOLE transformed reply, so the bubble shows it whole.
+    transformed = FULL + "\n\n" + FOOTER
+    delivery.finish(transformed)
+    await asyncio.wait_for(task, timeout=5.0)
+    assert delivery.final_response_sent is True
+
+    turn_ctx = SimpleNamespace(
+        stream_consumer_holder=[delivery],
+        source=SimpleNamespace(chat_id=CHAT),
+        session_key="sk-transformed-once",
+    )
+    gateway = GatewayTurnMixin.__new__(GatewayTurnMixin)
+    result = {"final_response": transformed, "messages": [], "response_transformed": True}
+    await gateway._run_agent_mark_streamed_delivery(result, turn_ctx)
+    assert result.get("already_sent") is True  # the plain send is cancelled
+
+    gateway_p = _Gateway(delivery.adapter)
+    event = SimpleNamespace()
+    session_entry = SimpleNamespace(session_id="sess-transformed-once")
+    with StreamConsumerPublication(_TurnBinding(delivery)):
+        delivered = await gateway_p._deliver_turn_response_then_limit_offer(
+            event, _Source(), session_entry, "sk", 1, result, [], transformed, "", False)
+    assert delivered is None  # no second copy of the reply
+    assert transport.of("send") == []  # the bubble is the reply's ONE presentation
+    assert len(transport.of("finalize")) == 1  # one finalize frame
+    assert transformed in transport.of("finalize")[0]
+    # What the bubble proved it drew: the record the decision was made on.
+    assert delivery.durable_answer_text == transformed
 
 
 # ---------------------------------------------------------------------------

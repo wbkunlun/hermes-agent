@@ -88,6 +88,107 @@ def _unexpected_silence_reply() -> str:
     return t("gateway.errors.unexpected_silence")
 
 
+# fork 2026-11-19 (DPMS 561213): what a reply's platform ALREADY put on screen.
+#
+# Production hm-5958d932-1f3 (2026-11-19 09:08): the stream bubble drew the whole reply (the
+# final frame landed — "final_frame_delivered chars=229"), and the gateway sent the SAME 193
+# chars again as a plain message ("[Wecom] Sending response (193 chars)"). Two gates missed it:
+# the finalize decision compared the RECORDED PAYLOAD with the final text (the bubble draws the
+# reply inside its own decoration — think block, session link — so the two never match
+# character-for-character), and the transformed branch (a plugin footer rewrote the reply after
+# the stream) had no way to cancel a plain send on a platform that cannot edit a sent message.
+# The rule is now "what is on screen", not "is the payload byte-identical".
+
+
+def _collapsed(text: str) -> str:
+    """Whitespace-collapsed text — how two renderings of the same reply compare."""
+    return " ".join((text or "").replace("\u200b", "").split())
+
+
+def _durable_on_screen_text(consumer: Any) -> str:
+    """The answer text the platform PROVED is on screen for this reply.
+
+    The stream consumer owns that record (the snapshot a landed frame drew); a platform that
+    keeps none answers "" and the caller falls back to the delivery flags.
+    """
+    if consumer is None:
+        return ""
+    record = getattr(consumer, "durable_answer_text", None)
+    if isinstance(record, str):
+        return record
+    if callable(record):
+        try:
+            return str(record() or "")
+        except Exception:
+            return ""
+    return ""
+
+
+def _landed_frame_text(consumer: Any, source: Any) -> str:
+    """What the platform's LAST landed stream frame drew (the display, decoration included).
+
+    The fork's durability probe (plugins/platforms/wecom/streaming.py). It answers "is the reply
+    on screen" — the bubble wraps the answer in its own decoration — and never the delta: the
+    decoration sits in FRONT of the answer, so only the consumer's own durable record can say
+    which part of the reply is still missing.
+    """
+    probe = getattr(getattr(consumer, "adapter", None), "last_landed_stream_frame_content", None)
+    if not callable(probe):
+        return ""
+    try:
+        return str(probe(getattr(source, "chat_id", "") or "") or "")
+    except Exception:
+        return ""
+
+
+def _final_text_on_screen(consumer: Any, final_text: str) -> bool:
+    """Has the platform proved that *final_text* is on screen for this reply?"""
+    hook = getattr(consumer, "has_durably_delivered_text", None)
+    if callable(hook):
+        try:
+            return bool(hook(final_text))
+        except Exception:
+            return False
+    return False
+
+
+def _unshown_remainder(final_text: str, shown_text: str) -> Optional[str]:
+    """The part of *final_text* that *shown_text* does not already put on screen.
+
+    "" when the whole final text is on screen, the tail when the shown text is a prefix of it,
+    and None when the relation cannot be established (nothing on screen, or a rewritten reply
+    whose text is genuinely new and must be delivered whole).
+
+    Whitespace-only differences are ignored — the platform may re-render what it draws — so the
+    bubble's own decoration (tens of characters around the reply) can never turn a whole reply
+    into a "tail": the comparison is over WORDS, and the tail is cut at the original text's
+    character offset.
+    """
+    final = final_text or ""
+    shown = shown_text or ""
+    if not final.strip() or not shown.strip():
+        return None
+    if final.startswith(shown):
+        return final[len(shown):]
+    final_words = final.split()
+    shown_words = shown.split()
+    if not shown_words:
+        return None
+    if len(final_words) < len(shown_words):
+        # The shown text is LONGER than the final one: it carries the final text whole (the
+        # platform drew more than the reply) — nothing is left to send.
+        return "" if shown_words[:len(final_words)] == final_words else None
+    if final_words[:len(shown_words)] != shown_words:
+        return None  # a rewritten reply: its text is new, not a tail
+    position = 0
+    for index, word in enumerate(final_words):
+        start = final.index(word, position)
+        position = start + len(word)
+        if index == len(shown_words) - 1:
+            return final[position:]
+    return ""
+
+
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
     """One verdict for "this failed turn is a context overflow", shared by transcript persistence
     (#1630 skip) and the user-facing reply so the two can never disagree.
@@ -1345,7 +1446,15 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             if callable(matcher):
                 with suppress(Exception):
                     if matcher(final_text) is False:
-                        return False
+                        # fork 2026-11-19 (DPMS 561213): the recorded PAYLOAD differs from the
+                        # final text, but the CONTENT may still be on screen — a platform that
+                        # cannot edit a sent message draws the reply inside its own decoration
+                        # (the think block, the session link), so the payload never matches
+                        # character-for-character. The platform's durable record decides now
+                        # ("what is on screen"), not the payload's equality. A payload that is
+                        # NOT on screen keeps the veto (a stale preview edit, #71643).
+                        if not _final_text_on_screen(consumer, final_text):
+                            return False
             return True
         # Exact-text match against what the consumer DURABLY delivered (commentary, segments, and the
         # visible prefix only once a real send landed) — safe without the ``previewed`` flag. The codex
@@ -2010,14 +2119,56 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 )
         elif _transformed and _sc is not None:
             # Transformed after streaming: edit the streamed message instead of sending a duplicate.
-            logger.info("finalize_decision=transformed_reconcile_edit for session %s (message_id=%s).", _sk, _sc.message_id)
             if _sc.message_id:
+                logger.info("finalize_decision=transformed_reconcile_edit for session %s (message_id=%s).", _sk, _sc.message_id)
                 await edit_streamed_message(
                     _sc, source, response, response["final_response"], sk=_sk,
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",
                     fail_exc="Failed to edit streamed message for session %s: %s",
                 )
+            else:
+                # fork 2026-11-19 (DPMS 561213): the platform cannot edit what it already sent
+                # (WeCom bubbles are immutable), so there is nothing to reconcile IN PLACE — and
+                # the plain send must NOT become the reply's second copy (production
+                # hm-5958d932-1f3: the bubble showed all 193 chars, the gateway sent them again).
+                # What the bubble PROVED it drew decides: nothing left → the plain send is
+                # cancelled; a tail the bubble never drew (a plugin footer appended after the last
+                # frame) → only that tail goes out, never the body again.
+                _on_screen = _durable_on_screen_text(_sc)
+                _remainder = _unshown_remainder(_final, _on_screen)
+                if _remainder is None and not _on_screen.strip():
+                    # No durable answer record: the last landed frame's own content decides whether
+                    # the reply is on screen (the bubble wraps the answer in its decoration).
+                    _landed = _landed_frame_text(_sc, source)
+                    if _landed and _collapsed(_final) and _collapsed(_final) in _collapsed(_landed):
+                        _remainder = ""
+                    elif _streamed:
+                        # The final frame landed and nothing contradicts it: the reply is on screen.
+                        _remainder = ""
+                if _remainder is None:
+                    logger.info(
+                        "finalize_decision=transformed_no_edit_normal_send for session %s (message_id=%s) — "
+                        "nothing proves the reply is on screen; delivering the complete response.",
+                        _sk, _sc.message_id,
+                    )
+                elif not _remainder.strip():
+                    response["already_sent"] = True
+                    response["delivery_uncertain"] = getattr(_sc, "delivery_uncertain", False) is True
+                    logger.info(
+                        "finalize_decision=transformed_suppress_already_shown for session %s "
+                        "on_screen_chars=%d final_chars=%d — the bubble already shows the reply; "
+                        "the plain send is cancelled.",
+                        _sk, len(_on_screen), len(_final),
+                    )
+                else:
+                    # Only the tail the bubble never drew goes out; the body is on screen already.
+                    response["_final_unshown_remainder"] = _remainder
+                    logger.info(
+                        "finalize_decision=transformed_delta_send for session %s on_screen_chars=%d "
+                        "final_chars=%d delta_chars=%d — only the tail the bubble never drew goes out.",
+                        _sk, len(_on_screen), len(_final), len(_remainder),
+                    )
         elif not _transformed and owns_reconcilable_preview(_sc, getattr(source, "chat_id", ""), _final):
             # Unconfirmed final, one real preview on screen (a flood-frozen bubble, a cancelled
             # consumer): finish it in place; a plain final send would post the answer twice.
