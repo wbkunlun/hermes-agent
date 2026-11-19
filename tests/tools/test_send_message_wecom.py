@@ -16,7 +16,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from gateway.config import Platform
-from tools.send_message_tool import _send_to_platform
+from gateway.outbound.send import _send_to_platform
 from plugins.platforms.wecom.adapter import _standalone_send
 
 

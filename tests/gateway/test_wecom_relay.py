@@ -210,7 +210,7 @@ def test_standalone_send_prefers_the_relay_over_an_ephemeral_connection(monkeypa
         raise AssertionError("an ephemeral WeComAdapter was constructed despite a relay answer")
 
     monkeypatch.setattr(wecom_module, "WeComAdapter", _boom)
-    monkeypatch.setattr("tools.send_message_senders._live_adapter", lambda platform: (None, None))
+    monkeypatch.setattr("gateway.outbound.senders._live_adapter", lambda platform, chat_id=None, thread_id=None: (None, None))
     monkeypatch.setattr(
         relay_client, "try_relay_send",
         lambda chat_id, message, **kwargs: {
@@ -232,7 +232,7 @@ def test_standalone_send_returns_the_relay_error_verbatim(monkeypatch):
         raise AssertionError("an ephemeral WeComAdapter was constructed despite a relay answer")
 
     monkeypatch.setattr(wecom_module, "WeComAdapter", _boom)
-    monkeypatch.setattr("tools.send_message_senders._live_adapter", lambda platform: (None, None))
+    monkeypatch.setattr("gateway.outbound.senders._live_adapter", lambda platform, chat_id=None, thread_id=None: (None, None))
     monkeypatch.setattr(
         relay_client, "try_relay_send",
         lambda chat_id, message, **kwargs: {"error": "group policy refused"},
@@ -267,7 +267,7 @@ def test_standalone_send_falls_through_when_no_relay_answered(monkeypatch):
 
     monkeypatch.setattr(wecom_module, "WeComAdapter", _EphemeralAdapter)
     monkeypatch.setattr(wecom_module, "check_wecom_requirements", lambda: True)
-    monkeypatch.setattr("tools.send_message_senders._live_adapter", lambda platform: (None, None))
+    monkeypatch.setattr("gateway.outbound.senders._live_adapter", lambda platform, chat_id=None, thread_id=None: (None, None))
     monkeypatch.setattr(relay_client, "try_relay_send", lambda chat_id, message, **kwargs: None)
 
     result = asyncio.run(_standalone_send(PlatformConfig(enabled=True), "g1", "report"))
@@ -364,7 +364,7 @@ def test_the_standalone_sender_scopes_the_relay_to_its_own_bot(monkeypatch):
 
     monkeypatch.setattr(wecom_module, "WeComAdapter",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("ephemeral adapter built")))
-    monkeypatch.setattr("tools.send_message_senders._live_adapter", lambda platform: (None, None))
+    monkeypatch.setattr("gateway.outbound.senders._live_adapter", lambda platform, chat_id=None, thread_id=None: (None, None))
     monkeypatch.setattr("plugins.platforms.wecom.relay_client.try_relay_send", _fake_relay)
 
     result = asyncio.run(_standalone_send(

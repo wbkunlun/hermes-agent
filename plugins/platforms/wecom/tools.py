@@ -301,7 +301,7 @@ async def _handler_message_push(args: dict[str, Any]) -> str:
         return tool_error("wecom_message_push requires 'chat_id' and 'content' (markdown)")
     try:
         from gateway.config import Platform
-        from tools.send_message_senders import _live_adapter
+        from gateway.outbound.senders import _live_adapter
         _runner, live = _live_adapter(Platform.WECOM)
     except Exception:
         live = None

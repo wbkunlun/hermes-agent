@@ -2141,8 +2141,14 @@ async def _standalone_send(
     # identity — and returns (runner, None) on lookup failure, falling through
     # to the agent-fallback/ephemeral paths below.
     try:
-        from tools.send_message_senders import _live_adapter
-        _runner, _live = _live_adapter(Platform.WECOM)
+        # Upstream v0.23.2 moved the outbound send layer from tools/send_message_senders.py to
+        # gateway/outbound/senders.py (the old module was deleted upstream) — follow the move.
+        from gateway.outbound.senders import _live_adapter
+        _runner, _live = _live_adapter(Platform.WECOM, chat_id, thread_id)
+    except PermissionError as e:  # SharedBotTargetRefused: not a routed target for this profile
+        # Upstream v0.23.2 refuses the send outright: falling through to the ephemeral connect
+        # would displace the primary bot's sole WeCom WebSocket (errcode 846609).
+        return send_error(str(e))
     except Exception:
         _runner = None
     if _runner is not None and _live is not None:

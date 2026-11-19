@@ -325,9 +325,9 @@ class TestMessageFamilyGuard:
     the gateway, the in-flight group reply parked, the bot went silent)."""
 
     def _patch_live_adapter(self, monkeypatch, adapter):
-        import tools.send_message_senders as senders
+        import gateway.outbound.senders as senders
 
-        monkeypatch.setattr(senders, "_live_adapter", lambda platform: (object(), adapter))
+        monkeypatch.setattr(senders, "_live_adapter", lambda platform, chat_id=None, thread_id=None: (object(), adapter))
 
     def test_message_push_routes_through_live_adapter(self, monkeypatch):
         import asyncio
@@ -356,8 +356,8 @@ class TestMessageFamilyGuard:
 
         from plugins.platforms.wecom import tools as wecom_tools
 
-        import tools.send_message_senders as senders
-        monkeypatch.setattr(senders, "_live_adapter", lambda platform: (None, None))
+        import gateway.outbound.senders as senders
+        monkeypatch.setattr(senders, "_live_adapter", lambda platform, chat_id=None, thread_id=None: (None, None))
         monkeypatch.setattr(wecom_tools, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("refusal path must not shell out")))
         out = asyncio.run(wecom_tools._handler_message_push({
