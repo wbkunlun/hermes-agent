@@ -87,13 +87,16 @@ class _Gateway(GatewayTurnPersistenceMixin):
     def _delivery_adapter_for(self, source):
         return self.adapter
 
+    def _event_thread_metadata(self, event, source):
+        return None  # the harness carries no thread routing
+
     def _should_send_voice_reply(self, *args, **kwargs):
         return False
 
     def _note_bot_reply(self, source):
         self.bot_replies += 1
 
-    async def _deliver_media_from_response(self, response, event, adapter, thread_metadata=None):
+    async def _deliver_media_from_response(self, response, event, adapter, thread_metadata=None, footer_line=""):
         return None  # the harness carries no media pipeline
 
 
