@@ -5,7 +5,10 @@ name: Upstream Sync Check
 #
 # Behaviour:
 #   * Every day at 06:00 UTC, run scripts/sync-upstream.sh --dry-run
-#     against the newest v2026.* upstream tag.
+#     against the newest upstream tag. Upstream ships semver tags (v0.23.x);
+#     the legacy date scheme (v2026.*) is still accepted as a fallback.
+#     Canary tags (v0.23.2+canary.*) are NEVER probed — a canary is a
+#     pre-release snapshot, not the release a resync should target.
 #   * If a newer upstream tag exists than what's already on
 #     feat/upstream-v<N>.<N>.<N>-merge, open a PR (or comment on the
 #     existing one) so the operator can review and merge.
@@ -15,9 +18,9 @@ name: Upstream Sync Check
 # Replaces the manual "remember to sync" ritual with a CI beacon that
 # fires when upstream ships v0.18 (or whenever the next release lands).
 #
-# Per-adapter production fixes in gateway/platforms/*.py are protected
-# by sync-upstream.sh's pre-merge fork-content snapshot + post-merge
-# identity check, so a dry-run failure here is a real signal.
+# Per-adapter production fixes in gateway/platforms/*.py and
+# plugins/platforms/wecom/ are protected by sync-upstream.sh's fork regression
+# tests + resync marker checks, so a dry-run failure here is a real signal.
 
 on:
   schedule:
@@ -26,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Specific upstream tag to probe (default: newest v2026.*)'
+        description: 'Specific upstream tag to probe (default: newest stable v0.* tag)'
         required: false
         default: ''
 
@@ -78,10 +81,16 @@ jobs:
           if [[ -n "${{ inputs.tag }}" ]]; then
             TAG="${{ inputs.tag }}"
           else
-            TAG=$(git tag -l 'v2026*' --sort=-v:refname | head -1)
+            # Upstream ships semver (v0.23.x); the legacy date scheme (v2026.*) is a
+            # fallback for forks pinned to it. Canary builds are excluded on purpose:
+            # they sort ABOVE the release tag and are pre-release snapshots.
+            TAG=$(git tag -l 'v0.*' --sort=-v:refname | grep -v -- '+canary' | head -1)
+            if [[ -z "$TAG" ]]; then
+              TAG=$(git tag -l 'v2026*' --sort=-v:refname | grep -v -- '+canary' | head -1)
+            fi
           fi
           if [[ -z "$TAG" ]]; then
-            echo "::error::no upstream v2026.* tag found"
+            echo "::error::no upstream v0.* (or legacy v2026.*) tag found"
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -143,18 +152,24 @@ jobs:
           \`\`\`bash
           # Locally:
           git fetch upstream --tags
-          bash scripts/sync-upstream.sh ${TARGET} --push
-          # Or just dry-run first:
+          # The script is LOCAL-ONLY (no push/tag/build flags):
+          bash scripts/sync-upstream.sh ${TARGET}
+          # Or just plan it first:
           bash scripts/sync-upstream.sh ${TARGET} --dry-run
           \`\`\`
 
           The sync script:
 
-          * Creates branch \`${BRANCH}\` if missing.
-          * Runs \`git merge ${TARGET} --no-edit -X theirs\`.
-          * Bumps \`pyproject.toml\` to v\${TARGET#v}.
-          * Runs \`tests/tools/test_send_message_wecom.py\`, \`tests/acp/test_session_provenance.py\`, and the provider-catalog smoke test.
-          * Fails the merge if any test fails — do NOT push past a red test.
+          * Merges \`${TARGET}\` with \`git merge ${TARGET} --no-edit\` — **no \`-X theirs\` / \`-X ours\`**:
+            conflicts surface for MANUAL resolution. Resolution rule: **KEEP fork fixes,
+            ADOPT upstream elsewhere**.
+          * Does NOT touch \`pyproject.toml\` — upstream owns the semver \`version\`, and the fork's
+            release tags are date-based overlays that must not overwrite it.
+          * Runs the fork regression suite (wecom / wework / gateway / compressor / acp) plus the
+            resync marker checks, and refuses to continue on leftover conflict markers.
+          * Is LOCAL-ONLY by design: it never pushes, tags, bumps the submodule or builds an image.
+            Those irreversible steps are run by hand after the merge is reviewed.
+          * Fails the merge if any test or marker check fails — do NOT push past a red test.
 
           cc: @brycehuang
           EOF
