@@ -11,9 +11,14 @@ from agent.turn_failure_copy import (
 from contextlib import suppress
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
-# Upstream v0.23.2 adds _mark_notify_metadata (notify-metadata work, #144897/#74547); the rest of
-# upstream's import block is unused here and stays dropped (fork style commit 1a7ab528e63).
-from gateway.platforms.base import _mark_notify_metadata
+from storage_user_copy import error_type_name
+from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.event import MessageEvent
+from gateway.session import (
+    SessionSource, _session_key_namespace, build_channel_continuity_note,
+    build_session_context,
+)
 from gateway.session_detached import detached_route_of
 from gateway.warning_notifications import diagnostic_wake_muted
 from gateway.run_turn_wecom_overflow import _wecom_overflow_claimed, _wecom_delivery_consumer
@@ -28,10 +33,10 @@ logger = logging.getLogger("gateway.run")
 def _acp_launch(runner, source) -> bool:
     """An editor session: ACP shows no reasoning event yet, so its reply keeps the projected block."""
     from gateway.session_setting_commands import local_policy
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     try:
         return getattr(local_policy(runner, source), "source", None) == "acp"
-    except RuntimeStoreError:  # a local route with no restored policy is not an editor launch
+    except AuthorityRefusal:  # a local route with no restored policy is not an editor launch
         return False
 
 
@@ -459,12 +464,12 @@ class GatewayTurnPersistenceMixin:
     def _hmwa_fresh_session_has_pending_input(self, session_entry) -> bool:
         """Whether the authority FIFO of the fresh session already holds an admitted input."""
         from gateway.session_authorities import active_authority
-        from hermes_state_runtime import list_session_admissions
+        from gateway.session_persistence import authority_persistence
         authority = active_authority(self)
         if authority is None or session_entry is None:
             return False
         owner = authority.logical_owner(session_entry.session_id)
-        return bool(list_session_admissions(authority.db, session_id=owner))
+        return bool(authority_persistence(authority).admissions.list(session_id=owner))
 
     def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source):
         """True when the reset was handed to the authority drain. A LOCAL session (the Bot Chat a
@@ -1000,7 +1005,7 @@ class GatewayTurnPersistenceMixin:
             return record_unexecuted_failure(launch_credentials_copy(e), 'launch_credentials_unavailable')
         # A local client (CLI, TUI, Desktop) is the operator at this host: its result carries the
         # real cause, so its details line is not the chat apology with the log pointer cut off.
-        local_error = f"{type(e).__name__}: {e}"[:500] if source.platform == Platform.LOCAL else None
+        local_error = f"{error_type_name(e)}: {e}"[:500] if source.platform == Platform.LOCAL else None
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         ), error=local_error)
