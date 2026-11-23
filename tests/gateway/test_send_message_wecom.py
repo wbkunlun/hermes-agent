@@ -1,0 +1,1 @@
+../tools/test_send_message_wecom.py
