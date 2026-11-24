@@ -40,6 +40,10 @@ provides_tools:
 # platform-plugin env var injector in hermes_cli/config.py.
 requires_env: []
 optional_env:
+  - name: A2A_OUTBOUND_HOOK_URL
+    description: "Platform outbound admission hook. When set, every a2a_call/a2a_orchestrate asks the control plane who is calling and which token to use (fail closed; the entry's static auth.token is ignored). Unset keeps the legacy static-token behaviour."
+    prompt: "A2A outbound admission hook URL (or empty for legacy static tokens)"
+    password: false
   - name: A2A_PEER_TOKENS
     description: "Per-peer bearer tokens ('alice:tok1,bob:tok2'). Each remote agent gets its own credential; the matched name is the authenticated identity used for rate limiting, trust, and audit."
     prompt: "A2A per-peer tokens (name:token, comma-separated; or empty)"

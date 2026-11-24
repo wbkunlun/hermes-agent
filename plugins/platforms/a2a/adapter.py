@@ -231,6 +231,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
         identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
         if identity is None:
+            # Denials are audited too: the local JSONL is the only call ledger (no platform ingest).
+            security.audit("policy", "unknown", "", "", extra={
+                "decision": "deny", "reason": "unauthenticated", "remote_addr": self._client_ip()})
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
         if adapter._security_context.localhost_only() and (refusal := security.browser_post_refusal(self.headers)):
             return self._error(403, None, protocol.ERR_UNAUTHORIZED, refusal)
@@ -262,6 +265,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             if failed():
                 if code == protocol.ERR_RATE_LIMITED:
                     protocol.metrics.rate_limit_triggers += 1
+                if code == protocol.ERR_UNTRUSTED_PEER:
+                    security.audit("policy", identity, "", "", extra={
+                        "decision": "deny", "reason": "untrusted_peer"})
                 return self._error(http, req_id, code, msg)
         agent = route["agent"]
         if handler_name == "_rpc_message_send":
@@ -601,7 +607,10 @@ class A2AAdapter(BasePlatformAdapter):
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
         framed = security.wrap_inbound(peer, text)
-        security.audit("inbound", peer, task_id, text)
+        # ``identity`` is the human-readable caller (peer name = alias, e.g. alice-9f2a);
+        # the shared master token path is ``owner``. Digests/ciphertexts are never logged.
+        security.audit("inbound", peer, task_id, text, extra={
+            "decision": "allow", "identity": peer if not peer.startswith("ip:") else "owner"})
         if not retry:
             protocol.persist_message(context_id, "user", text, task_id, input_id=input_id or "")
             protocol.metrics.inbound_total += 1

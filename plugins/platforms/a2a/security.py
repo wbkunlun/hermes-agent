@@ -268,11 +268,15 @@ def post_callback(url: str, body: bytes, headers: dict, *, localhost_mode: bool,
         return response.status_code  # the peer's body is never read: only the status matters
 
 
-def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
-    """Append an audit record (direction: inbound | outbound | push). Never raises."""
+def audit(direction: str, peer: str, task_id: str, summary: str, extra: Optional[dict] = None) -> None:
+    """Append an audit record (direction: inbound | outbound | push | policy). ``extra``
+    merges caller-supplied fields (decision / reason / identity / remote_addr) into the
+    record; the base shape is unchanged when it is omitted. Never raises."""
     try:
         from hermes_constants import get_hermes_home
         rec = {"ts": time.time(), "direction": direction, "peer": peer, "task_id": task_id, "summary": (summary or "")[:500]}
+        if extra:
+            rec.update(extra)
         get_hermes_home().mkdir(parents=True, exist_ok=True)
         with (get_hermes_home() / "a2a_audit.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

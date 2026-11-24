@@ -21,6 +21,124 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 120
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
 
+# --- Platform outbound admission hook (caller identity) ---------------------
+#
+# When the platform injects A2A_OUTBOUND_HOOK_URL, every a2a_call / a2a_orchestrate
+# send must first ask the control plane who is calling and which token to use
+# (fail closed: no identity, unreachable hook, non-200, or allow=false all deny
+# without contacting the peer). Identity comes from the session/plugin — never
+# from model arguments. With the env unset the legacy static ``auth.token``
+# behaviour is kept byte-for-byte (old platform compatibility).
+
+_HOOK_TIMEOUT = 10  # seconds; no retry — a slow control plane must not widen the surface
+
+_NO_IDENTITY = ("Error: A2A call denied — this session has no verified user identity. "
+                "Outbound A2A requires a signed-in user (IM session or agent-auth /login).")
+_HOOK_UNREACHABLE = "Error: A2A call denied — the platform admission service is unreachable (fail-closed)."
+_HOOK_DENIED = "Error: A2A call denied by the platform ({reason})."
+_HOOK_REASONS = {
+    "no_session_user": "this session has no verified user identity",
+    "peer_not_listed": "the target is not a registered peer of this agent",
+    "user_not_allowed_on_peer": "your identity is not on the target agent's caller list",
+    "no_outbound_token": "no credential is available for your identity on the target agent",
+}
+
+
+class _OutboundDenied(Exception):
+    """Admission refused before any peer contact; the message is model-facing already."""
+
+
+def _verified_um_identity() -> tuple[str, str]:
+    """``(um_user, um_name)`` from an enabled agent-auth plugin's ``verified_identity()``,
+    or ``("", "")`` when unavailable.
+
+    Read-only and programmatic (never from model arguments). ``getattr`` guards keep
+    deployments without the method/plugin silently on the IM-sender rung; any failure
+    is swallowed so no diagnostics reach the model. UM wins over the IM sender — a
+    garbled/encrypted IM userid must never match someone else's allowlist entry."""
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        for loaded in (getattr(get_plugin_manager(), "_plugins", None) or {}).values():
+            if getattr(loaded, "error", None) or not getattr(loaded, "enabled", False):
+                continue
+            instance = getattr(getattr(loaded, "module", None), "_instance", None)
+            fn = getattr(instance, "verified_identity", None)  # old deployments: absent
+            if not callable(fn):
+                continue
+            identity = fn(allow_group=False) or {}
+            user = str(identity.get("user") or "").strip()
+            if user:
+                return user, str(identity.get("name") or "").strip()
+    except Exception:
+        logger.debug("A2A: verified UM identity unavailable", exc_info=True)
+    return "", ""
+
+
+def _session_identity() -> tuple[str, str]:
+    """``(user_id, user_name)`` of the current chat sender. A chained A2A caller shows up
+    here as the peer alias it authenticated with; that passes through unchanged and the
+    platform resolves the alias back to a principal."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # standalone/embedded runs without the gateway package
+        get_session_env = lambda name, default="": default
+    user_id = (get_session_env("HERMES_SESSION_USER_ID", "")
+               or get_session_env("HERMES_SESSION_USER_ID_ALT", "") or "").strip()
+    user_name = (get_session_env("HERMES_SESSION_USER_NAME", "") or "").strip()
+    return user_id, user_name
+
+
+def _outbound_admission(agent_label: str, peer_url: str, tool: str) -> tuple[Optional[dict], Optional[str]]:
+    """Ask the platform hook who may call and with which token.
+
+    Returns ``(admission, None)`` with admission ``{token, url, principal, via}`` when
+    allowed, ``({}, None)`` in legacy mode (env unset — caller keeps the static entry
+    token), or ``(None, denial_message)`` when refused. Every refusal is also written to
+    the local audit JSONL. No retries: a denial is final for this call."""
+    hook_url = str(_get_scoped_secret("A2A_OUTBOUND_HOOK_URL", "") or "").strip()
+    if not hook_url:
+        return {}, None  # legacy: static entry token, unchanged behaviour
+    um_user, um_name = _verified_um_identity()
+    user_id = ""
+    if not um_user:
+        user_id, _ = _session_identity()
+    if not um_user and not user_id:
+        _audit_denial(agent_label, "no_session_user", "unknown")
+        return None, _NO_IDENTITY
+    body: dict[str, Any] = {"tool": tool}
+    if agent_label.startswith(("http://", "https://")):
+        body["url"] = agent_label
+    else:
+        body["peer"] = agent_label
+    if um_user:  # UM (verified) covers the IM sender: never send both
+        body["um_user"], body["um_name"] = um_user, um_name
+    else:
+        body["user_id"] = user_id
+    headers = {"Content-Type": "application/json"}
+    auth = str(_get_scoped_secret("CONTROL_PLANE_AUTH", "") or "").strip()
+    if auth:
+        headers["Authorization"] = f"Bearer {auth}"
+    try:
+        req = urllib.request.Request(hook_url, data=json.dumps(body).encode("utf-8"),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=_HOOK_TIMEOUT) as resp:
+            answer = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        logger.debug("A2A: outbound admission hook unreachable for %r", agent_label, exc_info=True)
+        _audit_denial(agent_label, "hook_unreachable", um_user or user_id)
+        return None, _HOOK_UNREACHABLE
+    if not isinstance(answer, dict) or not answer.get("allow"):
+        reason = str(answer.get("reason") or "denied") if isinstance(answer, dict) else "denied"
+        _audit_denial(agent_label, reason, um_user or user_id)
+        return None, _HOOK_DENIED.format(reason=_HOOK_REASONS.get(reason, reason))
+    return answer, None
+
+
+def _audit_denial(agent_label: str, reason: str, identity: str) -> None:
+    """Local policy record for a refused outbound call (never raises)."""
+    security.audit("policy", agent_label, "", "", extra={
+        "decision": "deny", "reason": f"outbound_{reason}", "identity": identity or "unknown"})
+
 
 def _load_config() -> dict:
     """Read-only view of config.yaml; peers are only read, never mutated (cache-safe)."""
@@ -92,11 +210,25 @@ def _rpc_url(base_url: str, card: Optional[dict]) -> str:
     return base_url.rstrip("/")
 
 
-def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> tuple[str, str, str]:
+def _send_task(agent_label: str, peer: dict, message: str, context_id: str, *, tool: str = "a2a_call") -> tuple[str, str, str]:
     """One SendMessage to a peer -> (reply_text, context_id, state). Raises urllib errors /
-    ValueError for the caller to format; handles redaction, audit, persistence, metrics."""
-    base_url = peer.get("url", "")
+    ValueError for the caller to format; handles redaction, audit, persistence, metrics.
+
+    With the platform hook configured this is also the admission enforcement point:
+    the static ``auth.token`` is ignored and the request carries the hook-issued
+    identity token plus X-A2A-Principal / X-A2A-Via; a refusal raises ``_OutboundDenied``
+    before the peer is contacted (and the caller must not retry elsewhere)."""
+    admission, denial = _outbound_admission(agent_label, str(peer.get("url", "")), tool)
+    if denial is not None:
+        raise _OutboundDenied(denial)
+    base_url = str(peer.get("url", ""))
     headers = _auth_header(peer.get("auth", {}) or {})
+    if admission:  # hook mode: platform-minted token + identity headers overwrite the static one
+        base_url = str(admission.get("url") or base_url)
+        headers = {"Authorization": f"Bearer {admission.get('token', '')}"}
+        for header, key in (("X-A2A-Principal", "principal"), ("X-A2A-Via", "via")):
+            if admission.get(key):
+                headers[header] = str(admission[key])
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
     try:
         card = _fetch_card(base_url, headers, min(timeout, 30))  # best-effort, to learn the rpc URL
@@ -182,6 +314,8 @@ def a2a_call(args: dict, **_: Any) -> str:
         return f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in config.yaml or pass a full http(s):// URL."
     try:
         reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
+    except _OutboundDenied as e:
+        return str(e)  # admission refusal: model-facing message, no internal detail
     except urllib.error.HTTPError as e:
         return _HTTP_CALL_ERRORS.get(e.code, "Error: call to '{agent}' failed — HTTP {code}.").format(agent=agent, code=e.code)
     except ValueError as e:
@@ -245,7 +379,8 @@ def _match_peers_by_capability(capability: str) -> list[tuple[str, dict]]:
 def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id: str = "") -> tuple[str, str]:
     """Call a single peer synchronously -> (agent_name, reply_text)."""
     try:
-        reply, _ctx, _state = _send_task(agent_name, _peer_from_entry(peer_entry), message, context_id)
+        reply, _ctx, _state = _send_task(agent_name, _peer_from_entry(peer_entry), message, context_id,
+                                         tool="a2a_orchestrate")
         return (agent_name, reply or "(no reply)")
     except Exception as e:
         return (agent_name, f"Error: {e}")

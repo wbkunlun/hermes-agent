@@ -40,6 +40,35 @@ The agent gets five tools:
 - `a2a_orchestrate(capability, message, mode?)` — fan-out a task to every
   peer advertising a capability (`all` / `first` / `best`).
 
+### Outbound admission hook (`A2A_OUTBOUND_HOOK_URL`)
+
+When the platform injects `A2A_OUTBOUND_HOOK_URL`, every `a2a_call` /
+`a2a_orchestrate` send first asks the control plane who is calling and which
+token to use:
+
+- **Identity ladder** (programmatic — never from model arguments): 1) a
+  signed-in **agent-auth** UM identity via `verified_identity()` (verified,
+  covers the IM sender — a garbled IM userid must not match someone else's
+  entry); 2) the session chat sender (`HERMES_SESSION_USER_ID`, which for a
+  chained A2A caller is the peer alias it authenticated with — passed through
+  for platform-side resolution). **No identity ⇒ the call is refused before
+  any request is made** (local terminal runs with no session are denied).
+- **Request**: `POST <hook>` with `Authorization: Bearer $CONTROL_PLANE_AUTH`
+  and `{peer|url, user_id | um_user+um_name, tool}`. No retry; a timeout or
+  unreachable hook counts as a denial (fail-closed).
+- **Allowed** ⇒ the peer request carries `Authorization: Bearer <hook token>`
+  (the entry's static `auth.token` is **ignored**) plus `X-A2A-Principal`
+  (the caller identity the peer will record) and `X-A2A-Via` (this agent's
+  name); the target URL is the hook's `url`.
+- **Denied** ⇒ a plain-language reason goes back to the model; the peer is
+  never contacted, and switching URLs or identities to retry is prohibited.
+  Denials are written to the local audit JSONL (`policy` records).
+- **Legacy**: env unset ⇒ behaviour is unchanged byte-for-byte (static
+  `auth.token`).
+- **Not routed through the hook**: `a2a_discover` (Agent Cards are public),
+  `a2a_list` / `a2a_history` (local reads / continuations of already-admitted
+  tasks keep the static-token path).
+
 ## Inbound — be callable
 
 When the `a2a` platform is enabled, Hermes serves a v1.0 Agent Card at
@@ -80,6 +109,7 @@ via `tasks/get`.
 | Var | Default | Meaning |
 |---|---|---|
 | `A2A_PEER_TOKENS` | _(unset)_ | Per-peer credentials `name:token,…` (preferred). |
+| `A2A_OUTBOUND_HOOK_URL` | _(unset)_ | Platform outbound admission hook; set ⇒ per-call identity + platform-minted tokens, unset ⇒ legacy static tokens. |
 | `A2A_BEARER_TOKEN` | _(unset)_ | Shared token; identity falls back to caller IP. |
 | `A2A_HOST` | `127.0.0.1` | Bind host. Only widens with a token set. |
 | `A2A_PORT` | `9900` | Inbound port. |
