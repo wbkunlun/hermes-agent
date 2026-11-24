@@ -150,6 +150,28 @@ class TestPlatformGate:
         assert _transform(plugin, "x") is not None
 
 
+class TestCronPlatform:
+    def test_cron_platform_gets_footer(self, plugin):
+        # Cron job deliveries run with platform="cron" (cron/scheduler.py
+        # _construct_cron_agent), so once config.json lists "cron" the same
+        # footer reaches scheduled-job deliveries as wecom replies.
+        _post(plugin, platform="cron", **FOOT_ARGS)
+        out = _transform(plugin, "定时任务完成", platform="cron")
+        assert out is not None
+        assert "📊 Model:" in out
+        assert "定时任务完成" in out
+
+    def test_cron_silence_marker_with_footer_still_silent(self, plugin):
+        # Invariant: the footer is appended at the END of the response, so it
+        # must never break autonomous-lane silence suppression — the bracketed
+        # marker still opens the response and the prefix rule in
+        # gateway.response_filters.is_autonomous_silence_response wins.
+        from gateway.response_filters import is_autonomous_silence_response
+        footed = ("[SILENT]\n\n---\n📊 Model: m · Input 1,200 · Output 300"
+                  " · Duration 2.3s · Turns 3")
+        assert is_autonomous_silence_response(footed) is True
+
+
 class TestConfigEnabled:
     def test_enabled_false_noops_both_hooks(self, plugin, tmp_path):
         cfg = json.loads(Path(_PLUGIN_PATH).parent.joinpath("config.json").read_text(encoding="utf-8"))

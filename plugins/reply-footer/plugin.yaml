@@ -13,7 +13,8 @@ description: >-
   (mtime-cached) on every hook fire, so toggling enabled takes effect
   immediately. When auto_disable_reply_badge is set and the reply-badge
   plugin is present/enabled, reply-badge is folded into plugins.disabled
-  (effective next gateway restart). wecom only; all paths fail-open.
+  (effective next gateway restart). Platforms gated by config.json
+  (bundled: wecom replies + cron job deliveries); all paths fail-open.
 author: "wehermes"
 hooks:
   - post_api_request
