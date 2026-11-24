@@ -1,0 +1,67 @@
+name: digital-employee-platform
+label: 企微数字员工
+kind: platform
+version: 2.0.0
+description: >
+  企业微信「数字员工」平台插件：平台（Dify HTTP 节点）同步 POST 到本网关
+  （默认 /chat），网关返回 message_list；超时后的答复经企微发消息 API 主动推送。
+  文件/图片暂不支持。设计文档见 wehermes
+  docs/design/2026-11-23-digital-employee-platform-plugin.md。
+requires_env:
+  - name: DIGITAL_EMPLOYEE_ENABLED
+    description: "为 true 时启用数字员工平台（写入 platforms.digital_employee.enabled）"
+    prompt: "Digital employee platform enabled (true/false)"
+    password: false
+optional_env:
+  - name: DIGITAL_EMPLOYEE_API_KEY
+    description: "校验平台请求的鉴权值（留空 = 不校验，仅限内网直连）"
+    prompt: "Inbound API key"
+    password: true
+  - name: DIGITAL_EMPLOYEE_AUTH_HEADER
+    description: "鉴权头名（默认 Authorization，按 Bearer 解析；也可改为 X-Api-Key 之类）"
+    prompt: "Auth header name"
+    password: false
+  - name: DIGITAL_EMPLOYEE_WEBHOOK_HOST
+    description: "监听地址（默认：0.0.0.0）"
+    prompt: "Webhook host"
+    password: false
+  - name: DIGITAL_EMPLOYEE_WEBHOOK_PORT
+    description: "监听端口（默认：13777，与 WeWork 的 13776 错开）"
+    prompt: "Webhook port"
+    password: false
+  - name: DIGITAL_EMPLOYEE_WEBHOOK_PATH
+    description: "平台调用的路径（默认：/chat）"
+    prompt: "Webhook path"
+    password: false
+  - name: DIGITAL_EMPLOYEE_RESPONSE_TIMEOUT
+    description: "同步等待 agent 的秒数（默认：110，平台侧一般 120s 超时）"
+    prompt: "Response timeout seconds"
+    password: false
+  - name: DIGITAL_EMPLOYEE_TIMEOUT_NOTICE
+    description: "超时时立即回给用户的提示语"
+    prompt: "Timeout notice"
+    password: false
+  - name: DIGITAL_EMPLOYEE_PUSH_URL
+    description: "企微发消息 API 完整地址（留空 = 关闭延迟推送）"
+    prompt: "WeChat push API URL"
+    password: false
+  - name: DIGITAL_EMPLOYEE_PUSH_KEY_ID
+    description: "企微发消息 API 的 keyId"
+    prompt: "WeChat push keyId"
+    password: true
+  - name: DIGITAL_EMPLOYEE_TEXT_CHUNK_LIMIT
+    description: "单条文本分片上限（默认：4000 字符）"
+    prompt: "Text chunk limit"
+    password: false
+  - name: DIGITAL_EMPLOYEE_REQUIRE_MENTION
+    description: "群聊是否必须 @ 数字员工（true/false，默认：true）"
+    prompt: "Require mention"
+    password: false
+  - name: DIGITAL_EMPLOYEE_ALLOWED_USERS
+    description: "可选的用户名单（逗号分隔；留空 = 平台侧已过滤，全放行）"
+    prompt: "Allowed users"
+    password: false
+  - name: DIGITAL_EMPLOYEE_HOME_CHANNEL
+    description: "cron 投递的默认会话 id（conversation_id）"
+    prompt: "Home conversation id"
+    password: false

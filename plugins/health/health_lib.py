@@ -28,7 +28,12 @@ LOOP_HEARTBEAT_TTL_S = 150.0
 _CONNECTED_STATES = {"connected", "running", "ok"}
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 # Remediation wording per platform key (anything unknown is labeled by its key).
-_PLATFORM_LABELS = {"wecom": "WeCom 智能机器人", "wework": "WeWork"}
+_PLATFORM_LABELS = {
+    "wecom": "WeCom 智能机器人",
+    "wework": "WeWork",
+    "digital_employee": "企微数字员工",
+    "digital-employee": "企微数字员工",
+}
 
 
 def env_flag(name: str, default: bool) -> bool:
