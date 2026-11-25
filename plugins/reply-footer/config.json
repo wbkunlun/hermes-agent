@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "platforms": ["wecom", "cron"],
+  "platforms": ["wecom", "cron", "wework", "digital_employee"],
   "auto_disable_reply_badge": true,
   "max_text_bytes": 20000,
   "single_message_max_bytes": 4096,

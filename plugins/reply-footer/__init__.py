@@ -26,10 +26,10 @@ How it works:
 Guards:
 
 * Platform gate: only runs when the payload ``platform`` is listed in
-  ``config.json`` ``platforms`` (code default ``["wecom"]``; the bundled
-  config.json also lists ``cron`` so scheduled-job deliveries carry the
-  footer too). The framework has no declarative platform gating, so each
-  callback checks it itself.
+  ``config.json`` ``platforms`` (code default mirrors the bundled
+  config.json: ``wecom``, ``cron`` (scheduled-job deliveries), ``wework``
+  and ``digital_employee``). The framework has no declarative platform
+  gating, so each callback checks it itself.
 * Idempotence: a ``response_text`` that already contains ``"📊 Model:"`` is
   left alone (the framework memoizes per turn; this backs the held/replay
   paths up).
@@ -70,7 +70,7 @@ _CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 _CONFIG_DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    "platforms": ["wecom"],
+    "platforms": ["wecom", "cron", "wework", "digital_employee"],
     "auto_disable_reply_badge": True,
     "max_text_bytes": 20000,
     "single_message_max_bytes": 4096,

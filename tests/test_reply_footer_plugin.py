@@ -172,6 +172,28 @@ class TestCronPlatform:
         assert is_autonomous_silence_response(footed) is True
 
 
+class TestWeworkAndDigitalEmployeePlatform:
+    def test_wework_platform_gets_footer(self, plugin):
+        # WeWork conversations run with platform="wework"
+        # (plugins/platforms/wework/adapter.py Platform("wework")), so once
+        # config.json lists "wework" webhook replies carry the same footer.
+        _post(plugin, platform="wework", **FOOT_ARGS)
+        out = _transform(plugin, "WeWork 回复完成", platform="wework")
+        assert out is not None
+        assert "📊 Model:" in out
+        assert "WeWork 回复完成" in out
+
+    def test_digital_employee_platform_gets_footer(self, plugin):
+        # Digital-employee conversations run with platform="digital_employee"
+        # (plugins/platforms/digital_employee/adapter.py Platform("digital_employee"));
+        # the footer rides in the last message_list chunk the platform splits.
+        _post(plugin, platform="digital_employee", **FOOT_ARGS)
+        out = _transform(plugin, "数字员工回复完成", platform="digital_employee")
+        assert out is not None
+        assert "📊 Model:" in out
+        assert "数字员工回复完成" in out
+
+
 class TestConfigEnabled:
     def test_enabled_false_noops_both_hooks(self, plugin, tmp_path):
         cfg = json.loads(Path(_PLUGIN_PATH).parent.joinpath("config.json").read_text(encoding="utf-8"))
