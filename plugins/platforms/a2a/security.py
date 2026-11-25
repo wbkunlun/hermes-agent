@@ -273,12 +273,11 @@ def audit(direction: str, peer: str, task_id: str, summary: str, extra: Optional
     merges caller-supplied fields (decision / reason / identity / remote_addr) into the
     record; the base shape is unchanged when it is omitted. Never raises."""
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_hermes_home, mkdir_under_hermes_home
         rec = {"ts": time.time(), "direction": direction, "peer": peer, "task_id": task_id, "summary": (summary or "")[:500]}
-        if extra:
+        if extra:  # fork 2026-11-24（DPMS 563037）：出站准入/policy 审计的 decision/reason/identity 合并；上游 v0.23.4 的窄签名无此参
             rec.update(extra)
-        get_hermes_home().mkdir(parents=True, exist_ok=True)
-        with (get_hermes_home() / "a2a_audit.jsonl").open("a", encoding="utf-8") as fh:
+        with (mkdir_under_hermes_home(get_hermes_home()) / "a2a_audit.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)
