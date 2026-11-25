@@ -412,7 +412,8 @@ class DigitalEmployeeAdapter(BasePlatformAdapter):
 
         if result.ok:
             logger.info("[%s] delivered delayed reply via push (conversation=%s)", self.name, chat_id)
-            return SendResult(success=True, message_id=f"push-{int(time.time() * 1000)}")
+            # 平台响应 result 是消息 id；缺失时回退本地时间戳形态
+            return SendResult(success=True, message_id=result.message_id or f"push-{int(time.time() * 1000)}")
         logger.error("[%s] push delivery failed for %s: %s", self.name, chat_id, result.describe())
         return SendResult(success=False, error=result.describe())
 

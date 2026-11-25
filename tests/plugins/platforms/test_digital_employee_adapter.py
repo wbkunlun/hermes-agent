@@ -197,7 +197,7 @@ async def test_late_reply_is_pushed_to_the_group_by_name():
     def push_handler(request: httpx.Request) -> httpx.Response:
         calls.append(json.loads(request.content))
         pushed.set()
-        return httpx.Response(200, text="ok")
+        return httpx.Response(200, json={"code": "0", "message": "执行成功", "result": "mid-1"})
 
     h = _Harness({
         "responseTimeout": "0.2",
@@ -230,7 +230,7 @@ async def test_late_reply_for_a_direct_chat_is_pushed_by_user_name():
     def push_handler(request: httpx.Request) -> httpx.Response:
         calls.append(json.loads(request.content))
         pushed.set()
-        return httpx.Response(200)
+        return httpx.Response(200, json={"code": "0", "message": "执行成功", "result": "mid-1"})
 
     h = _Harness({"responseTimeout": "0.2", "pushUrl": "http://push.example/api", "pushKeyId": "KID"})
     h.release = asyncio.Event()
