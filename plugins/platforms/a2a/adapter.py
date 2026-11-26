@@ -577,6 +577,13 @@ class A2AAdapter(BasePlatformAdapter):
         (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
+        # The platform's caller-identity declaration only counts once it verifies against this
+        # instance's own token. A declaration that fails to verify loses its lines before the
+        # text reaches the session — an unverifiable claim must never become an identity.
+        text, identity_status = security.verify_caller_identity(
+            text, params, self._security_context.bearer_token)
+        if identity_status == "rejected":
+            logger.warning("A2A: caller identity declaration from peer %s did not verify; stripped", peer)
         forwarded = not agent.get("local", True)
         message_id = protocol.extract_message_id(params) if forwarded else ""
         context_id = protocol.extract_context_id(params)

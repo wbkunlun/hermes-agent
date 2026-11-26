@@ -5,6 +5,7 @@ credential redaction; JSONL audit; trusted-peer allow-list; HMAC push signing; S
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -195,6 +196,56 @@ def wrap_inbound(peer: str, text: str) -> str:
     """Filter + frame inbound task text. EVERY message is framed — including "/..." text:
     remote peers must never reach the gateway's operator slash commands."""
     return PRIVACY_PREFIX.format(peer=peer or "unknown") + filter_inbound((text or "").strip())
+
+
+# 平台调用方身份声明（A2A 用户识别延伸）：平台在正文首行声明管理台用户，第二行附
+# HMAC 签名。key = 实例自己的 A2A_BEARER_TOKEN（平台侧持同值），msg 绑定
+# user|console|conversation|messageId——换人、换会话、换消息都签不通。只有平台拿得到
+# 这个 key，所以别的实例照抄声明行也算不出签名；验不过的声明在入会话前剥掉。
+CALLER_IDENTITY_RE = re.compile(r"^\[对话身份\] 用户=([^（）\s]+)（管理台） 会话=(\d+)\s*$")
+CALLER_SIGNATURE_RE = re.compile(r"^\[对话签名\] v1 ([A-Za-z0-9_-]{43})\s*$")
+
+
+def verify_caller_identity(text: str, params: dict, bearer_token: str) -> tuple[str, str]:
+    """Verify the platform's caller-identity declaration; strip it when it does not verify.
+
+    The platform signs ``<user>|console|<conversation>|<messageId>`` with the instance's own
+    A2A_BEARER_TOKEN. A peer that only copies the declaration lines cannot produce a valid
+    signature, so a declaration that does not verify is a claim, not an identity: it loses
+    both lines before the text reaches the session. Nothing that fails to verify — a missing
+    signature, a wrong mac, no key to verify with — may reach the agent as identity.
+
+    Returns ``(text, status)``; status is ``absent`` (no declaration), ``verified`` or
+    ``rejected`` (declaration stripped).
+    """
+    lines = (text or "").split("\n")
+    if not lines or not lines[0].startswith("[对话身份]"):
+        return text, "absent"
+    identity = CALLER_IDENTITY_RE.match(lines[0])
+    signature = CALLER_SIGNATURE_RE.match(lines[1]) if len(lines) > 1 else None
+    signed_line = len(lines) > 1 and lines[1].startswith("[对话签名]")
+    reason = ""
+    if identity is None:
+        reason = "malformed_identity"
+    elif signature is None:
+        reason = "missing_signature"
+    elif not bearer_token:
+        reason = "no_signing_key"
+    else:
+        message = params.get("message") if isinstance(params, dict) else None
+        message_id = str(message.get("messageId") or "") if isinstance(message, dict) else ""
+        if not message_id:
+            reason = "missing_message_id"
+        else:
+            user, conversation = identity.group(1), identity.group(2)
+            expected = base64.urlsafe_b64encode(
+                hmac.new(bearer_token.encode(), f"{user}|console|{conversation}|{message_id}".encode(),
+                         hashlib.sha256).digest()).rstrip(b"=").decode()
+            if not hmac.compare_digest(expected, signature.group(1)):
+                reason = "signature_mismatch"
+    if reason:
+        return "\n".join(lines[2:] if signed_line else lines[1:]), "rejected"
+    return "\n".join(lines), "verified"
 
 
 def redact_outbound(text: str) -> str:
