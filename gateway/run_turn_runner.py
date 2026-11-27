@@ -383,13 +383,33 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     stream_consumer.stream_deltas_enabled = consumer_stream_deltas
             except Exception as err:
                 logger.debug("Could not set up stream consumer: %s", err)
-        # Deltas tee to the stream consumer (when text streaming is on) and to streaming TTS.
+        # fork (DPMS 563935): A2A streams deltas/reasoning/tool events straight to its SSE
+        # bridge — no message-edit consumer involved. Forced on like WeCom (an API channel,
+        # no message-spam concern); held replies, scheduled heartbeats and the reasoning-leads
+        # combined-message gate still suppress streaming, and an explicit
+        # display.platforms.a2a.streaming=False override still wins.
+        try:
+            _plat_raw = getattr(getattr(ctx.source, "platform", None), "value", getattr(ctx.source, "platform", None))
+            if not held and not ctx.scheduled_heartbeat and not _reasoning_leads and str(_plat_raw or "") == "a2a" \
+                    and plat_streaming is not False:
+                _a2a_adapter = self._runner._delivery_adapter_for(ctx.source)
+                _sink_factory = getattr(_a2a_adapter, "a2a_stream_sink", None)
+                if _sink_factory is not None:
+                    _sink = _sink_factory(ctx.source.chat_id)
+                    if _sink is not None:
+                        ctx.delta_extra_sinks.append(_sink)
+        except Exception as err:
+            logger.debug("Could not set up a2a stream sink: %s", err)
+        # Deltas tee to the stream consumer (when text streaming is on), to streaming TTS,
+        # and to extra sinks (the A2A SSE bridge fork) — an extra sink counts as a delivered
+        # audience: the gateway then suppresses the final notify send, and the full reply
+        # still reaches the A2A task via on_processing_complete's streamed-final stash.
         delta_sinks = [
             sc for sc in (
                 stream_consumer if stream_consumer and stream_consumer.stream_deltas_enabled else None,
                 stts,
             ) if sc is not None
-        ]
+        ] + list(getattr(ctx, "delta_extra_sinks", None) or [])
         local_viewer_route = getattr(ctx.source, "platform", None) == Platform.LOCAL
         if delta_sinks or self._approval_owner is not None:
             def stream_delta_cb(text: Optional[str]) -> None:
@@ -586,6 +606,33 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
         agent.reasoning_callback = None  # per turn: a reused agent never keeps an earlier API turn's sink
+        # fork (DPMS 563935): extra sinks (the A2A SSE bridge) may consume reasoning deltas
+        # and tool lifecycle events. Reasoning: the sink only consumes — the agent core fires
+        # reasoning_callback per native reasoning delta during streaming (stream_delivery
+        # _fire_reasoning_delta) and gates the non-streaming end-of-turn fallback itself. Tool:
+        # the tee composes with the progress lane — queue/notices/task cards keep their existing
+        # behavior; only lifecycle events tee to the sink (thinking/subagent noise filtered).
+        for _extra in (getattr(ctx, "delta_extra_sinks", None) or []):
+            _on_reasoning = getattr(_extra, "on_reasoning_delta", None)
+            if _on_reasoning is not None:
+                agent.reasoning_callback = _on_reasoning
+                break
+        for _extra in (getattr(ctx, "delta_extra_sinks", None) or []):
+            _on_tool = getattr(_extra, "on_tool_event", None)
+            if _on_tool is not None:
+                _prev_progress = agent.tool_progress_callback
+
+                def _tee_tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                    try:
+                        if event_type in ("tool.started", "tool.completed"):
+                            _on_tool(event_type, tool_name, preview)
+                    except Exception:
+                        logger.debug("a2a tool sink error", exc_info=True)
+                    if _prev_progress is not None:
+                        _prev_progress(event_type, tool_name, preview, args, **kwargs)
+
+                agent.tool_progress_callback = _tee_tool_progress
+                break
         if self._approval_owner is not None:
             from gateway.session_api_turn import api_execution, wire_api_observers
             if api_execution.get() is not None:

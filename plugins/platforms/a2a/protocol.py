@@ -206,12 +206,19 @@ def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", 
     return task
 
 
-def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
-    """v1.0 StreamResponse with a statusUpdate member."""
+def status_update(task_id: str, context_id: str, state: str, text: str = "", *, metadata: Optional[dict] = None) -> dict:
+    """v1.0 StreamResponse with a statusUpdate member. ``metadata`` is the statusUpdate-level
+    extension member (a sibling of ``status``, per A2A v1.0 TaskStatusUpdateEvent.metadata) —
+    NOT a member of the TaskStatus itself: strict parsers (a2a-go v2.7.0) drop unknown
+    TaskStatus fields, but keep the event-level metadata. It carries intermediate stream
+    deltas (see A2AStreamBridge); terminal frames never set it."""
     status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
     if text:
         status["message"] = text_message(ROLE_AGENT, text, context_id)
-    return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
+    update: dict[str, Any] = {"taskId": task_id, "contextId": context_id, "status": status}
+    if metadata:
+        update["metadata"] = metadata
+    return {"statusUpdate": update}
 
 
 def artifact_update(task_id: str, context_id: str, text: str) -> dict:

@@ -82,6 +82,11 @@ class TurnContext:
     result_holder: list = field(default_factory=lambda: [None])
     tools_holder: list = field(default_factory=lambda: [None])
     stream_consumer_holder: list = field(default_factory=lambda: [None])
+    # fork (DPMS 563935): turn-event sinks outside the message-edit stream_consumer contract —
+    # the A2A SSE bridge consumes raw deltas/reasoning/tool lifecycle directly. Created in
+    # TurnRunner._setup_stream_consumer; joined into delta_sinks and wired for
+    # reasoning_callback / a tool_progress tee in _wire_turn_agent_callbacks.
+    delta_extra_sinks: list = field(default_factory=list)
     streaming_tts_consumer_holder: list = field(default_factory=lambda: [None])
     # voice-ack wiring
     _voice_ack_fired: list = field(default_factory=lambda: [False])

@@ -280,6 +280,89 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
 
 
+# Metadata key on statusUpdate frames that carries intermediate stream deltas
+# (fork DPMS 563935). Consumers: ai-sandbox chat runner (a2a-go surfaces it as
+# TaskStatusUpdateEvent.Metadata). Terminal frames never carry it.
+STREAM_DELTA_METADATA_KEY = "ai-sandbox/stream"
+
+
+class A2AStreamBridge:
+    """Per-stream SSE frame writer shared between the HTTP handler thread (which owns
+    the socket: submitted/working/keepalive/terminal) and gateway turn threads
+    (delta/reasoning/tool producers). Every socket write serializes on one lock, so
+    producer frames and terminal frames can interleave safely. A closed bridge (client
+    gone / stream finished) drops producer frames silently — a dead stream must never
+    break the agent turn — while handler-thread ``write`` keeps raising so the
+    keepalive/await path treats the client as gone."""
+
+    def __init__(self, write, req_id, task_id: str, context_id: str):
+        self._write, self._req_id = write, req_id
+        self.task_id, self.context_id = task_id, context_id
+        self._lock = threading.Lock()
+        self._seq = 0
+        self.closed = False
+
+    def emit(self, channel: str, payload: dict) -> bool:
+        """Gateway-thread frame emission. Payload fields join the channel + monotonic
+        seq; channel=text/reasoning carry ``text``, channel=tool carries event/tool/preview."""
+        with self._lock:
+            if self.closed:
+                return False
+            self._seq += 1
+            meta = {"channel": channel, "seq": self._seq, **payload}
+            frame = protocol.status_update(self.task_id, self.context_id, protocol.STATE_WORKING,
+                                           metadata={STREAM_DELTA_METADATA_KEY: meta})
+            try:
+                self._write(protocol.sse_data(frame, self._req_id))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self.closed = True
+                return False
+            return True
+
+    def write(self, chunk: str) -> None:
+        """Handler-thread raw write; socket errors propagate."""
+        with self._lock:
+            if self.closed:
+                raise ConnectionResetError("stream bridge closed")
+            self._write(chunk)
+
+    def close(self) -> None:
+        with self._lock:
+            self.closed = True
+
+
+class A2AStreamSink:
+    """Turn-thread consumer the gateway wires as a delta/reasoning/tool sink (see
+    run_turn_runner's delta_extra_sinks fork). Forwards into the context's live SSE
+    bridge; with no message/stream HTTP reader attached, every emit is a no-op — the
+    turn proceeds exactly like a non-streaming one."""
+
+    def __init__(self, adapter: A2AAdapter, chat_id: str):
+        self._adapter, self._chat_id = adapter, chat_id
+
+    def _bridge(self) -> Optional[A2AStreamBridge]:
+        return self._adapter._stream_bridges.get(self._chat_id)
+
+    def on_delta(self, text: Optional[str]) -> None:
+        bridge = self._bridge()
+        if text and bridge is not None:
+            bridge.emit("text", {"text": text})
+
+    def on_reasoning_delta(self, text: Optional[str]) -> None:
+        bridge = self._bridge()
+        if text and bridge is not None:
+            bridge.emit("reasoning", {"text": text})
+
+    def on_tool_event(self, event_type: str, tool_name: Optional[str] = None, preview: Optional[str] = None) -> None:
+        bridge = self._bridge()
+        if bridge is None:
+            return
+        if event_type == "tool.started":
+            bridge.emit("tool", {"event": "started", "tool": tool_name or "", "preview": (preview or "")[:200]})
+        elif event_type == "tool.completed":
+            bridge.emit("tool", {"event": "completed", "tool": tool_name or ""})
+
+
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
@@ -323,6 +406,9 @@ class A2AAdapter(BasePlatformAdapter):
         # Admission ids this process already forwarded; a resend of one is a retry, not a new turn.
         self._forwarded_inputs: OrderedDict[str, None] = OrderedDict()
         self._pending_lock = threading.Lock()
+        # Live stream bridges keyed by context_id (fork DPMS 563935): the message/stream
+        # handler registers before the turn dispatches; A2AStreamSink producers look up here.
+        self._stream_bridges: dict[str, A2AStreamBridge] = {}
 
     @property
     def name(self) -> str:
@@ -572,9 +658,24 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
-    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
+    def _inbound_context_id(self, params: dict, peer: str, agent: Optional[dict] = None) -> str:
+        """The context an inbound send resolves to — shared by _prepare_task and the
+        message/stream RPC, which must register its SSE bridge under the SAME id before
+        the turn dispatches (fork DPMS 563935)."""
+        agent = agent or self._agents[""]
+        context_id = protocol.extract_context_id(params)
+        if context_id:
+            return context_id
+        message_id = protocol.extract_message_id(params) if not agent.get("local", True) else ""
+        scope = "\0".join((*self._scope_for_agent(agent), peer))
+        return protocol.message_context_id(scope, message_id) if message_id else protocol.new_context_id()
+
+    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None,
+                      *, task_id: str = "", context_id: str = "") -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
-        (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
+        (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on.
+        ``task_id``/``context_id``: precomputed identities from the stream RPC (its bridge is
+        registered under them before this call); generate when empty (non-streaming path)."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         # The platform's caller-identity declaration only counts once it verifies against this
@@ -586,11 +687,7 @@ class A2AAdapter(BasePlatformAdapter):
             logger.warning("A2A: caller identity declaration from peer %s did not verify; stripped", peer)
         forwarded = not agent.get("local", True)
         message_id = protocol.extract_message_id(params) if forwarded else ""
-        context_id = protocol.extract_context_id(params)
-        if not context_id:
-            # A retry of a first send repeats the messageId and omits the contextId it never received.
-            scope = "\0".join((*self._scope_for_agent(agent), peer))
-            context_id = protocol.message_context_id(scope, message_id) if message_id else protocol.new_context_id()
+        context_id = context_id or self._inbound_context_id(params, peer, agent)
         # A retry after a timeout must find its accepted work, not queue a second turn.
         input_id = ("a2a-msg:" + hashlib.sha256(f"{context_id}\0{message_id}".encode()).hexdigest()
                     if message_id else None)
@@ -598,7 +695,7 @@ class A2AAdapter(BasePlatformAdapter):
         # one whose id the LRU evicted or a restart forgot.
         retry = input_id is not None and (self._note_forwarded_input(input_id)
                                           or protocol.logged_input(context_id, input_id))
-        task_id = protocol.new_task_id()
+        task_id = task_id or protocol.new_task_id()
         # The owner answers a resend from the accepted admission; it is not another turn of the loop.
         turn = 0 if retry else self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
@@ -746,37 +843,50 @@ class A2AAdapter(BasePlatformAdapter):
     def _keepalive(cls, handler):
         return lambda: cls._sse_write(handler, ": keepalive\n\n")
 
-    def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None) -> None:
+    def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None, write=None) -> None:
         """Emit the final artifact/status events and the closure marker. ``req_id`` threads into the
-        JSON-RPC SSE envelope (§9.4)."""
+        JSON-RPC SSE envelope (§9.4). ``write`` overrides the socket writer so streamed responses
+        serialize terminal frames against producer deltas on the bridge lock."""
         completed = bool(reply) and state == protocol.STATE_COMPLETED
         events = ([protocol.artifact_update(task_id, context_id, reply)] if completed else []) + [
             protocol.status_update(task_id, context_id, state, "" if completed else reply)]
+        write = write or (lambda chunk: self._sse_write(handler, chunk))
         for ev in events:
-            self._sse_write(handler, protocol.sse_data(ev, req_id))
-        self._sse_write(handler, protocol.sse_done())
+            write(protocol.sse_data(ev, req_id))
+        write(protocol.sse_done())
 
     def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
-        """message/stream as an SSE response of JSON-RPC-wrapped StreamResponse events (§9.4)."""
+        """message/stream as an SSE response of JSON-RPC-wrapped StreamResponse events (§9.4).
+        fork (DPMS 563935): intermediate text/reasoning/tool deltas ride statusUpdate frames
+        carrying ``metadata[STREAM_DELTA_METADATA_KEY]`` (bridge + gateway delta_extra_sinks);
+        the terminal artifact/status frames and the SSE-closure semantics are unchanged."""
         protocol.metrics.streams_started += 1
         self._sse_headers(handler)
         pending = None
+        bridge = None
         try:
-            terminal, pending = self._prepare_task(params, peer, agent=agent)
+            task_id = protocol.new_task_id()
+            context_id = self._inbound_context_id(params, peer, agent)
+            bridge = A2AStreamBridge(lambda chunk: self._sse_write(handler, chunk), req_id, task_id, context_id)
+            self._stream_bridges[context_id] = bridge
+            terminal, pending = self._prepare_task(params, peer, agent=agent, task_id=task_id, context_id=context_id)
             if terminal is not None:
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
-            task_id, context_id = pending["task_id"], pending["context_id"]
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
-            self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
-            self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            bridge.write(protocol.sse_data(protocol.stream_task(submitted), req_id))
+            bridge.write(protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
+            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=lambda: bridge.write(": keepalive\n\n")))
             pending = None
-            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
+            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id, write=bridge.write)
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
                 self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
             logger.debug("A2A: stream client disconnected")
+        finally:
+            if bridge is not None:
+                self._stream_bridges.pop(bridge.context_id, None)
+                bridge.close()
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
@@ -886,6 +996,12 @@ class A2AAdapter(BasePlatformAdapter):
             return fail("got HTTP %d", status)
         protocol.metrics.push_sent += 1
         logger.debug("A2A: push notification sent for task %s", task_id)
+
+    def a2a_stream_sink(self, chat_id: str) -> A2AStreamSink:
+        """Factory the gateway TurnRunner calls per streamed turn (delta_extra_sinks fork,
+        DPMS 563935): returns the turn-thread consumer that forwards deltas/reasoning/tool
+        events into this context's live SSE bridge (no-op without a message/stream reader)."""
+        return A2AStreamSink(self, chat_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None):
         """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
